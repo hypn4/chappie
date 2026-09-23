@@ -1,49 +1,109 @@
 # Chappie
 
-Use ChatGPT to work through [Pi](https://github.com/earendil-works/pi): edit local files, run commands, call Pi extensions, exchange files and images, and move between sessions on one or more devices.
+Use ChatGPT to work through [Pi](https://github.com/earendil-works/pi) or [Oh My Pi (OMP)](https://github.com/can1357/oh-my-pi): edit local files, run commands, call agent extensions, exchange files and images, and move between sessions on one or more devices.
 
 ## Setup
 
-Install the Pi package:
+Install Chappie for the host you use:
 
 ```sh
+# Pi
 pi install npm:@zetaloop/chappie
+
+# OMP
+omp plugin install @zetaloop/chappie
 ```
 
-Run Chappie as the MCP server managed by [otunnel](https://github.com/zetaloop/otunnel):
+Run the broker through [otunnel](https://github.com/zetaloop/otunnel). Use
+`otunnel profiles list` to find the active profile; it is typically
+`~/.config/tunnel-client/chappie.yaml`.
 
 ```yaml
+# Pi
 mcp:
   commands:
     - channel: main
       command: pi --chappie
 ```
 
-Add the tunnel as a developer-mode app in ChatGPT, then start Pi in a project:
+OMP uses the standalone broker executable:
 
-```sh
-pi --provider chappie --model chatgpt
+```yaml
+mcp:
+  commands:
+    - channel: main
+      command: $HOME/.omp/plugins/node_modules/.bin/chappie-omp
 ```
 
-Call `init` from ChatGPT to connect the conversation to Pi. A conversation can resume an existing task with its Pi session ID, while `sessions` can find connected sessions by device, directory, or name.
+On Windows, use the corresponding
+`%USERPROFILE%\.omp\plugins\node_modules\.bin\chappie-omp.cmd` path.
+
+Start the agent in a project:
+
+```sh
+# Pi
+pi --provider chappie --model chatgpt
+
+# OMP
+omp --model chappie/chatgpt
+```
+
+Call `init` from ChatGPT to connect to the agent session. When using an OMP
+profile or custom `PI_CONFIG_DIR` / `PI_CODING_AGENT_DIR`, give `chappie-omp`
+the same environment so the broker and session resolve the same socket.
+
+## Development
+
+Install dependencies and run the repository checks:
+
+```sh
+pnpm install
+pnpm check
+```
+
+For a local OMP checkout, point the otunnel profile at the source broker:
+
+```yaml
+mcp:
+  commands:
+    - channel: main
+      command: node /absolute/path/to/chappie/src/cli.omp.ts
+```
+
+Then load the source extension directly:
+
+```sh
+omp --no-extensions -e /absolute/path/to/chappie/src/index.omp.ts --model chappie/chatgpt
+```
+
+Restart otunnel after changing its broker command, then use `sessions` or
+`init` from ChatGPT to verify that the OMP session is visible.
+
+Pi and OMP use different local sockets by default: `~/.pi/agent/chappie.sock`
+and `~/.omp/agent/chappie.sock`. otunnel must launch the broker for the host
+being tested; a Pi broker only exposes Pi sessions, and an OMP broker only
+exposes OMP sessions.
 
 ## Usage
 
-Chappie exposes common coding tools directly and every active Pi tool through `tools` and `call`. `chat` sends an assistant message to Pi, Pi input accompanies later tool results, and `transfer` moves files between ChatGPT and Pi or between connected devices. `history` reads recent Pi messages and activity with timestamps. `ask` can present a persistent question in ChatGPT when webpage questions are enabled.
+Chappie exposes common coding tools directly and every active agent tool through `tools` and `call`. `chat` sends an assistant message to the agent, agent input accompanies later tool results, and `transfer` moves files between ChatGPT and the agent or between connected devices. `history` reads recent agent messages and activity with timestamps. `ask` can present a persistent question in ChatGPT when webpage questions are enabled.
 
-See the [tool guide](docs/tools.md) for session selection, history, Pi tools, webpage questions, and file transfer.
+See the [tool guide](docs/tools.md) for session selection, history, agent tools, webpage questions, and file transfer.
 
 ## Configuration
 
-`chappie.json` in Pi's agent directory configures Chappie.
+`chappie.json` lives in the selected host's agent directory:
 
-A broker can accept Pi sessions from other devices on the local network:
+- Pi: `~/.pi/agent/chappie.json`
+- OMP: `~/.omp/agent/chappie.json`
+
+A broker can accept sessions from other devices on the local network:
 
 ```json
 { "listen": true }
 ```
 
-Remote Pi sessions connect through the broker device's mDNS name:
+Remote sessions connect through the broker device's mDNS name:
 
 ```json
 { "connect": "<broker>.local" }

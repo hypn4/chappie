@@ -13,10 +13,6 @@ import type {
 	ToolResultMessage,
 	UserMessage,
 } from "@earendil-works/pi-ai";
-import type {
-	SlashCommandInfo,
-	ToolInfo,
-} from "@earendil-works/pi-coding-agent";
 import type { Activity } from "./activity.ts";
 import type { DeliveryRecord } from "./delivery.ts";
 import type { HistoryRange, HistoryResult } from "./history.ts";
@@ -35,10 +31,27 @@ export interface SessionDescription {
 	status: SessionStatus;
 }
 
+export interface SessionToolInfo {
+	name: string;
+	description: string;
+	parameters: unknown;
+	promptGuidelines?: string[];
+	sourceInfo?: unknown;
+}
+
+export interface SessionSkillInfo {
+	name: string;
+	description?: string;
+	source: "extension" | "prompt" | "skill";
+	sourceInfo?: unknown;
+	location?: string;
+	path?: string;
+}
+
 export interface SessionInspection {
 	session: SessionDescription;
-	tools: ToolInfo[];
-	skills: SlashCommandInfo[];
+	tools: SessionToolInfo[];
+	skills: SessionSkillInfo[];
 }
 
 export interface SessionInput {

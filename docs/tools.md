@@ -1,5 +1,9 @@
 # Tools
 
+> Chappie supports both Pi and Oh My Pi (OMP). This guide uses the existing
+> "Pi session/tool" terminology for the selected local agent host; the same
+> Chappie tools and session semantics apply to OMP unless noted otherwise.
+
 | Tool | Purpose |
 |---|---|
 | `init` | Select this ChatGPT conversation's default Pi session and read its environment. |

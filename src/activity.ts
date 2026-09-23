@@ -15,6 +15,18 @@ export function source(chatId: string, requestId: unknown): Source {
 	};
 }
 
+export function sameSource(
+	left: Source | undefined,
+	right: Source | undefined,
+): boolean {
+	return (
+		left !== undefined &&
+		right !== undefined &&
+		left.chatId === right.chatId &&
+		left.requestId === right.requestId
+	);
+}
+
 export function chatLabel({ chatId, requestId }: Source): string {
 	const workflow = requestId?.match(/^wfr_([^/]+)\//)?.[1];
 	return `ChatGPT ${chatId.slice(-4)}${workflow ? `(${workflow.slice(-4)})` : ""}`;

@@ -2,18 +2,20 @@ import { randomUUID } from "node:crypto";
 import { access } from "node:fs/promises";
 import { hostname } from "node:os";
 import { resolve } from "node:path";
+import type { ToolResultMessage, UserMessage } from "@earendil-works/pi-ai";
 import type {
-	AssistantMessage,
-	ToolResultMessage,
-	UserMessage,
-} from "@earendil-works/pi-ai";
-import type {
-	ExtensionAPI,
-	ExtensionContext,
+	ExtensionAPI as PiExtensionAPI,
+	ExtensionContext as PiExtensionContext,
 	SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
-import { type Activity, chatLabel, source } from "./activity.ts";
+import {
+	type Activity,
+	chatLabel,
+	type Source,
+	sameSource,
+	source,
+} from "./activity.ts";
 import type { DeliveryRecord } from "./delivery.ts";
 import { historyResult } from "./history.ts";
 import {
@@ -24,22 +26,130 @@ import {
 	type SessionInspection,
 	type SessionRequest,
 	type SessionResult,
+	type SessionSkillInfo,
 	type SessionStatus,
+	type SessionToolInfo,
 } from "./ipc.ts";
-import type { ProviderOutput } from "./provider.ts";
+import type { OmpExtensionAPI, OmpExtensionContext } from "./omp-api.ts";
+import type { ProviderOutput } from "./provider-core.ts";
 import {
 	type ResourceDescriptor,
 	readSessionResource,
 	rememberImages,
 	resourceSessionId,
 } from "./resources.ts";
-import { copyFiles, transfer, transferResult } from "./transfer.ts";
+import {
+	copyFiles,
+	executeTransfer,
+	type TransferArgs,
+	type TransferExecutionContext,
+	type TransferUpdate,
+	transferResult,
+} from "./transfer.ts";
 
 type RemoteRequest = Extract<BrokerMessage, { type: "chat" | "call" }>;
 
 interface Notice extends Activity {
 	message: string;
 	type: "info" | "warning" | "error";
+}
+
+type SessionHost = "pi" | "omp";
+
+interface ChappieHostAPI {
+	appendEntry(customType: string, data?: unknown): void;
+	getSessionName(): string | undefined;
+	getActiveTools(): string[];
+	getAllTools(): SessionToolInfo[];
+	getCommands(): SessionSkillInfo[];
+	sendMessage(
+		message: { customType: string; content: string; display: boolean },
+		options?: { triggerTurn?: boolean },
+	): void;
+}
+
+interface ChappieSessionManager {
+	getSessionId(): string;
+	getCwd(): string;
+	getLeafId(): string | null;
+	getLeafEntry(): SessionEntry | undefined;
+	getEntry(id: string): SessionEntry | undefined;
+	getBranch(): SessionEntry[];
+}
+
+interface ChappieContext {
+	ui: {
+		notify(message: string, type?: "info" | "warning" | "error"): void;
+	};
+	readonly cwd: string;
+	readonly model: { provider: string } | undefined;
+	sessionManager: ChappieSessionManager;
+	isIdle(): boolean;
+	abort(): void;
+}
+
+export function createPiHostApi(pi: PiExtensionAPI): ChappieHostAPI {
+	return {
+		appendEntry: (customType, data) => pi.appendEntry(customType, data),
+		getSessionName: () => pi.getSessionName(),
+		getActiveTools: () => pi.getActiveTools(),
+		getAllTools: () => pi.getAllTools(),
+		getCommands: () => pi.getCommands(),
+		sendMessage: (message, options) => pi.sendMessage(message, options),
+	};
+}
+
+export function createOmpHostApi(pi: OmpExtensionAPI): ChappieHostAPI {
+	return {
+		appendEntry: (customType, data) => pi.appendEntry(customType, data),
+		getSessionName: () => pi.getSessionName(),
+		getActiveTools: () => pi.getActiveTools(),
+		getAllTools: () => pi.getAllTools(),
+		getCommands: () => pi.getCommands(),
+		sendMessage: (message, options) => pi.sendMessage(message, options),
+	};
+}
+
+function adaptPiContext(context: PiExtensionContext): ChappieContext {
+	const sessionManager = context.sessionManager;
+	return {
+		ui: context.ui,
+		get cwd() {
+			return sessionManager.getCwd();
+		},
+		get model() {
+			return context.model ? { provider: context.model.provider } : undefined;
+		},
+		sessionManager,
+		isIdle: () => context.isIdle(),
+		abort: () => context.abort(),
+	};
+}
+
+function adaptOmpContext(context: OmpExtensionContext): ChappieContext {
+	const sessionManager = context.sessionManager;
+	return {
+		ui: context.ui,
+		get cwd() {
+			return sessionManager.getCwd();
+		},
+		get model() {
+			return context.model ? { provider: context.model.provider } : undefined;
+		},
+		sessionManager: {
+			getSessionId: () => sessionManager.getSessionId(),
+			getCwd: () => sessionManager.getCwd(),
+			getLeafId: () => sessionManager.getLeafId(),
+			// SAFETY: Chappie only consumes the shared persisted entry fields
+			// (type/id/parent/message/custom payloads) that Pi and OMP keep compatible.
+			getLeafEntry: () =>
+				sessionManager.getLeafEntry() as SessionEntry | undefined,
+			getEntry: (id) => sessionManager.getEntry(id) as SessionEntry | undefined,
+			getBranch: () => sessionManager.getBranch() as SessionEntry[],
+		},
+		isIdle: () => context.isIdle(),
+		abort: () => context.abort(),
+	};
 }
 
 interface SyncRequest {
@@ -65,16 +175,17 @@ interface HistoryRequest {
 interface ActiveRequest {
 	request: RemoteRequest;
 	session: SessionDescription;
-	message: AssistantMessage;
+	message: ProviderOutput["message"];
 	completed: boolean;
 	cancelled: string | undefined;
 	toolResults: ToolResultMessage[];
 }
 
 export class LocalSession {
-	readonly #pi: ExtensionAPI;
+	readonly #api: ChappieHostAPI;
 	readonly #agentDir: string;
 	readonly #connect: string | undefined;
+	readonly #host: SessionHost;
 	readonly #syncs = new Map<number, SyncRequest>();
 	readonly #stores = new Map<string, StoreRequest>();
 	readonly #queue: RemoteRequest[] = [];
@@ -83,7 +194,7 @@ export class LocalSession {
 	readonly #histories = new Map<number, HistoryRequest>();
 	readonly #requests = new Map<number, PendingRequest>();
 	readonly #copies = new Map<number, AbortController>();
-	#context: ExtensionContext | undefined;
+	#context: ChappieContext | undefined;
 	#connection: IpcClient | undefined;
 	#output: ProviderOutput | undefined;
 	#active: ActiveRequest | undefined;
@@ -93,15 +204,25 @@ export class LocalSession {
 	#sessionId: string | undefined;
 	#inputCursor: string | null = null;
 	#flushing = Promise.resolve();
+	#ompProviderActive = false;
+	#ompSessionName: string | undefined;
+	#ompPollStarted = false;
+	#latestOmpContext: OmpExtensionContext | undefined;
 
-	constructor(pi: ExtensionAPI, agentDir: string, connect?: string) {
-		this.#pi = pi;
+	constructor(
+		api: ChappieHostAPI,
+		agentDir: string,
+		connect?: string,
+		host: SessionHost = "pi",
+	) {
+		this.#api = api;
 		this.#agentDir = agentDir;
 		this.#connect = connect;
+		this.#host = host;
 	}
 
-	install(): void {
-		this.#pi.registerEntryRenderer<Notice>(
+	installPi(pi: PiExtensionAPI): void {
+		pi.registerEntryRenderer<Notice>(
 			"chappie.notice",
 			({ data }, _options, theme) => {
 				if (!data) return;
@@ -112,35 +233,38 @@ export class LocalSession {
 				);
 			},
 		);
-		this.#pi.on("session_start", (_event, context) => this.#update(context));
-		this.#pi.on("model_select", (event, context) =>
-			this.#update(context, event.model.provider === "chappie"),
+		pi.on("session_start", (_event, context) =>
+			this.#update(adaptPiContext(context)),
 		);
-		this.#pi.on("session_info_changed", (_event, context) => {
-			this.#context = context;
+		pi.on("model_select", (event, context) =>
+			this.#update(adaptPiContext(context), event.model.provider === "chappie"),
+		);
+		pi.on("session_info_changed", (_event, context) => {
+			this.#context = adaptPiContext(context);
 			void this.#sync().catch(() => {});
 		});
-		this.#pi.on("session_tree", (event, context) => {
-			this.#context = context;
-			if (context.model?.provider === "chappie") {
-				this.#resetInputs(context, event.newLeafId);
+		pi.on("session_tree", (event, context) => {
+			const shared = adaptPiContext(context);
+			this.#context = shared;
+			if (shared.model?.provider === "chappie") {
+				this.#resetInputs(shared, event.newLeafId);
 			}
 			this.#historyChanged();
 		});
 		// Pi persists messages after message_end handlers finish.
-		this.#pi.on("message_start", (_event, context) => {
-			this.#context = context;
+		pi.on("message_start", (_event, context) => {
+			this.#context = adaptPiContext(context);
 			this.#historyChanged();
 		});
-		this.#pi.on("tool_call", (_event, context) => {
-			this.#context = context;
+		pi.on("tool_call", (_event, context) => {
+			this.#context = adaptPiContext(context);
 			this.#historyChanged();
 		});
-		this.#pi.on("session_compact", (_event, context) => {
-			this.#context = context;
+		pi.on("session_compact", (_event, context) => {
+			this.#context = adaptPiContext(context);
 			this.#historyChanged();
 		});
-		this.#pi.on("context", (event, context) => ({
+		pi.on("context", (event, context) => ({
 			messages:
 				context.model?.provider === "chappie"
 					? []
@@ -150,18 +274,116 @@ export class LocalSession {
 								message.customType !== "chappie.request",
 						),
 		}));
-		this.#pi.on("turn_end", (event, context) =>
-			this.#turnEnd(event.message, event.toolResults, context),
+		pi.on("turn_end", (event, context) =>
+			this.#turnEnd(event.message, event.toolResults, adaptPiContext(context)),
 		);
-		this.#pi.on("agent_settled", async (_event, context) => {
-			this.#context = context;
-			this.#starting = false;
-			this.#collectInputs();
-			this.#historyChanged();
-			await this.#completeActive();
-			this.#dispatch();
+		pi.on("agent_settled", (_event, context) =>
+			this.#settled(adaptPiContext(context)),
+		);
+		pi.on("session_shutdown", () => this.close());
+	}
+
+	installOmp(pi: OmpExtensionAPI): void {
+		pi.on("session_start", (_event, context) => {
+			this.#refreshOmpContext(context);
+			if (!this.#ompPollStarted) {
+				this.#ompPollStarted = true;
+				context.setInterval(() => {
+					const current = this.#latestOmpContext;
+					if (current) this.#refreshOmpContext(current);
+				}, 500);
+			}
 		});
-		this.#pi.on("session_shutdown", () => this.close());
+		pi.on("session_switch", (_event, context) => {
+			this.#refreshOmpContext(context);
+			this.#historyChanged();
+		});
+		pi.on("session_branch", (_event, context) => {
+			this.#refreshOmpContext(context);
+			this.#historyChanged();
+		});
+		pi.on("session_tree", (event, context) => {
+			const shared = this.#refreshOmpContext(context);
+			if (shared.model?.provider === "chappie") {
+				this.#resetInputs(shared, event.newLeafId);
+			}
+			this.#historyChanged();
+		});
+		pi.on("message_start", (_event, context) => {
+			this.#refreshOmpContext(context);
+			this.#historyChanged();
+		});
+		pi.on("tool_call", (_event, context) => {
+			this.#refreshOmpContext(context);
+			this.#historyChanged();
+		});
+		pi.on("session_compact", (_event, context) => {
+			this.#refreshOmpContext(context);
+			this.#historyChanged();
+		});
+		pi.on("context", (event, context) => {
+			this.#refreshOmpContext(context);
+			return {
+				messages:
+					context.model?.provider === "chappie"
+						? []
+						: event.messages.filter(
+								(message) =>
+									message.role !== "custom" ||
+									message.customType !== "chappie.request",
+							),
+			};
+		});
+		pi.on("turn_end", (event, context) => {
+			const shared = this.#refreshOmpContext(context);
+			return this.#turnEnd(event.message, event.toolResults, shared);
+		});
+		pi.on("agent_end", (event, context) => {
+			const shared = this.#refreshOmpContext(context);
+			if (event.willContinue === true) return;
+			return this.#settled(shared);
+		});
+		pi.on("session_shutdown", () => this.close());
+	}
+
+	#refreshOmpContext(context: OmpExtensionContext): ChappieContext {
+		this.#latestOmpContext = context;
+		const shared = adaptOmpContext(context);
+		const active = shared.model?.provider === "chappie";
+		const name = this.#api.getSessionName();
+		if (!active) {
+			this.#ompSessionName = name;
+			if (this.#ompProviderActive) {
+				this.#ompProviderActive = false;
+				this.#update(shared, false);
+			}
+			return shared;
+		}
+
+		const sessionChanged =
+			this.#sessionId !== shared.sessionManager.getSessionId();
+		if (!this.#ompProviderActive || sessionChanged) {
+			this.#ompProviderActive = true;
+			this.#ompSessionName = name;
+			this.#update(shared, true);
+			return shared;
+		}
+
+		this.#context = shared;
+		if (name !== this.#ompSessionName) {
+			this.#ompSessionName = name;
+			void this.#sync().catch(() => {});
+		}
+		return shared;
+	}
+
+	async #settled(context: ChappieContext): Promise<void> {
+		this.#context = context;
+		this.#starting = false;
+		this.#collectInputs();
+		this.#historyChanged();
+		await this.#completeActive();
+		this.#dispatch();
 	}
 
 	#notify(
@@ -169,12 +391,14 @@ export class LocalSession {
 		type: Notice["type"] = "info",
 		activity: Activity = {},
 	): void {
-		if (this.#context)
-			this.#pi.appendEntry<Notice>("chappie.notice", {
+		if (this.#context) {
+			this.#api.appendEntry("chappie.notice", {
 				message,
 				type,
 				...activity,
 			});
+			if (this.#host === "omp") this.#context.ui.notify(message, type);
+		}
 		if (activity.event !== "history") this.#historyChanged();
 	}
 
@@ -210,21 +434,28 @@ export class LocalSession {
 	}
 
 	async transfer(
-		...parameters: Parameters<typeof transfer.execute>
-	): ReturnType<typeof transfer.execute> {
-		const [id, args, signal, update, context] = parameters;
-		if (!args.to) return transfer.execute(...parameters);
+		args: TransferArgs,
+		signal: AbortSignal | undefined,
+		update: TransferUpdate | undefined,
+		context: TransferExecutionContext,
+	): Promise<
+		ReturnType<typeof executeTransfer> extends Promise<infer Result>
+			? Result
+			: never
+	> {
+		if (!args.to) return executeTransfer(args, signal, update, context);
 		if (args.files) throw new Error("files and to are mutually exclusive");
-		if (args.paths.length !== args.to.paths.length)
+		if (args.paths.length !== args.to.paths.length) {
 			throw new Error("Source and destination counts must match");
+		}
 		const inspected = await this.#request(
 			{ type: "inspect", sessionId: args.to.sessionId },
 			signal,
 		);
-		if (!("inspection" in inspected))
+		if (!("inspection" in inspected)) {
 			throw new Error("Pi session returned no environment");
-		const exported = await transfer.execute(
-			id,
+		}
+		const exported = await executeTransfer(
 			{ paths: args.paths },
 			signal,
 			undefined,
@@ -250,8 +481,9 @@ export class LocalSession {
 			},
 			signal,
 		);
-		if (!("transfer" in result))
+		if (!("transfer" in result)) {
 			throw new Error("Pi session returned no transfer result");
+		}
 		return transferResult({ ...result.transfer, device: hostname() });
 	}
 
@@ -278,7 +510,7 @@ export class LocalSession {
 	}
 
 	#update(
-		context: ExtensionContext,
+		context: ChappieContext,
 		active = context.model?.provider === "chappie",
 	): void {
 		this.#context = context;
@@ -318,7 +550,7 @@ export class LocalSession {
 	#description(): SessionDescription {
 		const context = this.#context;
 		if (!context) throw new Error("Chappie session is not available");
-		const name = this.#pi.getSessionName();
+		const name = this.#api.getSessionName();
 		return {
 			id: context.sessionManager.getSessionId(),
 			cwd: context.cwd,
@@ -613,14 +845,14 @@ export class LocalSession {
 	}
 
 	#inspection(): SessionInspection {
-		const activeTools = new Set(this.#pi.getActiveTools());
+		const activeTools = new Set(this.#api.getActiveTools());
 		this.#collectInputs();
 		return {
 			session: this.#description(),
-			tools: this.#pi
+			tools: this.#api
 				.getAllTools()
 				.filter((tool) => activeTools.has(tool.name)),
-			skills: this.#pi
+			skills: this.#api
 				.getCommands()
 				.filter((command) => command.source === "skill"),
 		};
@@ -678,7 +910,7 @@ export class LocalSession {
 		)
 			return;
 		this.#starting = true;
-		this.#pi.sendMessage(
+		this.#api.sendMessage(
 			{
 				customType: "chappie.request",
 				content: "",
@@ -691,12 +923,22 @@ export class LocalSession {
 	async #turnEnd(
 		message: unknown,
 		toolResults: ToolResultMessage[],
-		context: ExtensionContext,
+		context: ChappieContext,
 	): Promise<void> {
 		this.#context = context;
 		this.#historyChanged();
 		const active = this.#active;
-		if (!active || message !== active.message) return;
+		if (!active) return;
+		const responseSource =
+			typeof message === "object" && message !== null
+				? (message as { chappie?: Source }).chappie
+				: undefined;
+		if (
+			message !== active.message &&
+			(this.#host !== "omp" ||
+				!sameSource(responseSource, active.message.chappie))
+		)
+			return;
 		const sessionId = active.session.id;
 		for (const result of toolResults) rememberImages(sessionId, result.content);
 		active.completed = true;
@@ -737,7 +979,7 @@ export class LocalSession {
 	}
 
 	#resetInputs(
-		context?: ExtensionContext,
+		context?: ChappieContext,
 		cursor = context?.sessionManager.getLeafId() ?? null,
 	): void {
 		this.#sessionId = context?.sessionManager.getSessionId();

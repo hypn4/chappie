@@ -15,10 +15,10 @@ import { pipeline } from "node:stream/promises";
 import {
 	formatSize,
 	type ToolDefinition,
-	withFileMutationQueue,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
-import { Type } from "typebox";
+import { type Static, Type } from "typebox";
+import { withFileMutationQueue } from "./file-mutation-queue.ts";
 import {
 	describeResource,
 	type ResourceDescriptor,
@@ -66,69 +66,82 @@ const parameters = Type.Object({
 	),
 });
 
+export type TransferArgs = Static<typeof parameters>;
+
+export interface TransferExecutionContext {
+	sessionId: string;
+	cwd: string;
+}
+
+export type TransferUpdate = (result: {
+	content: { type: "text"; text: string }[];
+	details: TransferDetails;
+}) => void;
+
+export async function executeTransfer(
+	args: TransferArgs,
+	signal: AbortSignal | undefined,
+	update: TransferUpdate | undefined,
+	context: TransferExecutionContext,
+): Promise<{
+	content: { type: "text"; text: string }[];
+	details: TransferDetails;
+}> {
+	const { sessionId, cwd } = context;
+	const device = hostname();
+	update?.({ content: [], details: { device, files: [], resources: [] } });
+	if (!args.files) {
+		const resources = await Promise.all(
+			args.paths.map((requested) =>
+				requested.startsWith("chappie://")
+					? describeResource(sessionId, requested)
+					: registerFile(sessionId, localPath(requested, cwd)),
+			),
+		);
+		return {
+			content: [{ type: "text" as const, text: JSON.stringify({ resources }) }],
+			details: { device, files: [], resources },
+		};
+	}
+
+	if (args.files.length !== args.paths.length) {
+		throw new Error("files and paths must contain the same number of entries");
+	}
+	const files = await Promise.all(
+		args.paths.map(async (requested, index) => {
+			const path = localPath(requested, cwd);
+			const source = args.files?.[index];
+			if (!source) throw new Error("files and paths must correspond by index");
+			try {
+				const bytes = await importFile(
+					path,
+					source.download_url,
+					args.overwrite === true,
+					signal,
+				);
+				return { path, bytes };
+			} catch (error) {
+				return {
+					path: requested,
+					error: error instanceof Error ? error.message : String(error),
+				};
+			}
+		}),
+	);
+	return transferResult({ device, files, resources: [] });
+}
+
 export const transfer = {
 	name: "transfer",
 	label: "transfer",
 	description:
 		"Copy ChatGPT files into Pi paths with files, or copy Pi files to another session with to. Otherwise, return resource links for Pi paths or Chappie image references.",
 	parameters,
-	async execute(
-		_id,
-		args,
-		signal,
-		update,
-		context,
-	): Promise<{
-		content: { type: "text"; text: string }[];
-		details: TransferDetails;
-	}> {
-		const sessionId = context.sessionManager.getSessionId();
-		const device = hostname();
-		update?.({ content: [], details: { device, files: [], resources: [] } });
-		if (!args.files) {
-			const resources = await Promise.all(
-				args.paths.map((requested) =>
-					requested.startsWith("chappie://")
-						? describeResource(sessionId, requested)
-						: registerFile(sessionId, localPath(requested, context.cwd)),
-				),
-			);
-			return {
-				content: [
-					{ type: "text" as const, text: JSON.stringify({ resources }) },
-				],
-				details: { device, files: [], resources },
-			};
-		}
-
-		if (args.files.length !== args.paths.length) {
-			throw new Error(
-				"files and paths must contain the same number of entries",
-			);
-		}
-		const files = await Promise.all(
-			args.paths.map(async (requested, index) => {
-				const path = localPath(requested, context.cwd);
-				const source = args.files?.[index];
-				if (!source)
-					throw new Error("files and paths must correspond by index");
-				try {
-					const bytes = await importFile(
-						path,
-						source.download_url,
-						args.overwrite === true,
-						signal,
-					);
-					return { path, bytes };
-				} catch (error) {
-					return {
-						path: requested,
-						error: error instanceof Error ? error.message : String(error),
-					};
-				}
-			}),
-		);
-		return transferResult({ device, files, resources: [] });
+	async execute(_id, args, signal, update, context) {
+		return executeTransfer(args, signal, update, {
+			sessionId: context.sessionManager.getSessionId(),
+			cwd: context.cwd,
+		});
 	},
 	renderCall(args, theme, context) {
 		const device = context.state.device ?? hostname();
@@ -293,6 +306,8 @@ async function importFile(
 				if (!response.ok || !response.body) {
 					throw new Error(`Download failed with HTTP ${response.status}`);
 				}
+				// SAFETY: Node/Bun fetch response bodies yield Uint8Array chunks; the
+				// AsyncIterable view is the shape consumed by Readable.from below.
 				content = response.body as unknown as AsyncIterable<Uint8Array>;
 			} else content = source;
 			const readable = Readable.from(content, { objectMode: false });

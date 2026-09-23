@@ -2,7 +2,7 @@ import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import * as z from "zod";
 import type { Activity, Source } from "./activity.ts";
 import { toolResultsContent } from "./delivery.ts";
-import type { ProviderOutput } from "./provider.ts";
+import type { ProviderOutput } from "./provider-core.ts";
 import { contentWithImageReferences, rememberImages } from "./resources.ts";
 
 export const historyInput = z.object({
