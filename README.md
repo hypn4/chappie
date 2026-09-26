@@ -10,7 +10,7 @@ The original MIT license and attribution are retained.
 ## Setup
 
 The broker requires Node.js 26 or newer. Use npm's `npx`, or install Bun to
-use `bunx`; both launch the published `chappie-omp` executable with Node.js.
+use `bun x`; both launch the published `chappie-omp` executable with Node.js.
 
 Install Chappie for the host you use:
 
@@ -56,19 +56,24 @@ mcp:
       command: npx --yes --package @hypn4/chappie@latest chappie-omp
 ```
 
-Or [bunx](https://bun.sh/docs/pm/bunx):
+Or [Bun (`bun x`)](https://bun.sh/docs/pm/bunx):
 
 ```yaml
 mcp:
   commands:
     - channel: main
-      command: bunx --package @hypn4/chappie@latest chappie-omp
+      command: bun x --package @hypn4/chappie@latest chappie-omp
 ```
+
+`bunx` is Bun's documented alias for `bun x`; both accept the same arguments.
+Prefer `bun x` in configuration so a separate `bunx` command is not required
+on `PATH`, including Windows installations that expose only `bun`. If `bunx`
+is available, it remains an equivalent alternative.
 
 `--package` selects the package that provides `chappie-omp`. The npx `--yes`
 option accepts package installation without prompting on the MCP input stream.
 The first run may download dependencies; later runs can use the package cache.
-Neither command installs the OMP plugin for you. `bunx` respects the broker's
+Neither command installs the OMP plugin for you. Bun respects the broker's
 Node.js shebang, so no `--bun` override is needed.
 
 Make sure the chosen runner and Node.js are on otunnel's `PATH`. If necessary,
