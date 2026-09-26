@@ -695,8 +695,7 @@ export class Broker {
 				await this.#waitForChange(
 					AbortSignal.any([signal, selectionTimeout]),
 				).catch((error: unknown) => {
-					signal.throwIfAborted();
-					if (selectionTimeout.aborted)
+					if (selectionTimeout.aborted && error === selectionTimeout.reason)
 						throw new Error(
 							"No available unbound session. Use sessions and select a sessionId explicitly.",
 						);
@@ -782,8 +781,7 @@ export class Broker {
 			while (!this.#sessions.has(sessionId))
 				await this.#waitForChange(AbortSignal.any([signal, timeout]));
 		} catch (error) {
-			signal.throwIfAborted();
-			if (timeout.aborted)
+			if (timeout.aborted && error === timeout.reason)
 				throw new Error(
 					`Session ${sessionId} is offline or unavailable. Check sessions and the broker's agent directory.`,
 				);
@@ -801,8 +799,8 @@ export class Broker {
 			(id) => ({ type: "inspect", id, sessionId }),
 			AbortSignal.any([signal, timeout]),
 		).catch((error: unknown) => {
-			signal.throwIfAborted();
-			if (timeout.aborted)
+			// Preserve the cause that settled the request, not a later caller abort.
+			if (timeout.aborted && error === timeout.reason)
 				throw new Error(
 					`Session ${sessionId} did not respond to inspection. Check the local host connection.`,
 				);
