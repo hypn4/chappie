@@ -7,7 +7,7 @@
  * matching files, and always release the next waiter after errors.
  */
 import { realpath } from "node:fs/promises";
-import { resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 
 const fileMutationQueues = new Map<string, Promise<void>>();
 let registrationQueue = Promise.resolve();
@@ -23,12 +23,21 @@ function isMissingPathError(error: unknown): boolean {
 }
 
 async function getMutationQueueKey(filePath: string): Promise<string> {
-	const resolvedPath = resolve(filePath);
-	try {
-		return await realpath(resolvedPath);
-	} catch (error) {
-		if (isMissingPathError(error)) return resolvedPath;
-		throw error;
+	let current = resolve(filePath);
+	const missing: string[] = [];
+	for (;;) {
+		try {
+			const key = join(await realpath(current), ...missing.reverse());
+			// Conservative serialization also covers case-insensitive volumes.
+			return process.platform === "win32" || process.platform === "darwin"
+				? key.toLowerCase()
+				: key;
+		} catch (error) {
+			if (!isMissingPathError(error) || dirname(current) === current)
+				throw error;
+			missing.push(basename(current));
+			current = dirname(current);
+		}
 	}
 }
 

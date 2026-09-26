@@ -117,7 +117,10 @@ function entryContent(
 	const header = { type: "text" as const, text: JSON.stringify(record) };
 	if (entry.type === "message" && entry.message.role === "toolResult") {
 		rememberImages(sessionId, entry.message.content);
-		return [header, ...toolResultsContent([entry.message], sessionId)];
+		return [
+			header,
+			...toolResultsContent([entry.message], sessionId, "references"),
+		];
 	}
 	const blocks =
 		typeof content === "string"

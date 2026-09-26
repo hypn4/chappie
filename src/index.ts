@@ -36,6 +36,8 @@ export default async function chappie(pi: ExtensionAPI): Promise<void> {
 		createPiHostApi(pi),
 		agentDir,
 		config.connect,
+		"pi",
+		config.tls,
 	);
 	session.installPi(pi);
 	pi.registerTool({

@@ -164,6 +164,7 @@ export function createChappieStream(
 		const output = new ProviderOutput(model, options?.signal);
 		if (!output.closed) {
 			queueMicrotask(() => {
+				if (output.closed) return;
 				void start(output).catch((error: unknown) => output.fail(error));
 			});
 		}

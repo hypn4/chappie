@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { open, readFile, stat } from "node:fs/promises";
+import type { BigIntStats } from "node:fs";
+import { open, stat } from "node:fs/promises";
 import { basename } from "node:path";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import mime from "mime";
@@ -16,17 +17,31 @@ export interface ResourceData extends ResourceDescriptor {
 }
 
 type ResourceEntry =
-	| { type: "file"; path: string; descriptor: ResourceDescriptor }
+	| {
+			type: "file";
+			path: string;
+			fingerprint: string;
+			descriptor: ResourceDescriptor;
+	  }
 	| { type: "image"; data: string; descriptor: ResourceDescriptor };
 
-const stores = new Map<string, Map<string, ResourceEntry>>();
+const MAX_FULL_RESOURCE_BYTES = 32 * 1024 * 1024;
+const MAX_IMAGE_CACHE_BYTES = 64 * 1024 * 1024;
+const MAX_RESOURCE_ENTRIES = 512;
+const RESOURCE_TTL_MS = 60 * 60 * 1000;
+const stores = new Map<
+	string,
+	ResourceEntry & { sessionId: string; expires: number }
+>();
 
 export async function registerFile(
 	sessionId: string,
 	path: string,
 ): Promise<ResourceDescriptor> {
-	const info = await stat(path);
+	const info = await stat(path, { bigint: true });
 	if (!info.isFile()) throw new Error(`${path} is not a file`);
+	if (info.size > BigInt(Number.MAX_SAFE_INTEGER))
+		throw new Error("File size exceeds the supported limit");
 	const name = basename(path);
 	const descriptor = resourceDescriptor(
 		sessionId,
@@ -34,9 +49,14 @@ export async function registerFile(
 		randomUUID(),
 		name,
 		mime.getType(path) ?? "application/octet-stream",
-		info.size,
+		Number(info.size),
 	);
-	store(sessionId).set(descriptor.uri, { type: "file", path, descriptor });
+	saveResource(sessionId, {
+		type: "file",
+		path,
+		fingerprint: fingerprint(info),
+		descriptor,
+	});
 	return descriptor;
 }
 
@@ -47,7 +67,7 @@ export function rememberImages(
 	for (const block of content) {
 		if (block.type !== "image") continue;
 		const descriptor = imageDescriptor(sessionId, block);
-		store(sessionId).set(descriptor.uri, {
+		saveResource(sessionId, {
 			type: "image",
 			data: block.data,
 			descriptor,
@@ -116,7 +136,7 @@ export function describeResource(
 	if (parsed.sessionId !== sessionId) {
 		throw new Error("The resource belongs to another Pi session");
 	}
-	const entry = store(sessionId).get(uri);
+	const entry = getResource(canonicalResourceUri(uri));
 	if (!entry) throw new Error(`Unknown Chappie resource: ${uri}`);
 	return entry.descriptor;
 }
@@ -127,45 +147,109 @@ export async function readSessionResource(
 	offset?: number,
 ): Promise<ResourceData> {
 	const descriptor = describeResource(sessionId, uri);
-	const entry = store(sessionId).get(uri);
+	const entry = getResource(canonicalResourceUri(uri));
 	if (!entry) throw new Error(`Unknown Chappie resource: ${uri}`);
-	if (offset === undefined) {
-		const blob =
-			entry.type === "file"
-				? (await readFile(entry.path)).toString("base64")
-				: entry.data;
-		return { ...descriptor, blob };
-	}
-	if (!Number.isSafeInteger(offset) || offset < 0)
+	if (offset !== undefined && (!Number.isSafeInteger(offset) || offset < 0))
 		throw new Error("Resource offset must be a nonnegative integer");
-	const length = Math.min(1024 * 1024, Math.max(0, descriptor.size - offset));
+	if (offset === undefined && descriptor.size > MAX_FULL_RESOURCE_BYTES)
+		throw new Error(
+			"Resource too large for a full read (32 MiB limit); use a session copy or a smaller export",
+		);
+	const start = offset ?? 0;
+	const length =
+		offset === undefined
+			? descriptor.size
+			: Math.min(1024 * 1024, Math.max(0, descriptor.size - start));
 	let data: Buffer;
 	if (entry.type === "file") {
 		await using file = await open(entry.path, "r");
-		const { buffer, bytesRead } = await file.read(
-			Buffer.alloc(length),
-			0,
-			length,
-			offset,
-		);
-		data = buffer.subarray(0, bytesRead);
+		const assertUnchanged = async () => {
+			if (fingerprint(await file.stat({ bigint: true })) !== entry.fingerprint)
+				throw new Error("Exported file changed; request a new export");
+		};
+		await assertUnchanged();
+		data = Buffer.alloc(length);
+		let read = 0;
+		while (read < length) {
+			const { bytesRead } = await file.read(
+				data,
+				read,
+				length - read,
+				start + read,
+			);
+			if (bytesRead === 0)
+				throw new Error("Exported file changed during transfer");
+			read += bytesRead;
+		}
+		await assertUnchanged();
 	} else {
-		data = Buffer.from(entry.data, "base64").subarray(offset, offset + length);
+		data = Buffer.from(entry.data, "base64").subarray(start, start + length);
 	}
 	return { ...descriptor, blob: data.toString("base64") };
+}
+
+function fingerprint(info: BigIntStats): string {
+	return [info.dev, info.ino, info.size, info.mtimeNs, info.ctimeNs].join(":");
+}
+
+export function canonicalResourceUri(uri: string): string {
+	const { sessionId, kind, id, name } = parseResourceUri(uri);
+	return `chappie://session/${encodeURIComponent(sessionId)}/${kind}/${encodeURIComponent(id)}/${encodeURIComponent(name)}`;
 }
 
 export function resourceSessionId(uri: string): string {
 	return parseResourceUri(uri).sessionId;
 }
 
-function store(sessionId: string): Map<string, ResourceEntry> {
-	let resources = stores.get(sessionId);
-	if (!resources) {
-		resources = new Map();
-		stores.set(sessionId, resources);
+function expireResources(): void {
+	const now = Date.now();
+	for (const [uri, entry] of stores) {
+		if (entry.expires <= now) stores.delete(uri);
 	}
-	return resources;
+}
+
+function getResource(uri: string): ResourceEntry | undefined {
+	expireResources();
+	const entry = stores.get(uri);
+	if (entry) {
+		stores.delete(uri);
+		entry.expires = Date.now() + RESOURCE_TTL_MS;
+		stores.set(uri, entry);
+	}
+	return entry;
+}
+
+function saveResource(sessionId: string, entry: ResourceEntry): void {
+	expireResources();
+	const bytes = entry.type === "image" ? entry.descriptor.size : 0;
+	if (bytes > MAX_FULL_RESOURCE_BYTES)
+		throw new Error("Image exceeds the 32 MiB resource limit");
+	stores.delete(entry.descriptor.uri);
+	let retained = [...stores.values()].reduce(
+		(total, value) =>
+			total + (value.type === "image" ? value.descriptor.size : 0),
+		0,
+	);
+	for (const [uri, value] of stores) {
+		if (
+			stores.size < MAX_RESOURCE_ENTRIES &&
+			retained + bytes <= MAX_IMAGE_CACHE_BYTES
+		)
+			break;
+		stores.delete(uri);
+		if (value.type === "image") retained -= value.descriptor.size;
+	}
+	stores.set(entry.descriptor.uri, {
+		...entry,
+		sessionId,
+		expires: Date.now() + RESOURCE_TTL_MS,
+	});
+}
+
+export function releaseSessionResources(sessionId: string): void {
+	for (const [uri, entry] of stores) {
+		if (entry.sessionId === sessionId) stores.delete(uri);
+	}
 }
 
 function resourceDescriptor(
@@ -202,7 +286,7 @@ function parseResourceUri(uri: string): {
 		throw new Error(`Invalid Chappie resource: ${uri}`);
 	}
 	const [sessionId, kind, id, name] = parts;
-	if (!sessionId || !kind || !id || !name) {
+	if (!sessionId || (kind !== "file" && kind !== "image") || !id || !name) {
 		throw new Error(`Invalid Chappie resource: ${uri}`);
 	}
 	return { sessionId, kind, id, name };

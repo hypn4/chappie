@@ -25,6 +25,7 @@ jobs:
         with:
           runtime: node@26
       - uses: biomejs/setup-biome@v2
+      - run: pnpm install --frozen-lockfile
       - run: pnpm check
       - run: pnpm pack
       - uses: actions/upload-artifact@v7

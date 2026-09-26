@@ -1,0 +1,195 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { TestContext } from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
+import type { ToolResultMessage } from "@earendil-works/pi-ai";
+import { Broker } from "../../src/broker.ts";
+import type {
+	OmpExtensionAPI,
+	OmpExtensionContext,
+} from "../../src/omp-api.ts";
+import { ProviderOutput } from "../../src/provider-core.ts";
+import { createOmpHostApi, LocalSession } from "../../src/session.ts";
+
+export async function until(
+	condition: () => boolean,
+	milliseconds = 2500,
+): Promise<void> {
+	const deadline = Date.now() + milliseconds;
+	while (!condition()) {
+		if (Date.now() >= deadline) throw new Error("Fixture condition timed out");
+		await delay(5);
+	}
+}
+
+export async function sessionFixture(t: TestContext) {
+	const root = await mkdtemp(
+		join(process.platform === "win32" ? tmpdir() : "/tmp", "chs-"),
+	);
+	const controller = new AbortController();
+	const watchdog = setTimeout(
+		() => controller.abort(new Error("fixture timeout")),
+		8000,
+	);
+	const handlers = new Map<
+		string,
+		(event: unknown, context: OmpExtensionContext) => unknown
+	>();
+	const timers: NodeJS.Timeout[] = [];
+	let probes = 0;
+	let aborts = 0;
+	const api = {
+		on(
+			name: string,
+			handler: (event: unknown, context: OmpExtensionContext) => unknown,
+		) {
+			handlers.set(name, handler);
+		},
+		appendEntry() {},
+		getSessionName() {
+			return undefined;
+		},
+		getActiveTools: () => ["read"],
+		getAllTools: () => [
+			{
+				name: "read",
+				description: "fixture",
+				parameters: {
+					type: "object",
+					properties: { path: { type: "string" } },
+				},
+			},
+		],
+		getCommands: () => [],
+		sendMessage() {},
+	} as unknown as OmpExtensionAPI;
+	function context(id: string): OmpExtensionContext {
+		return {
+			cwd: join(root, id),
+			model: { provider: "chappie" },
+			ui: { notify() {} },
+			sessionManager: {
+				getSessionId: () => id,
+				getCwd: () => join(root, id),
+				getLeafId: () => null,
+				getLeafEntry: () => undefined,
+				getEntry: () => undefined,
+				getBranch: () => [],
+			},
+			isIdle() {
+				probes++;
+				return false;
+			},
+			abort() {
+				aborts++;
+			},
+			setInterval() {
+				const timer = setInterval(() => {}, 100000);
+				timer.unref();
+				timers.push(timer);
+				return timer;
+			},
+		};
+	}
+	let current = context("A");
+	let broker = new Broker(root);
+	const local = new LocalSession(createOmpHostApi(api), root, undefined, "omp");
+	t.after(async () => {
+		controller.abort(new Error("fixture cleanup"));
+		for (const timer of timers) clearInterval(timer);
+		local.close();
+		await broker.close();
+		clearTimeout(watchdog);
+		await delay(10);
+		await rm(root, { recursive: true, force: true });
+	});
+	async function emit(name: string, event: unknown, ctx = current) {
+		await handlers.get(name)?.(event, ctx);
+	}
+	await broker.start();
+	local.installOmp(api);
+	await emit("session_start", {});
+	await until(() => broker.listSessions().length === 1);
+	await broker.initialize(
+		"test-chat",
+		"A",
+		"initialization",
+		controller.signal,
+	);
+	return {
+		root,
+		local,
+		controller,
+		context,
+		emit,
+		get broker() {
+			return broker;
+		},
+		get current() {
+			return current;
+		},
+		get aborts() {
+			return aborts;
+		},
+		async queue(requestId = "request-A") {
+			const prior = probes;
+			const pending = broker
+				.call(
+					"test-chat",
+					current.sessionManager.getSessionId(),
+					[{ name: "read", arguments: { path: "test.txt" } }],
+					requestId,
+					controller.signal,
+				)
+				.then(
+					(result) => ({ result }),
+					(error) => ({ error: String(error) }),
+				);
+			await until(() => probes > prior);
+			return { pending };
+		},
+		async dispatch() {
+			const output = new ProviderOutput(
+				{ api: "chappie", provider: "chappie", id: "chatgpt" },
+				controller.signal,
+			);
+			await local.start(output);
+			return output;
+		},
+		async complete(output: ProviderOutput, ctx = current) {
+			const call = output.message.content.find(
+				(block) => block.type === "toolCall",
+			);
+			if (call?.type !== "toolCall") throw new Error("Fixture expected a call");
+			const result: ToolResultMessage = {
+				role: "toolResult",
+				toolCallId: call.id,
+				toolName: call.name,
+				content: [{ type: "text", text: "completed" }],
+				isError: false,
+				timestamp: Date.now(),
+			};
+			await emit(
+				"turn_end",
+				{ message: structuredClone(output.message), toolResults: [result] },
+				ctx,
+			);
+			await emit("agent_end", { willContinue: false }, ctx);
+		},
+		async switchTo(id: string) {
+			current = context(id);
+			await emit("session_switch", {});
+			await until(() =>
+				broker.listSessions().some((session) => session.id === id),
+			);
+		},
+		async reconnect() {
+			await broker.close();
+			await delay(30);
+			broker = new Broker(root);
+			await broker.start();
+			await until(() => broker.listSessions().length === 1);
+		},
+	};
+}

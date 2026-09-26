@@ -38,7 +38,7 @@ mcp:
 On Windows, use the corresponding
 `%USERPROFILE%\.omp\plugins\node_modules\.bin\chappie-omp.cmd` path.
 
-Start the agent in a project:
+Add the tunnel as a developer-mode app in ChatGPT, then start the agent in a project:
 
 ```sh
 # Pi
@@ -59,15 +59,16 @@ Install dependencies and run the repository checks:
 ```sh
 pnpm install
 pnpm check
+pnpm build
 ```
 
-For a local OMP checkout, point the otunnel profile at the source broker:
+For a local OMP checkout, point the otunnel profile at the built broker:
 
 ```yaml
 mcp:
   commands:
     - channel: main
-      command: node /absolute/path/to/chappie/src/cli.omp.ts
+      command: node /absolute/path/to/chappie/dist/src/cli.omp.js
 ```
 
 Then load the source extension directly:
@@ -78,11 +79,17 @@ omp --no-extensions -e /absolute/path/to/chappie/src/index.omp.ts --model chappi
 
 Restart otunnel after changing its broker command, then use `sessions` or
 `init` from ChatGPT to verify that the OMP session is visible.
+After changing tool schemas, refresh the plugin connection in ChatGPT and test
+in a new conversation. Restarting the broker alone does not refresh cached tools.
 
 Pi and OMP use different local sockets by default: `~/.pi/agent/chappie.sock`
-and `~/.omp/agent/chappie.sock`. otunnel must launch the broker for the host
-being tested; a Pi broker only exposes Pi sessions, and an OMP broker only
-exposes OMP sessions.
+and `~/.omp/agent/chappie.sock` (named pipes on Windows). The broker and agent
+must use the same endpoint; the host name alone does not filter sessions.
+
+`pnpm check` includes installed-layout Node CLI and pinned Pi runtime tests. With OMP on `PATH`,
+`pnpm test:omp` also checks a temporary OMP session without using a model API.
+The packaged broker is JavaScript; direct TypeScript execution is only for
+source checkouts outside `node_modules`.
 
 ## Usage
 
@@ -97,20 +104,40 @@ See the [tool guide](docs/tools.md) for session selection, history, agent tools,
 - Pi: `~/.pi/agent/chappie.json`
 - OMP: `~/.omp/agent/chappie.json`
 
-A broker can accept sessions from other devices on the local network:
+Local-only use needs no network settings. For sessions on another device,
+configure mutual TLS with a private CA and a separate certificate/key per
+device. The server certificate must cover the broker's hostname. Certificate
+paths are relative to the agent directory; absolute paths are also accepted.
+
+Broker:
 
 ```json
-{ "listen": true }
+{
+  "listen": true,
+  "listenHost": "192.168.1.10",
+  "tls": { "ca": "ca.pem", "cert": "broker.pem", "key": "broker-key.pem" }
+}
 ```
 
-Remote sessions connect through the broker device's mDNS name:
+Remote agent:
 
 ```json
-{ "connect": "<broker>.local" }
+{
+  "connect": "broker.local",
+  "tls": { "ca": "ca.pem", "cert": "client.pem", "key": "client-key.pem" }
+}
 ```
 
-The default port is `24274`. Set `listen` to a port number or append `:port` to `connect` to use another one. Only the broker device runs otunnel; local and remote sessions appear in the same session list.
+Replace the address and hostname with the broker's actual values. TCP defaults
+to port `24274` and a loopback listener unless `listenHost` is set. A numeric
+`listen` or `connect` host with `:port` selects another port. Only the broker
+runs otunnel. Authenticated devices share local-agent privileges; use a CA
+trusted only for those devices. Never distribute the CA's private key.
+
+Existing plaintext `listen`/`connect` configurations must add `tls` on both
+sides. Plaintext fallback is deliberately not supported. Local Unix sockets
+and Windows named pipes do not require certificates.
 
 Set `ask` to `false` to disable webpage questions.
 
-Closely spaced initializations from the same ChatGPT conversation receive guidance to observe the ongoing work through `history` and explain its results. See [participation](docs/tools.md#participation).
+Closely spaced initializations from the same ChatGPT conversation receive guidance to observe through `history` without repeating exports or the completion response. See [participation](docs/tools.md#participation).

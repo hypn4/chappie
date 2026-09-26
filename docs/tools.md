@@ -16,7 +16,7 @@
 | `call` | Run one or more Pi tools as one native batch. |
 | `read` | Read local text or images. |
 | `bash` | Run a shell command. |
-| `edit` | Apply text replacements. |
+| `edit` | Apply Pi text replacements or an OMP native patch. |
 | `write` | Write text to a file. |
 | `transfer` | Move files between ChatGPT and Pi, copy between Pi sessions, or export a Pi image. |
 
@@ -26,11 +26,16 @@ Call `init` at the start of local work. Without `sessionId`, it reuses the conve
 
 When `globalAgents` is present, read and follow the instructions at `globalAgents.path` on the selected Pi session. Follow the participation guidance in `initialization.instructions`.
 
-`sessions` lists connected sessions with their ID, device, working directory, name, execution status, and binding count. The first execution tool call establishes the default using its `sessionId` or an online session with no saved bindings. Once a default exists, another tool's `sessionId` selects only that operation's target; `init({ sessionId })` changes the default.
+`sessions` lists connected sessions with their ID, host (`pi` or `omp`), agent directory, device, working directory, name, execution status, and binding count. The list is a broker snapshot and does not wait for a host inspection. The first execution tool call establishes the default using its `sessionId` or an online session with no saved bindings. Once a default exists, another tool's `sessionId` selects only that operation's target; `init({ sessionId })` changes the default.
 
 Several ChatGPT conversations can use the same Pi session. One conversation can also operate on several Pi sessions explicitly. Requests already assigned to a session continue there even if the conversation later changes its default.
 
-Remote Pi sessions appear in the same list when they connect to a broker exposed through `listen` and `connect`. Their tools, global `AGENTS.md`, files, images, and Pi interfaces come from the remote device.
+Remote Pi sessions appear in the same list when they connect through `listen` and `connect` with mutual TLS configured on both devices. Their tools, global `AGENTS.md`, files, images, and Pi interfaces come from the remote device.
+
+Host-session switches reject queued work for the old session instead of
+retargeting it. Late results retain their original session and directory.
+Offline selection waits at most five seconds; inspection waits at most three
+seconds. An explicit target is never replaced with another project.
 
 ## History
 
@@ -46,17 +51,23 @@ To follow progress, pass `after` with `wait: true`. Available entries return imm
 
 Set `observer: true` to read as an observer. New messages and work activity wake waiting readers; idle status alone does not indicate task completion.
 
-History includes saved messages, tool calls and results, summaries, images, file links, and work activity. Truncation notices and full-output paths are included so complete output can be read when needed. Reading history leaves new input and pending results available for normal delivery.
+History includes saved messages, tool calls and results, summaries, images, file references, and work activity. File references are records, not new attachments; reading history does not re-export files. Truncation notices and full-output paths are included so complete output can be read when needed. Reading history leaves new input and pending results available for normal delivery.
 
 ## Participation
 
-The executing assistant uses `chat` to share progress and completion in Pi. When initialization directs an assistant to observe, it follows that work through `history` with `observer: true` and `wait: true`, thinks independently, and explains the recorded results in ChatGPT when the task is complete.
+The executing assistant uses `chat` to share progress and completion in Pi. When initialization directs an assistant to observe, it follows that work through `history` with `observer: true` and `wait: true`, thinks independently, and leaves the completion response to the original execution. Observers must not repeat exports or post a second completion response.
 
 ## Pi tools
 
 ChatGPT truncates tool responses exceeding 10,000 tokens.
 
 `read`, `bash`, `edit`, `write`, and `transfer` are available directly. `init` includes a short catalog of the active Pi tools; use `tools` for their complete definitions and `call` to invoke extension tools.
+
+For OMP, direct `read` translates `offset`/`limit` and preserves native snapshot
+anchors. Direct `edit` accepts `patch` containing the exact native patch format
+returned by `read`/`tools`; it does not synthesize anchors from Pi text edits.
+`call` always takes native arguments. Tool definitions that cannot be converted
+to JSON Schema report `schemaError` instead of silently omitting their contract.
 
 For example:
 
@@ -85,7 +96,7 @@ Pi controls execution inside that batch. Separate requests run in order within o
 
 Pi user input consumed during the work accompanies later Chappie results, including images.
 
-If a request is explicitly cancelled after local work has produced results, those results can accompany a later response to the originating ChatGPT conversation. Long-running local work is better run through the environment's persistent process facilities instead of occupying one tool request.
+If cancellation or a broken broker connection interrupts result delivery, late results can accompany a later response to the originating ChatGPT conversation. A broker restart reloads operation receipts, but an agent process exit cannot recover unfinished in-memory work automatically. Check history before retrying a state-changing operation. Long-running local work is better run through the environment's persistent process facilities instead of occupying one tool request.
 
 The active model remains the current ChatGPT conversation. Starting another `chappie/chatgpt` agent inside Pi does not create another browser conversation; tools that need another model should use a separately configured provider.
 
@@ -119,7 +130,28 @@ Questions remain available after the assistant response and across broker restar
 
 ## Files
 
+Supply a stable `operationId` when calling `transfer` from ChatGPT. Keep it
+unchanged when the same operation resumes after approval or a connection retry;
+use a new ID for a new user request. Replays return a receipt without repeating
+execution or attaching files again. An uncertain receipt requires checking the
+original work, not automatically retrying it. Completed receipts are retained for
+24 hours; unresolved receipts are not evicted automatically. ChatGPT still owns
+approval prompts and final response rendering. The broker does not suppress or bypass host approvals. Each state file retains at most 16,384 operation receipts and fails closed when unresolved work fills that limit.
+
 `transfer.paths` always names paths or image references on the Pi side. Relative paths resolve from the selected Pi session's working directory; absolute paths and `~/` are accepted.
+
+A completed replay receipt confirms native execution, not attachment receipt.
+Its `delivery.resources` preserves the original references without attaching them
+again. `sourceReadAt`, when present, records a successful broker-side source read;
+`hostReceipt` remains `unconfirmed` because that does not prove ChatGPT saved it.
+Older receipts may lack references; inspect history instead of recreating work.
+
+For an explicitly requested missing-file recovery, pass the original resource URI
+to `transfer.paths`, with a stable `operationId` for that separate delivery request.
+This reuses the registered resource, not the source command or a new export of the
+path. Approval resumes reuse that same ID. Do not do this automatically or after
+an approval denial. If the reference expired or its source changed, recovery fails
+without regenerating the file or repeating the original task.
 
 ### ChatGPT to Pi
 
@@ -127,36 +159,44 @@ Pair Pi destinations with ChatGPT files:
 
 ```json
 {
+  "operationId": "import-reference-and-data-1",
   "paths": ["assets/reference.png", "data/input.csv"],
   "files": ["/mnt/data/reference.png", "/mnt/data/input.csv"]
 }
 ```
 
-The ChatGPT host turns the cloud paths or attachment references into downloadable file objects before the call reaches Chappie. Parent directories are created as needed.
+The ChatGPT host turns the cloud paths or attachment references into downloadable file objects before the call reaches Chappie. Use the direct `transfer` tool for these imports; nesting cloud file references inside `call` does not apply the same file conversion. Parent directories are created as needed.
 
 Existing targets produce an error by default. Use `overwrite: true` when replacement is intended:
 
 ```json
 {
+  "operationId": "replace-reference-1",
   "paths": ["assets/reference.png"],
   "files": ["/mnt/data/reference.png"],
   "overwrite": true
 }
 ```
 
-A failed or cancelled transfer removes the incomplete destination opened by that operation. Successful members of a multi-file transfer remain in place.
+Downloads are staged before replacement. A failed or cancelled member leaves its previous destination untouched. Multi-file results retain each success or error and set `isError`/`details.failed` when any member failed; successful files are not rolled back. Transfers accept at most 128 paths.
 
 ### Pi to ChatGPT
 
 Omit `files` to export existing Pi files:
 
 ```json
-{ "paths": ["build/output.zip", "renders/preview.png"] }
+{ "operationId": "export-build-1", "paths": ["build/output.zip", "renders/preview.png"] }
 ```
 
 Chappie returns MCP resource links. ChatGPT retrieves the bytes when it materializes those resources, which can require user confirmation. A resource remains associated with the Pi session that exported it, so that Pi process and source file need to remain available until the bytes are read.
 
-For a directory, create an archive with a Pi tool and export the resulting file.
+If an exported source changes, reading it fails rather than returning mixed or
+truncated bytes. A new export requires a new user intent and operation ID.
+History and delayed results contain references, not new download attachments.
+Full reads are limited to 32 MiB; session copies use 1 MiB chunks. Registrations
+expire after one hour without access and share a 512-entry budget. Cached image
+bytes are limited to 64 MiB. Expired or evicted references must be re-exported
+explicitly. For a directory, create an archive with a Pi tool first.
 
 ### Pi to Pi
 
@@ -164,6 +204,7 @@ Supply `to` to copy files to another connected Pi session:
 
 ```json
 {
+  "operationId": "copy-build-1",
   "sessionId": "<source-session>",
   "paths": ["build/output.zip"],
   "to": {

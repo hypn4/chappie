@@ -80,7 +80,7 @@ export interface OmpToolDefinition<TArgs, TDetails> {
 			| ((result: { content: unknown[]; details: TDetails }) => void)
 			| undefined,
 		context: OmpExtensionContext,
-	): Promise<{ content: unknown[]; details: TDetails }>;
+	): Promise<{ content: unknown[]; details: TDetails; isError?: boolean }>;
 }
 
 export interface OmpExtensionAPI {

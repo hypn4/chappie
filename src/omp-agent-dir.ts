@@ -3,7 +3,7 @@ import { join, resolve } from "node:path";
 
 const PROFILE_NAME_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const WINDOWS_RESERVED_BASENAME_RE =
-	/^(?:CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])(?:..*)?$/i;
+	/^(?:CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])(?:\..*)?$/i;
 
 function normalizeProfileName(profile: string | undefined): string | undefined {
 	const normalized = profile?.trim();

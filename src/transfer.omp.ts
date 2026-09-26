@@ -5,6 +5,13 @@ import type { TransferArgs, TransferDetails } from "./transfer.ts";
 const parameters = {
 	type: "object",
 	properties: {
+		operationId: {
+			type: "string",
+			minLength: 1,
+			maxLength: 128,
+			description:
+				"Stable transfer ID; reuse across approval retries, not across new user requests.",
+		},
 		paths: {
 			type: "array",
 			items: { type: "string" },

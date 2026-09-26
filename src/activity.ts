@@ -1,6 +1,8 @@
 export interface Source {
 	chatId: string;
 	requestId?: string;
+	invocationId?: string;
+	operationKey?: string;
 }
 
 export interface Activity extends Partial<Source> {

@@ -13,7 +13,10 @@
 	"scripts": {
 		"format": "biome check --write .",
 		"check": "biome check . && tsc && node --test",
-		"test": "node --test"
+		"test": "node --test",
+		"build": "node scripts/build.mjs",
+		"prepack": "node scripts/build.mjs",
+		"test:omp": "node scripts/verify-omp.mjs"
 	},
 	"keywords": [
 		"pi-package",
@@ -47,7 +50,8 @@
 	},
 	"files": [
 		"src",
-		"docs"
+		"docs",
+		"dist"
 	],
 	"publishConfig": {
 		"access": "public"
@@ -62,6 +66,6 @@
 		]
 	},
 	"bin": {
-		"chappie-omp": "./src/cli.omp.ts"
+		"chappie-omp": "./dist/src/cli.omp.js"
 	}
 }

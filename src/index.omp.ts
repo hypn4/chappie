@@ -13,6 +13,7 @@ export default async function chappie(pi: OmpExtensionAPI): Promise<void> {
 		agentDir,
 		config.connect,
 		"omp",
+		config.tls,
 	);
 	session.installOmp(pi);
 	pi.registerTool(createOmpTransferTool(session));
