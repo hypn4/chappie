@@ -13,17 +13,24 @@ Install Chappie for the host you use:
 
 ```sh
 # Pi
-pi install npm:@hypn4/chappie@next
+pi install npm:@hypn4/chappie
 
 # OMP
-omp plugin install @hypn4/chappie@next
+omp plugin install @hypn4/chappie
 ```
 
-Release candidates use the `next` tag. Pin a version, such as
-`@hypn4/chappie@0.6.0-rc.1`, for reproducible installations. Remove the upstream
-package or stop loading the source extension before enabling this package;
-both register the same `chappie/chatgpt` provider and `chappie-omp` executable.
-Keep the broker and extension on the same version.
+Untagged installation selects `latest`. Use `@hypn4/chappie@latest` explicitly
+for the same release, or pin `@hypn4/chappie@0.6.0`. Release candidates remain
+available through `next`. Remove the upstream Chappie package or stop loading
+the source extension before enabling this package; both register the same
+`chappie/chatgpt` provider. Keep the broker and extension on the same version.
+
+`omp --chappie` requires an OMP host with the `omp.cli` manifest interface.
+The maintained host build `@hypn4/oh-my-pi@18.3.2-chappie.1` provides it;
+unmodified upstream OMP 18.3.2 does not. Install that host with the package
+manager that owns your `omp` command and avoid competing global OMP binaries.
+The existing standalone `chappie-omp` remains available with upstream OMP.
+See [host compatibility](docs/publishing.md#host-compatibility) before switching.
 
 Run the broker through [otunnel](https://github.com/zetaloop/otunnel). Use
 `otunnel profiles list` to find the active profile; it is typically
@@ -37,17 +44,20 @@ mcp:
       command: pi --chappie
 ```
 
-OMP uses the standalone broker executable:
+For a host supporting plugin CLI modes:
 
 ```yaml
+# OMP
 mcp:
   commands:
     - channel: main
-      command: $HOME/.omp/plugins/node_modules/.bin/chappie-omp
+      command: omp --chappie
 ```
 
-On Windows, use the corresponding
-`%USERPROFILE%\.omp\plugins\node_modules\.bin\chappie-omp.cmd` path.
+With unmodified upstream OMP, use the **absolute path** to the installed
+`chappie-omp` executable instead. Do not put `$HOME`, `~`, or `%USERPROFILE%`
+in the otunnel command: environment expansion depends on its launcher, not
+YAML. On Windows, the standalone executable is `chappie-omp.cmd`.
 
 Add the tunnel as a developer-mode app in ChatGPT, then start the agent in a project:
 
@@ -60,7 +70,7 @@ omp --model chappie/chatgpt
 ```
 
 Call `init` from ChatGPT to connect to the agent session. When using an OMP
-profile or custom `PI_CONFIG_DIR` / `PI_CODING_AGENT_DIR`, give `chappie-omp`
+profile or custom `PI_CONFIG_DIR` / `PI_CODING_AGENT_DIR`, give the broker
 the same environment so the broker and session resolve the same socket.
 
 ## Development

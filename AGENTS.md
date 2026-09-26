@@ -4,7 +4,7 @@ Chappie is a TypeScript package that connects ChatGPT developer-mode tools to na
 
 ## Architecture
 
-The package has host-specific extension entry points: `src/index.ts` for Pi and `src/index.omp.ts` for OMP. Pi can run the MCP broker through `pi --chappie`; OMP uses the standalone `chappie-omp` broker compiled to `dist/src/cli.omp.js`. Each host extension registers the `chappie/chatgpt` provider and connects its current session through `node:net`: locally through a Unix socket or Windows named pipe in that host's agent directory, or through mutually authenticated TLS when `connect` targets another device.
+The package has host-specific extension entry points: `src/index.ts` for Pi and `src/index.omp.ts` for OMP. Pi can run the MCP broker through `pi --chappie`; OMP hosts with the `omp.cli` interface use `omp --chappie`; the standalone `chappie-omp` broker compiled to `dist/src/cli.omp.js` remains supported on upstream hosts. Each host extension registers the `chappie/chatgpt` provider and connects its current session through `node:net`: locally through a Unix socket or Windows named pipe in that host's agent directory, or through mutually authenticated TLS when `connect` targets another device.
 
 The broker owns ChatGPT conversation bindings, initialization cooldowns, MCP request routing, deferred-result descriptors, and resource dispatch. The host extension owns provider output, native tool execution, session input, branch history, cancellation, and the bytes behind exported resources.
 

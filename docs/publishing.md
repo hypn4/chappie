@@ -84,3 +84,41 @@ Keep Beads data, local settings, and credentials out of Git and the tarball.
 - [pnpm setup inputs](https://github.com/pnpm/setup/blob/main/action.yml)
 - [Workflow artifacts](https://docs.github.com/en/actions/tutorials/store-and-share-data)
 - [npm tarball installation](https://docs.npmjs.com/cli/v11/commands/npm-install/)
+
+## Host compatibility
+
+Chappie 0.6.0 declares `omp.cli.chappie` and exports a callable broker entry.
+OMP must dispatch this manifest entry before consuming stdin; registering an
+extension flag alone cannot provide that behavior. The host changes are on
+`hypn4/oh-my-pi`, branch `feat/plugin-cli-modes`, and distributed separately as
+`@hypn4/oh-my-pi@18.3.2-chappie.1`. This is a fork build, not an upstream release.
+
+For a Bun-managed OMP installation, an explicit host switch is:
+
+```sh
+bun remove --global @oh-my-pi/pi-coding-agent
+bun add --global @hypn4/oh-my-pi@18.3.2-chappie.1
+omp plugin install @hypn4/chappie
+```
+
+Stop running OMP processes before switching the host. Keep `~/.omp` and its
+profiles; do not delete session or authentication data. Users who installed
+OMP through a different package manager should use that same manager for the
+switch. Keep only one `omp` command on PATH. The fork retains upstream's Bun
+runtime requirement and reports the upstream baseline in `omp --version`;
+the installed npm package version identifies the fork revision.
+
+No Chappie install script patches OMP, changes PATH, or replaces a global
+executable. On upstream OMP, the standalone broker remains the supported route.
+
+For integration testing, install the candidate Chappie tarball into an isolated
+home's `.omp/plugins`, then run:
+
+```sh
+node scripts/verify-omp-cli.mjs --home /absolute/test-home --cli /absolute/omp/dist/cli.js
+```
+
+This checks MCP initialization and tool discovery while stdin stays open,
+protocol-only stdout, and EOF shutdown. It does not call a model or modify the
+active tunnel. `--cli` runs the source or bundled host through Bun; omit it to
+check the `omp` command on PATH.

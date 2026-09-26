@@ -1,6 +1,6 @@
 {
 	"name": "@hypn4/chappie",
-	"version": "0.6.0-rc.1",
+	"version": "0.6.0",
 	"description": "Maintained Chappie fork connecting ChatGPT to Pi and Oh My Pi",
 	"devDependencies": {
 		"@earendil-works/pi-ai": "^0.85.1",
@@ -65,7 +65,10 @@
 	"omp": {
 		"extensions": [
 			"./src/index.omp.ts"
-		]
+		],
+		"cli": {
+			"chappie": "./dist/src/cli.omp.js"
+		}
 	},
 	"bin": {
 		"chappie-omp": "./dist/src/cli.omp.js"
