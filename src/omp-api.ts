@@ -36,6 +36,7 @@ interface OmpEventMap {
 	tool_call: unknown;
 	session_compact: unknown;
 	context: { messages: Array<{ role: string; customType?: string }> };
+	before_provider_request: { payload: unknown };
 	turn_end: { message: unknown; toolResults: ToolResultMessage[] };
 	agent_end: { willContinue?: boolean };
 	session_shutdown: unknown;
@@ -48,7 +49,15 @@ export interface OmpProviderConfig {
 	streamSimple?: (
 		model: { api: string; provider: string; id: string },
 		context: unknown,
-		options?: { signal?: AbortSignal },
+		options?: {
+			signal?: AbortSignal;
+			sessionId?: string;
+			onPayload?: (
+				payload: unknown,
+				model?: { api: string; provider: string; id: string },
+				signal?: AbortSignal,
+			) => unknown | Promise<unknown>;
+		},
 	) => unknown;
 	models?: Array<{
 		id: string;

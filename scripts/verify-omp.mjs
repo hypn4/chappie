@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+	mkdir,
+	mkdtemp,
+	readFile,
+	rm,
+	symlink,
+	writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -19,6 +26,47 @@ const work = join(root, "work");
 await mkdir(agent);
 await mkdir(work);
 await writeFile(join(work, "fixture.txt"), "Alpha\nBeta\nGamma\n");
+const probeExtension = join(root, "provider-probe.ts");
+const reminderFile = join(root, "todo-reminder.txt");
+const settingsFile = join(root, "settings.yml");
+await writeFile(
+	settingsFile,
+	JSON.stringify({ todo: { reminders: true, remindersMax: 1 } }),
+);
+// Relative imports keep the candidate in OMP's dependency-rewrite graph.
+await symlink(
+	extensionRoot,
+	join(root, "candidate"),
+	process.platform === "win32" ? "junction" : "dir",
+);
+// Replace the global provider as another extension instance would, but never
+// spawn a task or subagent. Its disposed owner must not receive root requests.
+await writeFile(
+	probeExtension,
+	`
+import { writeFileSync } from "node:fs";
+import chappie from "./candidate/src/index.omp.ts";
+import { createOmpChappieProvider } from "./candidate/src/provider.omp.ts";
+export default async function probe(api) {
+  await chappie(api);
+  let dispose;
+  const foreign = createOmpChappieProvider(async () => {
+    throw new Error("Provider request was routed to the wrong owner");
+  }, { on(event, handler) { if (event === "session_shutdown") dispose = handler; } });
+  api.registerProvider("chappie", foreign);
+  dispose?.({}, {});
+  api.on("todo_reminder", () => writeFileSync(${JSON.stringify(reminderFile)}, "seen"));
+  const unsupported = foreign.streamSimple(
+    { api: "chappie", provider: "chappie", id: "chatgpt" },
+    { messages: [{ role: "user", content: "Auxiliary probe" }] },
+    { sessionId: "auxiliary-probe" }
+  );
+  const reply = await unsupported.result();
+  if (reply.stopReason !== "error" || !reply.errorMessage?.includes("request hook"))
+    throw new Error("Auxiliary requests must fail before acquiring any owner");
+}
+`,
+);
 const broker = new Broker(agent);
 const controller = new AbortController();
 const timer = setTimeout(
@@ -44,8 +92,10 @@ try {
 		"--no-prewalk",
 		"--approval-mode",
 		"yolo",
+		"--config",
+		settingsFile,
 		"-e",
-		join(extensionRoot, "src/index.omp.ts"),
+		probeExtension,
 		"--model",
 		"chappie/chatgpt",
 	];
@@ -250,6 +300,48 @@ try {
 		recoveredReplay.replay?.delivery?.resources[0]?.uri,
 		links[0].uri,
 	);
+	const todoName = "Verify OMP provider ownership";
+	for (const [label, call] of [
+		[
+			"todo-init",
+			{ name: "todo", arguments: { op: "init", items: [todoName] } },
+		],
+		["todo-read", { name: "read", arguments: { path: "fixture.txt" } }],
+	]) {
+		const result = await broker.call(
+			"integration-chat",
+			session.id,
+			[call],
+			label,
+			signal,
+		);
+		assert.ok(result.toolResults.every((item) => !item.isError));
+	}
+	await broker.chat(
+		"integration-chat",
+		session.id,
+		"Pause with an unfinished TODO.",
+		"todo-stop",
+		signal,
+	);
+	// Read-after-stop exercises the real automatic continuation, not a fake task.
+	const resumed = await broker.call(
+		"integration-chat",
+		session.id,
+		[{ name: "read", arguments: { path: "fixture.txt" } }],
+		"after-reminder",
+		signal,
+	);
+	assert.ok(resumed.toolResults.every((item) => !item.isError));
+	assert.equal(await readFile(reminderFile, "utf8"), "seen");
+	const completedTodo = await broker.call(
+		"integration-chat",
+		session.id,
+		[{ name: "todo", arguments: { op: "done", task: todoName } }],
+		"todo-done",
+		signal,
+	);
+	assert.ok(completedTodo.toolResults.every((item) => !item.isError));
 	await broker.chat(
 		"integration-chat",
 		session.id,
@@ -258,10 +350,10 @@ try {
 		signal,
 	);
 	console.log(
-		"OMP integration passed: schemas, exact read, native edit, resource bytes, three approval-resume simulations, reference-only history, and explicit original-URI recovery.",
+		"OMP integration passed: provider ownership after replacement/disposal, auxiliary rejection, TODO continuation, exact read, native edit, resource bytes, replay and original-URI recovery.",
 	);
 	console.log(
-		"No external model inference or live broker configuration was used. This does not test ChatGPT's approval UI or final response rendering.",
+		"No subagents, external model inference or live broker changes were used. ChatGPT approval UI and final response rendering are not covered.",
 	);
 } catch (error) {
 	console.error(error);
