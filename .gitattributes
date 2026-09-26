@@ -1,2 +1,2 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# Keep source and package bytes consistent on all supported platforms.
+* text=auto eol=lf

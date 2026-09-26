@@ -1,7 +1,7 @@
 {
-	"name": "@zetaloop/chappie",
-	"version": "0.5.0",
-	"description": "Connect ChatGPT to Pi and OMP",
+	"name": "@hypn4/chappie",
+	"version": "0.6.0-rc.1",
+	"description": "Maintained Chappie fork connecting ChatGPT to Pi and Oh My Pi",
 	"devDependencies": {
 		"@earendil-works/pi-ai": "^0.85.1",
 		"@earendil-works/pi-coding-agent": "^0.85.1",
@@ -16,7 +16,8 @@
 		"test": "node --test",
 		"build": "node scripts/build.mjs",
 		"prepack": "node scripts/build.mjs",
-		"test:omp": "node scripts/verify-omp.mjs"
+		"test:omp": "node scripts/verify-omp.mjs",
+		"verify:package": "node scripts/verify-package.mjs"
 	},
 	"keywords": [
 		"pi-package",
@@ -54,11 +55,12 @@
 		"dist"
 	],
 	"publishConfig": {
-		"access": "public"
+		"access": "public",
+		"registry": "https://registry.npmjs.org"
 	},
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/zetaloop/chappie.git"
+		"url": "git+https://github.com/hypn4/chappie.git"
 	},
 	"omp": {
 		"extensions": [
@@ -67,5 +69,15 @@
 	},
 	"bin": {
 		"chappie-omp": "./dist/src/cli.omp.js"
-	}
+	},
+	"homepage": "https://github.com/hypn4/chappie#readme",
+	"bugs": {
+		"url": "https://github.com/hypn4/chappie/issues"
+	},
+	"contributors": [
+		{
+			"name": "hypn4",
+			"url": "https://github.com/hypn4"
+		}
+	]
 }

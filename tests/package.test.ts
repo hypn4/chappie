@@ -21,7 +21,7 @@ test("installed Node CLI uses JavaScript and includes runtime assets", async (t)
 		join(process.platform === "win32" ? tmpdir() : "/tmp", "chpkg-"),
 	);
 	t.after(() => rm(temporary, { recursive: true, force: true }));
-	const installed = join(temporary, "node_modules/@zetaloop/chappie");
+	const installed = join(temporary, "node_modules", pkg.name);
 	await mkdir(installed, { recursive: true });
 	for (const directory of pkg.files)
 		await cp(join(root, directory), join(installed, directory), {

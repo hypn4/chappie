@@ -12,39 +12,57 @@ on:
         default: dryrun
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  package:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-tags: true
-      - uses: pnpm/setup@v2
-        with:
-          runtime: node@26
-      - uses: biomejs/setup-biome@v2
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm check
-      - run: pnpm pack
-      - uses: actions/upload-artifact@v7
-        with:
-          name: package
-          path: zetaloop-chappie-*.tgz
-          if-no-files-found: error
-          compression-level: 0
+  verify:
+    if: github.repository == 'hypn4/chappie'
+    uses: ./.github/workflows/check.yml
+    with:
+      ref: ${{ github.sha }}
 
-      - name: Create release draft
-        if: github.event_name == 'push' || inputs.mode == 'draft'
+  draft:
+    needs: verify
+    if: github.event_name == 'push' || inputs.mode == 'draft'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    env:
+      EXPECTED_INTEGRITY: ${{ needs.verify.outputs.integrity }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+          package-manager-cache: false
+      - name: Validate release identity
+        id: metadata
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PUSH_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
         run: |
-          tag=$(git tag --points-at HEAD --list 'v*' | head -1)
-          if [ -z "$tag" ]; then
-            echo "::notice::No version tag at HEAD; the package is available in this workflow run"
-            exit 0
-          fi
-          version=$(jq -r .version package.json)
-          test "$tag" = "v$version"
-          gh release create "$tag" zetaloop-chappie-*.tgz --verify-tag --draft --title "$tag" --generate-notes
+          git merge-base --is-ancestor HEAD origin/main
+          node scripts/release-metadata.mjs ${PUSH_TAG:+"$PUSH_TAG"}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: npm-package
+      - run: node scripts/verify-package.mjs package.tgz
+      - name: Create release draft from the tested artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.metadata.outputs.tag }}
+          PRERELEASE: ${{ steps.metadata.outputs.prerelease }}
+        run: |
+          test "$(git rev-list -n 1 "$RELEASE_TAG")" = "$(git rev-parse HEAD)"
+          args=()
+          if [ "$PRERELEASE" = true ]; then args+=(--prerelease); fi
+          gh release create "$RELEASE_TAG" package.tgz --verify-tag --draft \
+            --title "$RELEASE_TAG" --generate-notes "${args[@]}"

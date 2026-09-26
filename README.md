@@ -2,17 +2,28 @@
 
 Use ChatGPT to work through [Pi](https://github.com/earendil-works/pi) or [Oh My Pi (OMP)](https://github.com/can1357/oh-my-pi): edit local files, run commands, call agent extensions, exchange files and images, and move between sessions on one or more devices.
 
+This is the maintained [hypn4/chappie](https://github.com/hypn4/chappie) fork of
+[zetaloop/chappie](https://github.com/zetaloop/chappie), published as
+`@hypn4/chappie`. It includes OMP support and connection and file-transfer fixes.
+The original MIT license and attribution are retained.
+
 ## Setup
 
 Install Chappie for the host you use:
 
 ```sh
 # Pi
-pi install npm:@zetaloop/chappie
+pi install npm:@hypn4/chappie@next
 
 # OMP
-omp plugin install @zetaloop/chappie
+omp plugin install @hypn4/chappie@next
 ```
+
+Release candidates use the `next` tag. Pin a version, such as
+`@hypn4/chappie@0.6.0-rc.1`, for reproducible installations. Remove the upstream
+package or stop loading the source extension before enabling this package;
+both register the same `chappie/chatgpt` provider and `chappie-omp` executable.
+Keep the broker and extension on the same version.
 
 Run the broker through [otunnel](https://github.com/zetaloop/otunnel). Use
 `otunnel profiles list` to find the active profile; it is typically
@@ -90,6 +101,8 @@ must use the same endpoint; the host name alone does not filter sessions.
 `pnpm test:omp` also checks a temporary OMP session without using a model API.
 The packaged broker is JavaScript; direct TypeScript execution is only for
 source checkouts outside `node_modules`.
+
+For the fork release process, see [publishing](docs/publishing.md).
 
 ## Usage
 

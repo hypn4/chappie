@@ -22,4 +22,6 @@ Native messages, tool results, and activity records stay in the host session tra
 
 ## Development
 
-Use `pnpm format` and `pnpm check` during development. `pnpm build` compiles the Node broker and copies its runtime assets; `pnpm pack` runs the build automatically. `pnpm test:omp` is an opt-in native OMP smoke test with temporary files and no model inference. For OMP integration testing, run the source broker and source extension from the same checkout and keep their agent-directory settings aligned; see the README development section. Version tags and manual release runs check the source and produce an npm package with a release draft. Publishing the draft runs the npm publishing workflow.
+Use `pnpm format` and `pnpm check` during development. `pnpm build` compiles the Node broker and copies its runtime assets; `pnpm pack` runs the build automatically. `pnpm test:omp` is an opt-in native OMP smoke test with temporary files and no model inference. For OMP integration testing, run the source broker and source extension from the same checkout and keep their agent-directory settings aligned; see the README development section. The reusable check workflow tests source and a single tarball on Linux, macOS, and Windows. Release and publish workflows wait for those checks; the OIDC job publishes the tested artifact without rebuilding it. See docs/publishing.md.
+
+Fork releases use `@hypn4/chappie`; see `docs/publishing.md`. Keep the original license and author, publish only validated tarballs, and never include local task data or credentials.

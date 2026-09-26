@@ -10,6 +10,7 @@ import { toolResultsContent } from "../src/delivery.ts";
 
 // These are synthetic tool requests, not a second model/agent doing inference.
 const checkout = fileURLToPath(new URL("../", import.meta.url));
+const extensionRoot = process.env.CHAPPIE_PACKAGE_ROOT || checkout;
 const root = await mkdtemp(
 	join(process.platform === "win32" ? tmpdir() : "/tmp", "chomp-"),
 );
@@ -44,7 +45,7 @@ try {
 		"--approval-mode",
 		"yolo",
 		"-e",
-		join(checkout, "src/index.omp.ts"),
+		join(extensionRoot, "src/index.omp.ts"),
 		"--model",
 		"chappie/chatgpt",
 	];
