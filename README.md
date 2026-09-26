@@ -9,21 +9,28 @@ The original MIT license and attribution are retained.
 
 ## Setup
 
+The broker requires Node.js 26 or newer. Use npm's `npx`, or install Bun to
+use `bunx`; both launch the published `chappie-omp` executable with Node.js.
+
 Install Chappie for the host you use:
 
 ```sh
 # Pi
-pi install npm:@hypn4/chappie@next
+pi install npm:@hypn4/chappie
 
 # OMP
-omp plugin install @hypn4/chappie@next
+omp plugin install @hypn4/chappie
 ```
 
-Release candidates use the `next` tag. Pin a version, such as
-`@hypn4/chappie@0.6.0-rc.1`, for reproducible installations. Remove the upstream
-package or stop loading the source extension before enabling this package;
-both register the same `chappie/chatgpt` provider and `chappie-omp` executable.
-Keep the broker and extension on the same version.
+Omitting the version selects npm's `latest` tag. To install or update that
+version explicitly, run `omp plugin install @hypn4/chappie@latest`; use
+`omp plugin list` to inspect installed plugins. Release candidates are also
+available on `next`. Pin a version, such as `@hypn4/chappie@0.6.0-rc.1`,
+for reproducible installations, and pin the same version in the broker command.
+
+Remove the upstream package or stop loading the source extension before enabling
+this package; both register the same `chappie/chatgpt` provider. Updating the
+broker does not update the OMP plugin: keep both on the same version.
 
 Run the broker through [otunnel](https://github.com/zetaloop/otunnel). Use
 `otunnel profiles list` to find the active profile; it is typically
@@ -37,17 +44,42 @@ mcp:
       command: pi --chappie
 ```
 
-OMP uses the standalone broker executable:
+For OMP, choose one of these commands. The standalone broker works with
+unmodified OMP; it does not require `omp --chappie` or an OMP fork.
+
+[npx](https://docs.npmjs.com/cli/v11/commands/npx/):
 
 ```yaml
 mcp:
   commands:
     - channel: main
-      command: $HOME/.omp/plugins/node_modules/.bin/chappie-omp
+      command: npx --yes --package @hypn4/chappie@latest chappie-omp
 ```
 
-On Windows, use the corresponding
-`%USERPROFILE%\.omp\plugins\node_modules\.bin\chappie-omp.cmd` path.
+Or [bunx](https://bun.sh/docs/pm/bunx):
+
+```yaml
+mcp:
+  commands:
+    - channel: main
+      command: bunx --package @hypn4/chappie@latest chappie-omp
+```
+
+`--package` selects the package that provides `chappie-omp`. The npx `--yes`
+option accepts package installation without prompting on the MCP input stream.
+The first run may download dependencies; later runs can use the package cache.
+Neither command installs the OMP plugin for you. `bunx` respects the broker's
+Node.js shebang, so no `--bun` override is needed.
+
+Make sure the chosen runner and Node.js are on otunnel's `PATH`. If necessary,
+use the runner's actual absolute path, not a `$HOME` or `%USERPROFILE%` placeholder.
+This avoids depending on shell expansion or the plugin's internal install path.
+
+Start the tunnel with the updated profile:
+
+```sh
+otunnel run --profile chappie
+```
 
 Add the tunnel as a developer-mode app in ChatGPT, then start the agent in a project:
 
@@ -59,9 +91,9 @@ pi --provider chappie --model chatgpt
 omp --model chappie/chatgpt
 ```
 
-Call `init` from ChatGPT to connect to the agent session. When using an OMP
-profile or custom `PI_CONFIG_DIR` / `PI_CODING_AGENT_DIR`, give `chappie-omp`
-the same environment so the broker and session resolve the same socket.
+Call `sessions` or `init` from ChatGPT to connect to the agent session. When using
+an OMP profile or custom `PI_CONFIG_DIR` / `PI_CODING_AGENT_DIR`, launch otunnel
+and OMP with the same environment so the broker and session resolve the same socket.
 
 ## Development
 
