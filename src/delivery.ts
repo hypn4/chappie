@@ -11,11 +11,13 @@ export interface DeliveryRecord extends Source {
 	cwd: string;
 	toolResults: ToolResultMessage[];
 	error?: string;
+	complete?: boolean;
 }
 
 export function toolResultsContent(
 	toolResults: ToolResultMessage[],
 	sessionId: string,
+	resources: "links" | "references" = "links",
 ) {
 	return toolResults.flatMap((result) => [
 		{
@@ -23,17 +25,20 @@ export function toolResultsContent(
 			text: JSON.stringify({
 				toolCallId: result.toolCallId,
 				toolName: result.toolName,
-				isError: result.isError,
+				isError:
+					result.isError ||
+					(result.details as { failed?: boolean } | undefined)?.failed === true,
 			}),
 		},
 		...contentWithImageReferences(sessionId, result.content),
-		...resourceDescriptors(result.details).map((resource) => ({
-			type: "resource_link" as const,
-			uri: resource.uri,
-			name: resource.name,
-			mimeType: resource.mimeType,
-			size: resource.size,
-		})),
+		...resourceDescriptors(result.details).map((resource) =>
+			resources === "links"
+				? { type: "resource_link" as const, ...resource }
+				: {
+						type: "text" as const,
+						text: JSON.stringify({ resourceReference: resource }),
+					},
+		),
 	]);
 }
 
@@ -49,6 +54,10 @@ export function deliveryContent(deliveries: DeliveryRecord[]) {
 				error: delivery.error,
 			}),
 		},
-		...toolResultsContent(delivery.toolResults, delivery.sessionId),
+		...toolResultsContent(
+			delivery.toolResults,
+			delivery.sessionId,
+			"references",
+		),
 	]);
 }

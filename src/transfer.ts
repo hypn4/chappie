@@ -1,24 +1,25 @@
-import { once } from "node:events";
 import { createWriteStream } from "node:fs";
 import {
+	chmod,
 	link,
+	lstat,
 	mkdir,
 	mkdtempDisposable,
 	rename,
 	stat,
-	unlink,
 } from "node:fs/promises";
 import { homedir, hostname } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
+import type { ReadableStream as NodeReadableStream } from "node:stream/web";
 import {
 	formatSize,
 	type ToolDefinition,
-	withFileMutationQueue,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
-import { Type } from "typebox";
+import { type Static, Type } from "typebox";
+import { withFileMutationQueue } from "./file-mutation-queue.ts";
 import {
 	describeResource,
 	type ResourceDescriptor,
@@ -26,10 +27,17 @@ import {
 } from "./resources.ts";
 
 export interface TransferDetails {
+	failed?: boolean;
 	device: string;
 	files: ({ path: string; bytes: number } | { path: string; error: string })[];
 	resources: ResourceDescriptor[];
 	to?: { sessionId: string; device: string };
+}
+
+export interface TransferResult {
+	content: { type: "text"; text: string }[];
+	details: TransferDetails;
+	isError?: boolean;
 }
 
 export const transferFile = Type.Object({
@@ -40,6 +48,14 @@ export const transferFile = Type.Object({
 });
 
 const parameters = Type.Object({
+	operationId: Type.Optional(
+		Type.String({
+			minLength: 1,
+			maxLength: 128,
+			description:
+				"Stable ID for this user-requested transfer. Reuse after approval or transport retries; choose a new ID only for a new user request.",
+		}),
+	),
 	paths: Type.Array(Type.String(), {
 		minItems: 1,
 		description:
@@ -66,69 +82,81 @@ const parameters = Type.Object({
 	),
 });
 
+export type TransferArgs = Static<typeof parameters>;
+
+export interface TransferExecutionContext {
+	sessionId: string;
+	cwd: string;
+}
+
+export type TransferUpdate = (result: {
+	content: { type: "text"; text: string }[];
+	details: TransferDetails;
+}) => void;
+
+export async function executeTransfer(
+	args: TransferArgs,
+	signal: AbortSignal | undefined,
+	update: TransferUpdate | undefined,
+	context: TransferExecutionContext,
+): Promise<TransferResult> {
+	if (args.paths.length < 1 || args.paths.length > 128)
+		throw new Error("Transfers require between 1 and 128 paths");
+	const { sessionId, cwd } = context;
+	const device = hostname();
+	update?.({ content: [], details: { device, files: [], resources: [] } });
+	if (!args.files) {
+		const resources = await Promise.all(
+			args.paths.map((requested) =>
+				requested.startsWith("chappie://")
+					? describeResource(sessionId, requested)
+					: registerFile(sessionId, localPath(requested, cwd)),
+			),
+		);
+		return {
+			content: [{ type: "text" as const, text: JSON.stringify({ resources }) }],
+			details: { device, files: [], resources },
+		};
+	}
+
+	if (args.files.length !== args.paths.length) {
+		throw new Error("files and paths must contain the same number of entries");
+	}
+	const files = await Promise.all(
+		args.paths.map(async (requested, index) => {
+			const path = localPath(requested, cwd);
+			const source = args.files?.[index];
+			if (!source) throw new Error("files and paths must correspond by index");
+			try {
+				const bytes = await importFile(
+					path,
+					source.download_url,
+					args.overwrite === true,
+					signal,
+				);
+				return { path, bytes };
+			} catch (error) {
+				return {
+					path: requested,
+					error: error instanceof Error ? error.message : String(error),
+				};
+			}
+		}),
+	);
+	return transferResult({ device, files, resources: [] });
+}
+
 export const transfer = {
 	name: "transfer",
 	label: "transfer",
 	description:
 		"Copy ChatGPT files into Pi paths with files, or copy Pi files to another session with to. Otherwise, return resource links for Pi paths or Chappie image references.",
 	parameters,
-	async execute(
-		_id,
-		args,
-		signal,
-		update,
-		context,
-	): Promise<{
-		content: { type: "text"; text: string }[];
-		details: TransferDetails;
-	}> {
-		const sessionId = context.sessionManager.getSessionId();
-		const device = hostname();
-		update?.({ content: [], details: { device, files: [], resources: [] } });
-		if (!args.files) {
-			const resources = await Promise.all(
-				args.paths.map((requested) =>
-					requested.startsWith("chappie://")
-						? describeResource(sessionId, requested)
-						: registerFile(sessionId, localPath(requested, context.cwd)),
-				),
-			);
-			return {
-				content: [
-					{ type: "text" as const, text: JSON.stringify({ resources }) },
-				],
-				details: { device, files: [], resources },
-			};
-		}
-
-		if (args.files.length !== args.paths.length) {
-			throw new Error(
-				"files and paths must contain the same number of entries",
-			);
-		}
-		const files = await Promise.all(
-			args.paths.map(async (requested, index) => {
-				const path = localPath(requested, context.cwd);
-				const source = args.files?.[index];
-				if (!source)
-					throw new Error("files and paths must correspond by index");
-				try {
-					const bytes = await importFile(
-						path,
-						source.download_url,
-						args.overwrite === true,
-						signal,
-					);
-					return { path, bytes };
-				} catch (error) {
-					return {
-						path: requested,
-						error: error instanceof Error ? error.message : String(error),
-					};
-				}
-			}),
-		);
-		return transferResult({ device, files, resources: [] });
+	async execute(_id, args, signal, update, context) {
+		return executeTransfer(args, signal, update, {
+			sessionId: context.sessionManager.getSessionId(),
+			cwd: context.cwd,
+		});
 	},
 	renderCall(args, theme, context) {
 		const device = context.state.device ?? hostname();
@@ -202,24 +230,13 @@ function displayPath(path: string): string {
 		: path;
 }
 
-export function transferResult(details: TransferDetails): {
-	content: { type: "text"; text: string }[];
-	details: TransferDetails;
-} {
-	if (details.files.some((file) => "error" in file)) {
-		throw new Error(
-			details.files
-				.map((file) =>
-					"error" in file
-						? `${file.path}: ${file.error}`
-						: `${file.path}  ${formatSize(file.bytes)}`,
-				)
-				.join("\n"),
-		);
-	}
+export function transferResult(details: TransferDetails): TransferResult {
+	const failed = details.files.some((file) => "error" in file);
+	const result = { ...details, ...(failed ? { failed: true } : {}) };
 	return {
-		content: [{ type: "text", text: JSON.stringify(details) }],
-		details,
+		content: [{ type: "text", text: JSON.stringify(result) }],
+		details: result,
+		isError: failed,
 	};
 }
 
@@ -239,19 +256,13 @@ export async function copyFiles(
 			try {
 				const resource = resources[index];
 				if (!resource) throw new Error("Missing source resource");
-				const bytes = await withFileMutationQueue(path, async () => {
-					signal.throwIfAborted();
-					await mkdir(dirname(path), { recursive: true });
-					await using temporary = await mkdtempDisposable(
-						join(dirname(path), ".chappie-"),
-					);
-					const staged = join(temporary.path, "file");
-					const bytes = await importFile(staged, read(resource), false, signal);
-					signal.throwIfAborted();
-					if (overwrite) await rename(staged, path);
-					else await link(staged, path);
-					return bytes;
-				});
+				const bytes = await importFile(
+					path,
+					read(resource),
+					overwrite,
+					signal,
+					resource.size,
+				);
 				return { path, bytes };
 			} catch (error) {
 				return {
@@ -276,38 +287,54 @@ async function importFile(
 	source: string | AsyncIterable<Uint8Array>,
 	overwrite: boolean,
 	signal?: AbortSignal,
+	expectedBytes?: number,
 ): Promise<number> {
 	return withFileMutationQueue(path, async () => {
 		signal?.throwIfAborted();
 		await mkdir(dirname(path), { recursive: true });
-		const writable = createWriteStream(path, {
-			flags: overwrite ? "w" : "wx",
+		const existing = await lstat(path).catch((error: NodeJS.ErrnoException) => {
+			if (error.code !== "ENOENT") throw error;
+			return undefined;
 		});
-		let opened = false;
-		try {
-			await once(writable, "open");
-			opened = true;
-			let content: AsyncIterable<Uint8Array>;
-			if (typeof source === "string") {
-				const response = await fetch(source, signal ? { signal } : {});
-				if (!response.ok || !response.body) {
-					throw new Error(`Download failed with HTTP ${response.status}`);
-				}
-				content = response.body as unknown as AsyncIterable<Uint8Array>;
-			} else content = source;
-			const readable = Readable.from(content, { objectMode: false });
-			if (signal) await pipeline(readable, writable, { signal });
-			else await pipeline(readable, writable);
-			signal?.throwIfAborted();
-			return (await stat(path)).size;
-		} catch (error) {
-			if (!writable.closed) {
-				const closed = once(writable, "close");
-				writable.destroy();
-				await closed.catch(() => {});
+		if (!overwrite && existing)
+			throw new Error(`Destination already exists: ${path}`);
+		await using temporary = await mkdtempDisposable(
+			join(dirname(path), ".chappie-"),
+		);
+		const staged = join(temporary.path, "file");
+		let readable: Readable;
+		if (typeof source === "string") {
+			const url = new URL(source);
+			if (url.protocol !== "https:" && url.protocol !== "http:") {
+				throw new Error("File downloads require an HTTP(S) URL from the host");
 			}
-			if (opened) await unlink(path).catch(() => {});
-			throw error;
+			const response = await fetch(url, signal ? { signal } : {});
+			if (!response.ok || !response.body) {
+				await response.body?.cancel();
+				throw new Error(`Download failed with HTTP ${response.status}`);
+			}
+			// Node fetch uses a native web stream; DOM and Node declarations differ.
+			readable = Readable.fromWeb(
+				response.body as unknown as NodeReadableStream<Uint8Array>,
+			);
+		} else {
+			readable = Readable.from(source, { objectMode: false });
 		}
+		const writable = createWriteStream(staged, { flags: "wx", mode: 0o600 });
+		if (signal) await pipeline(readable, writable, { signal });
+		else await pipeline(readable, writable);
+		const bytes = (await stat(staged)).size;
+		if (expectedBytes !== undefined && bytes !== expectedBytes) {
+			throw new Error(
+				`Incomplete transfer: expected ${expectedBytes} bytes, received ${bytes}`,
+			);
+		}
+		if (overwrite && existing?.isFile())
+			await chmod(staged, existing.mode & 0o777);
+		signal?.throwIfAborted();
+		// link is an atomic no-clobber commit; rename replaces only after success.
+		if (overwrite) await rename(staged, path);
+		else await link(staged, path);
+		return bytes;
 	});
 }

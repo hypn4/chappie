@@ -1,6 +1,8 @@
 export interface Source {
 	chatId: string;
 	requestId?: string;
+	invocationId?: string;
+	operationKey?: string;
 }
 
 export interface Activity extends Partial<Source> {
@@ -13,6 +15,18 @@ export function source(chatId: string, requestId: unknown): Source {
 		chatId,
 		...(typeof requestId === "string" ? { requestId } : {}),
 	};
+}
+
+export function sameSource(
+	left: Source | undefined,
+	right: Source | undefined,
+): boolean {
+	return (
+		left !== undefined &&
+		right !== undefined &&
+		left.chatId === right.chatId &&
+		left.requestId === right.requestId
+	);
 }
 
 export function chatLabel({ chatId, requestId }: Source): string {

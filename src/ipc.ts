@@ -1,25 +1,28 @@
 import { createHash } from "node:crypto";
-import { lstat, unlink } from "node:fs/promises";
+import { chmod, lstat, mkdir, readFile, unlink } from "node:fs/promises";
 import {
 	createConnection,
 	createServer,
+	isIP,
 	type Server,
 	type Socket,
 } from "node:net";
 import { join, resolve } from "node:path";
+import {
+	connect as connectTls,
+	createServer as createTlsServer,
+} from "node:tls";
 import type {
 	AssistantMessage,
 	ToolCall,
 	ToolResultMessage,
 	UserMessage,
 } from "@earendil-works/pi-ai";
-import type {
-	SlashCommandInfo,
-	ToolInfo,
-} from "@earendil-works/pi-coding-agent";
 import type { Activity } from "./activity.ts";
+import type { NetworkTlsConfig } from "./config.ts";
 import type { DeliveryRecord } from "./delivery.ts";
 import type { HistoryRange, HistoryResult } from "./history.ts";
+import { validateBrokerMessage, validateSessionMessage } from "./ipc-schema.ts";
 import type { ResourceData, ResourceDescriptor } from "./resources.ts";
 import type { TransferDetails } from "./transfer.ts";
 
@@ -28,6 +31,8 @@ const defaultPort = 24274;
 export type SessionStatus = "idle" | "ready" | "executing";
 
 export interface SessionDescription {
+	host?: "pi" | "omp";
+	agentDir?: string;
 	id: string;
 	cwd: string;
 	device: string;
@@ -35,10 +40,28 @@ export interface SessionDescription {
 	status: SessionStatus;
 }
 
+export interface SessionToolInfo {
+	name: string;
+	description: string;
+	parameters: unknown;
+	schemaError?: string;
+	promptGuidelines?: string[];
+	sourceInfo?: unknown;
+}
+
+export interface SessionSkillInfo {
+	name: string;
+	description?: string;
+	source: "extension" | "prompt" | "skill";
+	sourceInfo?: unknown;
+	location?: string;
+	path?: string;
+}
+
 export interface SessionInspection {
 	session: SessionDescription;
-	tools: ToolInfo[];
-	skills: SlashCommandInfo[];
+	tools: SessionToolInfo[];
+	skills: SessionSkillInfo[];
 }
 
 export interface SessionInput {
@@ -95,12 +118,14 @@ export type BrokerMessage =
 			range: HistoryRange;
 			chatId: string;
 			requestId?: string;
+			operationKey?: string;
 	  }
 	| {
 			type: "chat";
 			id: number;
 			chatId: string;
 			requestId?: string;
+			operationKey?: string;
 			sessionId: string;
 			text: string;
 	  }
@@ -109,8 +134,10 @@ export type BrokerMessage =
 			id: number;
 			chatId: string;
 			requestId?: string;
+			operationKey?: string;
 			sessionId: string;
 			calls: ToolCall[];
+			direct?: boolean;
 	  }
 	| { type: "cancel"; id: number; sessionId: string; reason: string }
 	| (SessionRequest & { id: number })
@@ -124,10 +151,19 @@ export function ipcEndpoint(agentDir: string): string {
 	return String.raw`\\.\pipe\chappie-${createHash("sha256").update(identity).digest("hex").slice(0, 16)}`;
 }
 
+export interface PeerLimits {
+	maxFrameBytes?: number;
+	maxQueuedBytes?: number;
+	maxQueuedMessages?: number;
+}
+
 export class JsonLinePeer<Incoming, Outgoing> {
 	readonly #socket: Socket;
 	readonly #onMessage: (message: Incoming) => Promise<void> | void;
 	readonly #onClose: () => void;
+	readonly #limits: Required<PeerLimits>;
+	#queuedBytes = 0;
+	#queuedMessages = 0;
 	#buffer = "";
 	#messages = Promise.resolve();
 	#writes = Promise.resolve();
@@ -137,8 +173,16 @@ export class JsonLinePeer<Incoming, Outgoing> {
 		socket: Socket,
 		onMessage: (message: Incoming) => Promise<void> | void,
 		onClose: () => void,
+		limits: PeerLimits = {},
 	) {
 		this.#socket = socket;
+		this.#limits = {
+			maxFrameBytes: 64 * 1024 * 1024,
+			maxQueuedBytes: 128 * 1024 * 1024,
+			maxQueuedMessages: 256,
+			...limits,
+		};
+		socket.setKeepAlive(true, 15000);
 		this.#onMessage = onMessage;
 		this.#onClose = onClose;
 		socket.setEncoding("utf8");
@@ -156,6 +200,8 @@ export class JsonLinePeer<Incoming, Outgoing> {
 
 	send(message: Outgoing): Promise<void> {
 		const line = `${JSON.stringify(message)}\n`;
+		if (Buffer.byteLength(line) > this.#limits.maxFrameBytes)
+			return Promise.reject(new Error("IPC frame exceeds the size limit"));
 		const sent = this.#writes.then(
 			() =>
 				new Promise<void>((resolveWrite, rejectWrite) => {
@@ -174,31 +220,53 @@ export class JsonLinePeer<Incoming, Outgoing> {
 	}
 
 	close(): void {
-		if (!this.#closed) this.#socket.end();
+		this.#closed = true;
+		this.#socket.destroy();
 	}
 
 	#receive(chunk: string): void {
+		if (this.#closed) return;
 		this.#buffer += chunk;
 		let end = this.#buffer.indexOf("\n");
 		while (end !== -1) {
 			const line = this.#buffer.slice(0, end);
 			this.#buffer = this.#buffer.slice(end + 1);
+			const bytes = Buffer.byteLength(line);
+			if (
+				bytes > this.#limits.maxFrameBytes ||
+				this.#queuedBytes + bytes > this.#limits.maxQueuedBytes ||
+				this.#queuedMessages >= this.#limits.maxQueuedMessages
+			) {
+				this.close();
+				return;
+			}
 			if (line.length > 0) {
+				this.#queuedBytes += bytes;
+				this.#queuedMessages++;
 				this.#messages = this.#messages
-					.then(() => this.#onMessage(JSON.parse(line) as Incoming))
-					.catch((error: unknown) => {
-						this.#socket.destroy(
-							error instanceof Error ? error : new Error(String(error)),
-						);
+					.then(async () => {
+						if (!this.#closed)
+							await this.#onMessage(JSON.parse(line) as Incoming);
+					})
+					.catch(() => {
+						this.close();
+					})
+					.finally(() => {
+						this.#queuedBytes -= bytes;
+						this.#queuedMessages--;
 					});
 			}
 			end = this.#buffer.indexOf("\n");
 		}
+		if (Buffer.byteLength(this.#buffer) > this.#limits.maxFrameBytes)
+			this.close();
 	}
 }
 
 export class IpcServer {
+	readonly #agentDir: string;
 	readonly #endpoint: string;
+	#socketIdentity: { dev: number; ino: number } | undefined;
 	readonly #onMessage: (
 		peer: JsonLinePeer<SessionMessage, BrokerMessage>,
 		message: SessionMessage,
@@ -208,6 +276,7 @@ export class IpcServer {
 	) => void;
 	readonly #peers = new Set<JsonLinePeer<SessionMessage, BrokerMessage>>();
 	readonly #servers = new Set<Server>();
+	readonly #sockets = new Set<Socket>();
 
 	constructor(
 		agentDir: string,
@@ -217,22 +286,52 @@ export class IpcServer {
 		) => Promise<void> | void,
 		onClose: (peer: JsonLinePeer<SessionMessage, BrokerMessage>) => void,
 	) {
+		this.#agentDir = agentDir;
 		this.#endpoint = ipcEndpoint(agentDir);
 		this.#onMessage = onMessage;
 		this.#onClose = onClose;
 	}
 
-	async start(network: boolean | number = false): Promise<void> {
+	async start(
+		network: boolean | number = false,
+		options: { host?: string; tls?: NetworkTlsConfig } = {},
+	): Promise<void> {
 		if (this.#servers.size > 0) return;
+		if (network && !options.tls)
+			throw new Error("TCP listening requires mutual TLS configuration");
+		const material =
+			network && options.tls
+				? await tlsMaterial(this.#agentDir, options.tls)
+				: undefined;
+		await mkdir(this.#agentDir, { recursive: true, mode: 0o700 });
 		if (process.platform !== "win32") await prepareUnixSocket(this.#endpoint);
 		try {
 			const local = this.#createServer();
 			await listenServer(local, this.#endpoint);
 			this.#servers.add(local);
+			if (process.platform !== "win32") {
+				await chmod(this.#endpoint, 0o600);
+				const info = await lstat(this.#endpoint);
+				this.#socketIdentity = { dev: info.dev, ino: info.ino };
+			}
 			if (!network) return;
-
-			const remote = this.#createServer();
-			await listenServer(remote, network === true ? defaultPort : network);
+			const remote = createTlsServer(
+				{
+					...material,
+					minVersion: "TLSv1.3",
+					requestCert: true,
+					rejectUnauthorized: true,
+					handshakeTimeout: 5000,
+				},
+				(socket) => this.#accept(socket),
+			);
+			remote.on("connection", (socket) => this.#trackSocket(socket));
+			remote.maxConnections = 128;
+			remote.on("tlsClientError", () => {});
+			await listenServer(remote, {
+				host: options.host ?? "127.0.0.1",
+				port: network === true ? defaultPort : network,
+			});
 			this.#servers.add(remote);
 		} catch (error) {
 			await this.close();
@@ -243,24 +342,51 @@ export class IpcServer {
 	async close(): Promise<void> {
 		for (const peer of this.#peers) peer.close();
 		this.#peers.clear();
+		for (const socket of this.#sockets) socket.destroy();
+		this.#sockets.clear();
 		const servers = [...this.#servers];
 		this.#servers.clear();
 		await Promise.all(servers.map(closeServer));
+		const identity = this.#socketIdentity;
+		this.#socketIdentity = undefined;
+		if (identity) {
+			const current = await lstat(this.#endpoint).catch(() => undefined);
+			if (
+				current?.isSocket() &&
+				current.dev === identity.dev &&
+				current.ino === identity.ino
+			)
+				await unlink(this.#endpoint).catch(() => {});
+		}
 	}
 
 	#createServer(): Server {
-		return createServer((socket) => {
-			let peer: JsonLinePeer<SessionMessage, BrokerMessage>;
-			peer = new JsonLinePeer(
-				socket,
-				(message) => this.#onMessage(peer, message),
-				() => {
-					this.#peers.delete(peer);
-					this.#onClose(peer);
-				},
-			);
-			this.#peers.add(peer);
-		});
+		const server = createServer((socket) => this.#accept(socket));
+		server.on("connection", (socket) => this.#trackSocket(socket));
+		server.maxConnections = 128;
+		return server;
+	}
+
+	#trackSocket(socket: Socket): void {
+		this.#sockets.add(socket);
+		socket.once("close", () => this.#sockets.delete(socket));
+	}
+
+	#accept(socket: Socket): void {
+		if (this.#peers.size >= 128) {
+			socket.destroy();
+			return;
+		}
+		let peer: JsonLinePeer<SessionMessage, BrokerMessage>;
+		peer = new JsonLinePeer(
+			socket,
+			(message) => this.#onMessage(peer, validateSessionMessage(message)),
+			() => {
+				this.#peers.delete(peer);
+				this.#onClose(peer);
+			},
+		);
+		this.#peers.add(peer);
 	}
 }
 
@@ -271,6 +397,8 @@ interface ConnectionCallbacks {
 }
 
 export class IpcClient {
+	readonly #agentDir: string;
+	readonly #tls: NetworkTlsConfig | undefined;
 	readonly #endpoint: string;
 	readonly #remote: string | undefined;
 	readonly #callbacks: ConnectionCallbacks;
@@ -284,7 +412,10 @@ export class IpcClient {
 		agentDir: string,
 		remote: string | undefined,
 		callbacks: ConnectionCallbacks,
+		tls?: NetworkTlsConfig,
 	) {
+		this.#agentDir = agentDir;
+		this.#tls = tls;
 		this.#endpoint = ipcEndpoint(agentDir);
 		this.#remote = remote;
 		this.#callbacks = callbacks;
@@ -335,10 +466,25 @@ export class IpcClient {
 		let socket: Socket | undefined;
 		let failure = new Error("Chappie disconnected");
 		try {
-			socket = this.#remote
-				? createConnection(networkEndpoint(this.#remote))
-				: createConnection(this.#endpoint);
-			await connectSocket(socket, signal);
+			const deadline = AbortSignal.any([signal, AbortSignal.timeout(5000)]);
+			if (this.#remote) {
+				if (!this.#tls)
+					throw new Error("Remote Chappie connections require mutual TLS");
+				const target = networkEndpoint(this.#remote);
+				const servername =
+					this.#tls.serverName ?? (isIP(target.host) ? undefined : target.host);
+				socket = connectTls({
+					...target,
+					...(await tlsMaterial(this.#agentDir, this.#tls)),
+					...(servername ? { servername } : {}),
+					minVersion: "TLSv1.3",
+					rejectUnauthorized: true,
+				});
+				await connectSocket(socket, deadline, "secureConnect");
+			} else {
+				socket = createConnection(this.#endpoint);
+				await connectSocket(socket, deadline);
+			}
 		} catch (error) {
 			socket?.destroy();
 			this.#scheduleReconnect();
@@ -348,7 +494,10 @@ export class IpcClient {
 		let peer: JsonLinePeer<BrokerMessage, SessionMessage>;
 		peer = new JsonLinePeer(
 			socket,
-			(message) => this.#callbacks.onMessage(message),
+			(message) => {
+				if (this.#peer === peer)
+					return this.#callbacks.onMessage(validateBrokerMessage(message));
+			},
 			() => {
 				if (this.#peer !== peer) return;
 				this.#peer = undefined;
@@ -380,7 +529,7 @@ export class IpcClient {
 
 function listenServer(
 	server: Server,
-	endpoint: string | number,
+	endpoint: string | number | NetworkEndpoint,
 ): Promise<void> {
 	return new Promise<void>((resolveListen, rejectListen) => {
 		const onError = (error: Error): void => {
@@ -419,11 +568,15 @@ function networkEndpoint(value: string): NetworkEndpoint {
 	return { host, port: url.port ? Number(url.port) : defaultPort };
 }
 
-function connectSocket(socket: Socket, signal: AbortSignal): Promise<void> {
+function connectSocket(
+	socket: Socket,
+	signal: AbortSignal,
+	event: "connect" | "secureConnect" = "connect",
+): Promise<void> {
 	return new Promise<void>((resolveConnect, rejectConnect) => {
 		const cleanup = (): void => {
 			signal.removeEventListener("abort", onAbort);
-			socket.off("connect", onConnect);
+			socket.off(event, onConnect);
 			socket.off("error", onError);
 		};
 		const onConnect = (): void => {
@@ -444,7 +597,7 @@ function connectSocket(socket: Socket, signal: AbortSignal): Promise<void> {
 			return;
 		}
 		signal.addEventListener("abort", onAbort, { once: true });
-		socket.once("connect", onConnect);
+		socket.once(event, onConnect);
 		socket.once("error", onError);
 	});
 }
@@ -459,7 +612,9 @@ function abortError(signal: AbortSignal): Error {
 
 async function prepareUnixSocket(endpoint: string): Promise<void> {
 	try {
-		await lstat(endpoint);
+		const info = await lstat(endpoint);
+		if (!info.isSocket())
+			throw new Error(`Refusing to replace a non-socket file: ${endpoint}`);
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
 		throw error;
@@ -489,4 +644,18 @@ function endpointAcceptsConnections(endpoint: string): Promise<boolean> {
 			else rejectProbe(error);
 		});
 	});
+}
+
+async function tlsMaterial(
+	agentDir: string,
+	config: NetworkTlsConfig,
+): Promise<{ ca: Buffer; cert: Buffer; key: Buffer }> {
+	const [ca, cert, key] = await Promise.all(
+		[config.ca, config.cert, config.key].map((path) =>
+			readFile(resolve(agentDir, path)),
+		),
+	);
+	if (!ca || !cert || !key)
+		throw new Error("Incomplete TLS certificate configuration");
+	return { ca, cert, key };
 }

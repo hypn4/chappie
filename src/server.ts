@@ -34,12 +34,18 @@ const outputSchema = z.object({
 
 const questionTemplate = "ui://chappie/question.html";
 const questionSchema = outputSchema.extend({ question: questionOutput });
-const toolAnnotations = {
-	readOnlyHint: true,
-	destructiveHint: false,
-	idempotentHint: true,
-	openWorldHint: false,
-} as const;
+function toolAnnotations(name: string) {
+	const readOnly = ["tools", "read", "history", "sessions"].includes(name);
+	const dangerous = ["call", "bash", "write", "edit", "transfer"].includes(
+		name,
+	);
+	return {
+		readOnlyHint: readOnly,
+		destructiveHint: dangerous,
+		idempotentHint: readOnly || name === "init",
+		openWorldHint: dangerous || name === "read",
+	};
+}
 
 interface RequestContext {
 	mcpReq: {
@@ -85,7 +91,7 @@ export function createServer(broker: Broker): McpServer {
 					.optional()
 					.describe("Default Pi session ID; may be shared with other chats"),
 			}),
-			annotations: toolAnnotations,
+			annotations: toolAnnotations("init"),
 		},
 		handle(async (args, context) => {
 			const chatId = requireChatId(context);
@@ -95,7 +101,12 @@ export function createServer(broker: Broker): McpServer {
 				context.mcpReq._meta?.["otunnel/requestId"],
 				context.mcpReq.signal,
 			);
-			return finishResult(broker, context, textResult(initialized, inputs));
+			return finishResult(
+				broker,
+				context,
+				textResult(initialized, inputs),
+				initialized.initialization?.mode !== "observer",
+			);
 		}),
 	);
 
@@ -114,24 +125,31 @@ export function createServer(broker: Broker): McpServer {
 						"Pi session for this operation; becomes the default if none is set",
 					),
 			}),
-			annotations: toolAnnotations,
+			annotations: toolAnnotations("chat"),
 		},
 		handle(async (args, context) => {
 			const chatId = requireChatId(context);
-			const { sessionId, cwd, inputs, initialization } = await broker.chat(
-				chatId,
-				args.sessionId,
-				args.text,
-				context.mcpReq._meta?.["otunnel/requestId"],
-				context.mcpReq.signal,
-			);
+			const { sessionId, cwd, inputs, initialization, replay } =
+				await broker.chat(
+					chatId,
+					args.sessionId,
+					args.text,
+					context.mcpReq._meta?.["otunnel/requestId"],
+					context.mcpReq.signal,
+				);
 			return finishResult(
 				broker,
 				context,
 				textResult(
-					{ sessionId, cwd, ...(initialization ? { initialization } : {}) },
+					{
+						sessionId,
+						cwd,
+						...(initialization ? { initialization } : {}),
+						...(replay ? { replay } : {}),
+					},
 					inputs,
 				),
+				!replay,
 			);
 		}),
 	);
@@ -152,7 +170,7 @@ export function createServer(broker: Broker): McpServer {
 						),
 				}),
 				outputSchema: questionSchema,
-				annotations: toolAnnotations,
+				annotations: toolAnnotations("ask"),
 				_meta: { ui: { resourceUri: questionTemplate } },
 			},
 			handle(async ({ sessionId, ...input }, context) => {
@@ -189,7 +207,7 @@ export function createServer(broker: Broker): McpServer {
 					questionId: z.string().describe("question.id returned by ask"),
 				}),
 				outputSchema: questionSchema,
-				annotations: toolAnnotations,
+				annotations: toolAnnotations("ask_assert"),
 			},
 			handle(async ({ questionId }, context) => {
 				const question = await broker.assertQuestion(
@@ -222,7 +240,7 @@ export function createServer(broker: Broker): McpServer {
 						.describe("The question widget has loaded"),
 				}),
 				outputSchema: questionSchema,
-				annotations: toolAnnotations,
+				annotations: toolAnnotations("answer"),
 				_meta: { ui: { visibility: ["app"] }, "openai/widgetAccessible": true },
 			},
 			async ({ questionId, answer, loaded = false }, context) => {
@@ -293,7 +311,7 @@ export function createServer(broker: Broker): McpServer {
 						"Pi session for this operation; becomes the default if none is set",
 					),
 			}),
-			annotations: toolAnnotations,
+			annotations: toolAnnotations("tools"),
 		},
 		handle(async (args, context) => {
 			const { inputs, ...inspected } = await broker.tools(
@@ -335,7 +353,8 @@ export function createServer(broker: Broker): McpServer {
 							arguments: z.record(z.string(), z.unknown()),
 						}),
 					)
-					.min(1),
+					.min(1)
+					.max(128),
 				sessionId: z
 					.string()
 					.optional()
@@ -343,7 +362,7 @@ export function createServer(broker: Broker): McpServer {
 						"Pi session for this operation; becomes the default if none is set",
 					),
 			}),
-			annotations: toolAnnotations,
+			annotations: toolAnnotations("call"),
 		},
 		handle(async (args, context) => {
 			const result = await broker.call(
@@ -362,7 +381,9 @@ export function createServer(broker: Broker): McpServer {
 					result.cwd,
 					result.inputs,
 					result.initialization,
+					result.replay,
 				),
+				!result.replay,
 			);
 		}),
 	);
@@ -375,7 +396,7 @@ export function createServer(broker: Broker): McpServer {
 				description: tool.description,
 				outputSchema,
 				inputSchema: tool.inputSchema,
-				annotations: toolAnnotations,
+				annotations: toolAnnotations(tool.name),
 				...(tool.fileParams
 					? { _meta: { "openai/fileParams": tool.fileParams } }
 					: {}),
@@ -393,6 +414,7 @@ export function createServer(broker: Broker): McpServer {
 					calls,
 					context.mcpReq._meta?.["otunnel/requestId"],
 					context.mcpReq.signal,
+					true,
 				);
 				return finishResult(
 					broker,
@@ -403,7 +425,9 @@ export function createServer(broker: Broker): McpServer {
 						result.cwd,
 						result.inputs,
 						result.initialization,
+						result.replay,
 					),
+					!result.replay,
 				);
 			}),
 		);
@@ -422,7 +446,7 @@ export function createServer(broker: Broker): McpServer {
 					.describe("Pi session to read; defaults to this chat's session"),
 			}),
 			outputSchema,
-			annotations: toolAnnotations,
+			annotations: toolAnnotations("history"),
 		},
 		handle(async ({ sessionId, ...range }, context) => {
 			const { history, ...session } = await broker.history(
@@ -458,20 +482,14 @@ export function createServer(broker: Broker): McpServer {
 					.optional()
 					.describe("Filter the online list to this Pi session"),
 			}),
-			annotations: toolAnnotations,
+			annotations: toolAnnotations("sessions"),
 		},
 		handle(async (args, context) => {
 			const chatId = requestChatId(context);
-			const inputs = chatId
-				? await broker.inputs(chatId, args.sessionId, context.mcpReq.signal)
-				: [];
-			const result = textResult(
-				{
-					binding: chatId ? (broker.binding(chatId) ?? null) : null,
-					sessions: broker.listSessions(args.sessionId),
-				},
-				inputs,
-			);
+			const result = textResult({
+				binding: chatId ? (broker.binding(chatId) ?? null) : null,
+				sessions: broker.listSessions(args.sessionId),
+			});
 			return finishResult(broker, context, result);
 		}),
 	);
@@ -519,9 +537,10 @@ function textResult(
 
 async function finishResult<
 	T extends { content: ReturnType<typeof toolResult>["content"] },
->(broker: Broker, context: RequestContext, result: T) {
+>(broker: Broker, context: RequestContext, result: T, deliverPending = true) {
 	context.mcpReq.signal.throwIfAborted();
 	const chatId = requestChatId(context);
+	if (!deliverPending) return formatResult(result, chatId);
 	const deliveries = chatId ? broker.deliveries(chatId) : [];
 	const answers = chatId ? broker.answers(chatId) : [];
 	const content = [
@@ -529,8 +548,10 @@ async function finishResult<
 		...deliveryContent(deliveries),
 		...answerContent(answers),
 	];
+	// Validate/serialize before consuming durable pending results.
+	const formatted = formatResult({ ...result, content }, chatId);
 	await broker.acknowledge(deliveries, answers, context.mcpReq.signal);
-	return formatResult({ ...result, content }, chatId);
+	return formatted;
 }
 
 function formatResult<

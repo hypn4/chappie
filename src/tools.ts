@@ -9,6 +9,7 @@ import { fromJsonSchema } from "@modelcontextprotocol/server";
 import type { Initialization } from "./broker.ts";
 import { toolResultsContent } from "./delivery.ts";
 import type { SessionInput } from "./ipc.ts";
+import type { ReplayReceipt } from "./operations.ts";
 import { contentWithImageReferences } from "./resources.ts";
 import { transfer } from "./transfer.ts";
 
@@ -27,9 +28,15 @@ const definitions = [
 
 export const directTools = definitions.map((definition) => ({
 	name: definition.name,
-	description: definition.description,
+	description:
+		definition.name === "edit"
+			? "Pi: use path and exact-text edits. OMP: use patch with native anchors from the latest read. These formats are not interchangeable."
+			: definition.description,
 	inputSchema: fromJsonSchema<Record<string, unknown>>(
-		withSessionId(definition.parameters as unknown as Record<string, unknown>),
+		withSessionId(
+			definition.parameters as unknown as Record<string, unknown>,
+			definition.name,
+		),
 	),
 	fileParams: definition.name === "transfer" ? ["files"] : undefined,
 }));
@@ -40,6 +47,7 @@ export function toolResult(
 	cwd: string,
 	inputs: SessionInput[] = [],
 	initialization?: Initialization,
+	replay?: ReplayReceipt,
 ) {
 	return {
 		content: [
@@ -49,12 +57,17 @@ export function toolResult(
 					sessionId,
 					cwd,
 					...(initialization ? { initialization } : {}),
+					...(replay ? { replay } : {}),
 				}),
 			},
 			...toolResultsContent(toolResults, sessionId),
 			...inputContent(inputs),
 		],
-		isError: toolResults.some((result) => result.isError),
+		isError: toolResults.some(
+			(result) =>
+				result.isError ||
+				(result.details as { failed?: boolean } | undefined)?.failed === true,
+		),
 	};
 }
 
@@ -72,12 +85,34 @@ export function inputContent(inputs: SessionInput[]) {
 
 function withSessionId(
 	schema: Record<string, unknown>,
+	name: string,
 ): Record<string, unknown> {
 	const copy = structuredClone(schema) as {
 		properties?: Record<string, unknown>;
+		required?: string[];
 	};
+	if (name === "edit") {
+		copy.properties = {
+			...copy.properties,
+			patch: {
+				type: "string",
+				description:
+					"OMP native patch copied from the latest read snapshot; retain its hash and line anchors.",
+			},
+		};
+		delete copy.required;
+		return {
+			...copy,
+			properties: { ...copy.properties, sessionId: { type: "string" } },
+			oneOf: [{ required: ["path", "edits"] }, { required: ["patch"] }],
+			additionalProperties: false,
+		};
+	}
 	return {
 		...copy,
+		...(name === "transfer"
+			? { required: [...(copy.required ?? []), "operationId"] }
+			: {}),
 		properties: {
 			...copy.properties,
 			sessionId: {

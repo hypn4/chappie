@@ -15,18 +15,27 @@ import {
 	type SessionResult,
 } from "./ipc.ts";
 import {
+	operationIdentity,
+	type ReplayReceipt,
+	replayReceipt,
+} from "./operations.ts";
+import {
 	type Question,
 	type QuestionAnswer,
 	type QuestionInput,
 	type QuestionRecord,
 	questionView,
 } from "./questions.ts";
-import { type ResourceData, resourceSessionId } from "./resources.ts";
+import {
+	type ResourceData,
+	resourceDescriptors,
+	resourceSessionId,
+} from "./resources.ts";
 import { State } from "./state.ts";
 import type { ToolInput } from "./tools.ts";
 
 const observerInstructions =
-	"This ChatGPT conversation recently initialized or resumed work in this Pi session. A parallel execution is already continuing the task. Participate as an observer for this task: read history with observer: true, follow new entries with after and wait: true, and think independently. Leave execution and Pi communication to the ongoing work. Once its completion is recorded, explain the actual results in ChatGPT and finish your response. Continue observing this task rather than reinitializing to take over.";
+	"This ChatGPT conversation recently initialized or resumed work in this Pi session. A recent initialization may still own this task; do not assume another completion is needed. Participate as an observer for this task: read history with observer: true, follow new entries with after and wait: true, and think independently. Leave execution and Pi communication to the ongoing work. Do not export files, repeat the completed report, or publish a second completion response. Leave the single completion response to the original execution. Continue observing rather than reinitializing to take over.";
 
 interface RegisteredSession {
 	description: SessionDescription;
@@ -34,6 +43,7 @@ interface RegisteredSession {
 }
 
 interface PendingRequest {
+	sessionId: string;
 	peer: JsonLinePeer<SessionMessage, BrokerMessage>;
 	resolve(result: SessionResult): void;
 	reject(error: Error): void;
@@ -49,6 +59,7 @@ interface ChangeWaiter {
 }
 
 export interface Initialization {
+	mode?: "executor" | "observer";
 	sessionId: string;
 	instructions: string;
 }
@@ -67,6 +78,7 @@ export interface InspectedSession extends SessionInspection {
 }
 
 export interface ChatResult {
+	replay?: ReplayReceipt;
 	initialization?: Initialization;
 	sessionId: string;
 	cwd: string;
@@ -77,8 +89,15 @@ export interface CallResult extends ChatResult {
 	toolResults: ToolResultMessage[];
 }
 
+export interface BrokerOptions {
+	sessionWaitMs?: number;
+	inspectionTimeoutMs?: number;
+}
+
 export class Broker {
 	readonly #agentDir: string;
+	readonly #sessionWaitMs: number;
+	readonly #inspectionTimeoutMs: number;
 	readonly #ipc: IpcServer;
 	readonly #state: State;
 	readonly #sessions = new Map<string, RegisteredSession>();
@@ -92,7 +111,9 @@ export class Broker {
 	#ask = true;
 	#nextRequestId = 1;
 
-	constructor(agentDir: string) {
+	constructor(agentDir: string, options: BrokerOptions = {}) {
+		this.#sessionWaitMs = options.sessionWaitMs ?? 5000;
+		this.#inspectionTimeoutMs = options.inspectionTimeoutMs ?? 3000;
 		this.#agentDir = agentDir;
 		this.#state = new State(agentDir);
 		this.#ipc = new IpcServer(
@@ -106,7 +127,10 @@ export class Broker {
 		const config = await readConfig(this.#agentDir);
 		this.#ask = config.ask ?? true;
 		await this.#state.load();
-		await this.#ipc.start(config.listen ?? false);
+		await this.#ipc.start(config.listen ?? false, {
+			...(config.tls ? { tls: config.tls } : {}),
+			...(config.listenHost ? { host: config.listenHost } : {}),
+		});
 	}
 
 	async close(): Promise<void> {
@@ -127,6 +151,7 @@ export class Broker {
 		this.#waiters.clear();
 		this.#sessions.clear();
 		await this.#ipc.close();
+		await this.#state.flush();
 	}
 
 	listSessions(sessionId?: string): (SessionDescription & {
@@ -164,7 +189,8 @@ export class Broker {
 			target,
 			signal,
 		);
-		await this.#ackInputs(target, inputs, signal);
+		if (initialization?.mode !== "observer")
+			await this.#ackInputs(target, inputs, signal);
 		return {
 			selection,
 			...(initialization ? { initialization } : {}),
@@ -173,7 +199,7 @@ export class Broker {
 				name,
 				description: description.split("\n", 1)[0] ?? description,
 			})),
-			inputs,
+			inputs: initialization?.mode === "observer" ? [] : inputs,
 			...(globalAgents ? { globalAgents } : {}),
 		};
 	}
@@ -191,17 +217,43 @@ export class Broker {
 			requestId,
 			signal,
 		);
+		const identity = operationIdentity(chatId, target, "chat", requestId, text);
+		if (identity) {
+			const session = this.#sessions.get(target);
+			if (!session) throw new Error("Target session disconnected");
+			const replay = await this.#state.reserveOperation({
+				...identity,
+				chatId,
+				sessionId: target,
+				cwd: session.description.cwd,
+				status: "running",
+				updatedAt: Date.now(),
+			});
+			if (replay)
+				return {
+					sessionId: target,
+					cwd: replay.cwd,
+					inputs: [],
+					replay: replayReceipt(replay),
+				};
+		}
+
 		const result = await this.#request(
 			target,
 			(id) => ({
 				type: "chat",
 				id,
 				...source(chatId, requestId),
+				...(identity ? { operationKey: identity.key } : {}),
 				sessionId: target,
 				text,
 			}),
 			signal,
-		);
+		).catch(async (error: unknown) => {
+			await this.#state.finishOperation(identity?.key, "uncertain");
+			throw error;
+		});
+		await this.#state.finishOperation(identity?.key, "completed");
 		if ("message" in result) {
 			const inputs = result.inputs;
 			await this.#ackInputs(target, inputs, signal);
@@ -247,13 +299,44 @@ export class Broker {
 		calls: ToolInput[],
 		requestId: unknown,
 		signal: AbortSignal,
+		direct = false,
 	): Promise<CallResult> {
+		if (calls.length < 1 || calls.length > 128)
+			throw new Error("Tool batches must contain between 1 and 128 calls");
 		const { sessionId: target, initialization } = await this.#selectSession(
 			chatId,
 			sessionId,
 			requestId,
 			signal,
 		);
+		const identity = operationIdentity(
+			chatId,
+			target,
+			"call",
+			requestId,
+			calls,
+		);
+		if (identity) {
+			const session = this.#sessions.get(target);
+			if (!session) throw new Error("Target session disconnected");
+			const replay = await this.#state.reserveOperation({
+				...identity,
+				chatId,
+				sessionId: target,
+				cwd: session.description.cwd,
+				status: "running",
+				updatedAt: Date.now(),
+			});
+			if (replay)
+				return {
+					sessionId: target,
+					cwd: replay.cwd,
+					inputs: [],
+					toolResults: [],
+					replay: replayReceipt(replay),
+				};
+		}
+
 		const toolCalls: ToolCall[] = calls.map((call) => ({
 			type: "toolCall",
 			id: `chappie-${randomUUID()}`,
@@ -266,12 +349,24 @@ export class Broker {
 				type: "call",
 				id,
 				...source(chatId, requestId),
+				...(identity ? { operationKey: identity.key } : {}),
 				sessionId: target,
 				calls: toolCalls,
+				...(direct ? { direct: true } : {}),
 			}),
 			signal,
-		);
+		).catch(async (error: unknown) => {
+			await this.#state.finishOperation(identity?.key, "uncertain");
+			throw error;
+		});
 		if ("toolResults" in result) {
+			await this.#state.finishOperation(
+				identity?.key,
+				"completed",
+				result.toolResults.flatMap((result) =>
+					resourceDescriptors(result.details),
+				),
+			);
 			await this.#ackInputs(target, result.inputs, signal);
 			return {
 				sessionId: target,
@@ -281,6 +376,7 @@ export class Broker {
 				inputs: result.inputs,
 			};
 		}
+		await this.#state.finishOperation(identity?.key, "uncertain");
 		throw new Error("Pi session returned no tool results");
 	}
 
@@ -454,6 +550,7 @@ export class Broker {
 			signal,
 		);
 		if ("resource" in result) {
+			if (chatId) await this.#state.recordResourceRead(chatId, requested.href);
 			if (chatId) this.#cooldown(chatId, sessionId);
 			return { ...result.resource, uri };
 		}
@@ -478,11 +575,17 @@ export class Broker {
 	): Promise<void> {
 		switch (message.type) {
 			case "request": {
+				if (
+					![...this.#sessions.values()].some((session) => session.peer === peer)
+				)
+					throw new Error("Unregistered IPC peer cannot relay requests");
 				let relays = this.#relays.get(peer);
 				if (!relays) {
 					relays = new Map();
 					this.#relays.set(peer, relays);
 				}
+				if (relays.has(message.id) || relays.size >= 128)
+					throw new Error("Duplicate or excessive relay requests");
 				const controller = new AbortController();
 				relays.set(message.id, controller);
 				void this.#request(
@@ -511,6 +614,9 @@ export class Broker {
 					?.abort(new Error("Transfer cancelled"));
 				break;
 			case "sync": {
+				const owner = this.#sessions.get(message.session.id)?.peer;
+				if (owner && owner !== peer && !owner.closed)
+					throw new Error("Session already belongs to another connection");
 				const registered =
 					this.#sessions.get(message.session.id)?.peer === peer;
 				this.#sessions.set(message.session.id, {
@@ -535,6 +641,19 @@ export class Broker {
 				break;
 			}
 			case "delivery":
+				if (
+					![...this.#sessions.values()].some((session) => session.peer === peer)
+				)
+					throw new Error("Unregistered peer cannot submit results");
+				if (
+					this.#sessions.get(message.delivery.sessionId)?.peer !== peer &&
+					!this.#state.ownsOperation(
+						message.delivery.operationKey,
+						message.delivery.chatId,
+						message.delivery.sessionId,
+					)
+				)
+					throw new Error("Deferred result does not belong to this operation");
 				await this.#state.addDelivery(message.delivery);
 				await peer.send({ type: "stored", id: message.delivery.id });
 				break;
@@ -563,6 +682,7 @@ export class Broker {
 		selection: InitializedSession["selection"];
 		initialization?: Initialization;
 	}> {
+		const selectionTimeout = AbortSignal.timeout(this.#sessionWaitMs);
 		for (;;) {
 			signal.throwIfAborted();
 			const boundId = this.#state.binding(chatId);
@@ -572,7 +692,16 @@ export class Broker {
 				target = [...this.#sessions.keys()].find((id) => !occupied.has(id));
 			}
 			if (!target) {
-				await this.#waitForChange(signal);
+				await this.#waitForChange(
+					AbortSignal.any([signal, selectionTimeout]),
+				).catch((error: unknown) => {
+					signal.throwIfAborted();
+					if (selectionTimeout.aborted)
+						throw new Error(
+							"No available unbound session. Use sessions and select a sessionId explicitly.",
+						);
+					throw error;
+				});
 				continue;
 			}
 			await this.#waitForSession(target, signal);
@@ -625,6 +754,7 @@ export class Broker {
 		return {
 			sessionId,
 			instructions: observer ? observerInstructions : historyInstructions,
+			mode: observer ? "observer" : "executor",
 		};
 	}
 
@@ -647,18 +777,37 @@ export class Broker {
 	}
 
 	async #waitForSession(sessionId: string, signal: AbortSignal): Promise<void> {
-		while (!this.#sessions.has(sessionId)) await this.#waitForChange(signal);
+		const timeout = AbortSignal.timeout(this.#sessionWaitMs);
+		try {
+			while (!this.#sessions.has(sessionId))
+				await this.#waitForChange(AbortSignal.any([signal, timeout]));
+		} catch (error) {
+			signal.throwIfAborted();
+			if (timeout.aborted)
+				throw new Error(
+					`Session ${sessionId} is offline or unavailable. Check sessions and the broker's agent directory.`,
+				);
+			throw error;
+		}
 	}
 
 	async #inspect(
 		sessionId: string,
 		signal: AbortSignal,
 	): Promise<Extract<SessionResult, { inspection: SessionInspection }>> {
+		const timeout = AbortSignal.timeout(this.#inspectionTimeoutMs);
 		const result = await this.#request(
 			sessionId,
 			(id) => ({ type: "inspect", id, sessionId }),
-			signal,
-		);
+			AbortSignal.any([signal, timeout]),
+		).catch((error: unknown) => {
+			signal.throwIfAborted();
+			if (timeout.aborted)
+				throw new Error(
+					`Session ${sessionId} did not respond to inspection. Check the local host connection.`,
+				);
+			throw error;
+		});
 		if ("inspection" in result) return result;
 		throw new Error("Pi session returned no inspection");
 	}
@@ -687,6 +836,8 @@ export class Broker {
 		const session = this.#sessions.get(sessionId);
 		if (!session) throw new Error(`Pi session ${sessionId} is offline`);
 		if (signal.aborted) throw abortError(signal);
+		if (this.#pending.size >= 512)
+			throw new Error("Too many pending session requests");
 		const id = this.#nextRequestId++;
 		const completion = Promise.withResolvers<SessionResult>();
 		const onAbort = (): void => {
@@ -704,6 +855,7 @@ export class Broker {
 			pending.reject(abortError(signal));
 		};
 		const pending: PendingRequest = {
+			sessionId,
 			peer: session.peer,
 			resolve: completion.resolve,
 			reject: completion.reject,
@@ -767,6 +919,13 @@ export class Broker {
 
 	#removeSession(sessionId: string): void {
 		this.#sessions.delete(sessionId);
+		for (const [id, pending] of this.#pending) {
+			if (pending.sessionId !== sessionId) continue;
+			this.#finishRequest(id, pending);
+			pending.reject(
+				new Error("Session changed or disconnected before request completion"),
+			);
+		}
 		this.#notifyChange();
 	}
 }
