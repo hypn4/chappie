@@ -8,6 +8,8 @@ The package has host-specific extension entry points: `src/index.ts` for Pi and 
 
 The broker owns ChatGPT conversation bindings, initialization cooldowns, MCP request routing, deferred-result descriptors, and resource dispatch. The host extension owns provider output, native tool execution, session input, branch history, cancellation, and the bytes behind exported resources.
 
+OMP's custom API registration is process-wide. Keep its dispatcher stateless: route each request through the caller's `onPayload` / `before_provider_request` hook and exact session ID, not the last registered extension instance. Native Chappie requests have an empty model context; auxiliary inference is rejected before acquiring an output. Completed OMP results are delivered at `turn_end`, independently of later provider requests or TODO continuations.
+
 Pi and OMP use separate agent directories by default (`~/.pi/agent` and `~/.omp/agent`), so their local `chappie.sock` endpoints are also separate. The broker launched by otunnel must use the same host and agent-directory settings as the session under test.
 
 One accepted MCP tool request becomes one native host tool batch. Durable operation receipts reject conflicting replays and prevent accepted work from being executed again; replay replies contain no repeated tool output or attachments. Export receipts retain inert resource references; a source read is not proof of ChatGPT file receipt. A `call` array requests native batch execution explicitly; Chappie does not combine separate MCP requests. Requests are ordered within a session, while different sessions operate independently.

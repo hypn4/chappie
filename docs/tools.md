@@ -69,6 +69,13 @@ returned by `read`/`tools`; it does not synthesize anchors from Pi text edits.
 `call` always takes native arguments. Tool definitions that cannot be converted
 to JSON Schema report `schemaError` instead of silently omitting their contract.
 
+Chappie is a ChatGPT-controlled transport, not a general-purpose inference API.
+OMP requests must belong to a live session through its request hook and session
+ID. Auxiliary model prompts, such as title generation, cannot borrow that
+session's pending response. No other model is selected automatically. Creating
+an OMP task does not create a ChatGPT conversation or provide autonomous child
+inference; each Chappie session still needs an explicit ChatGPT controller.
+
 For example:
 
 ```json

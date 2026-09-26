@@ -418,11 +418,22 @@ export class LocalSession {
 		if (activity.event !== "history") this.#historyChanged();
 	}
 
-	async start(output: ProviderOutput): Promise<void> {
+	async start(
+		output: ProviderOutput,
+		expectedSessionId?: string,
+	): Promise<void> {
 		const context = this.#context;
 		const connection = this.#connection;
 		if (context?.model?.provider !== "chappie" || !connection) {
 			throw new Error("Chappie is not active for this session");
+		}
+		if (
+			expectedSessionId !== undefined &&
+			expectedSessionId !== context.sessionManager.getSessionId()
+		) {
+			throw new Error(
+				"Chappie provider request has a mismatched session identity",
+			);
 		}
 		if (this.#output && !this.#output.closed) {
 			throw new Error("Chappie already has an active provider request");
@@ -1097,6 +1108,11 @@ export class LocalSession {
 				? directHostResults(active.request.calls, toolResults)
 				: toolResults;
 		if (this.#retired.delete(active.id)) this.#retainResult(active);
+		else if (this.#host === "omp") {
+			// A completed tool batch belongs to its caller even when OMP continues
+			// for a TODO reminder or background work. Do not wait for another stream.
+			await this.#completeActive();
+		}
 	}
 
 	#retainResult(active: ActiveRequest): void {
