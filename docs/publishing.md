@@ -39,6 +39,11 @@ in an isolated OMP session without model inference. Remove only your temporary
 consumer directory afterward. Git checkout tests and package checks serve different
 purposes; never replace the package install with a link to source dependencies.
 
+After publishing, verify the README's `npx` and `bunx` commands with MCP stdin
+kept open, then confirm `omp plugin install @hypn4/chappie` and the explicit
+`@latest` form select the intended release. The broker and plugin are installed
+separately and should use the same version. No fork of OMP is required.
+
 ## First publication
 
 After all source and consumer jobs pass for the release commit, authenticate with
