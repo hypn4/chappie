@@ -2,8 +2,14 @@
 
 The package is `@hypn4/chappie`, maintained in `hypn4/chappie`. Retain the upstream
 MIT attribution, `chappie/chatgpt` provider, and `chappie-omp` executable.
-Release candidates use `X.Y.Z-rc.N` on `next`; stable releases use `X.Y.Z` on
-`latest`. Published versions are immutable.
+GitHub Actions publishes releases with npm trusted publishing (OIDC), without a
+local npm login or a stored publishing token. Published versions are immutable.
+
+`package.json` commits the release channel as `publishConfig.tag`: `latest` for
+the default installation, or `next` for an opt-in preview. This fork currently
+selects `latest`, including release candidates. A version such as `X.Y.Z-rc.N`
+remains a prerelease regardless of its npm channel; `latest` is not a stability
+claim. Select the channel before publishing instead of moving tags afterward.
 
 ## Verification pipeline
 
@@ -45,37 +51,44 @@ kept open (`bunx` is the equivalent alias when available), then confirm
 `@latest` form select the intended release. The broker and plugin are installed
 separately and should use the same version. No fork of OMP is required.
 
-## First publication
+## One-time trusted publisher setup
 
-After all source and consumer jobs pass for the release commit, authenticate with
-the owning npm account and publish the tested candidate once. Complete any 2FA
-prompt locally; never put credentials in an issue, source file, or command log.
+This fork is already configured for `hypn4/chappie`, workflow `publish.yml`,
+environment `release`, with direct `npm publish` allowed and repository variable
+`NPM_TRUSTED_PUBLISHING=true`. Do not repeat npm login, trust management, or account
+verification for routine releases. Account 2FA remains enabled.
 
-```sh
-npm whoami
-npm publish ./package.tgz --ignore-scripts --access public --tag next
-npm trust github @hypn4/chappie --repo hypn4/chappie --file publish.yml --env release --allow-publish
-npm trust list @hypn4/chappie
-```
-
-The package must exist before configuring its trusted publisher. `npm trust` needs
-npm 11.15 or newer and account-level 2FA. After verifying trust, set the repository
-variable `NPM_TRUSTED_PUBLISHING=true`. Until then only manual publish dry runs
-are enabled. Keep the GitHub environment named `release`.
+For a new package or repository, follow the [npm setup guide](https://docs.npmjs.com/trusted-publishers/).
+The package must exist before configuring its trusted publisher. Initial package
+creation and trust/account changes may require interactive authentication; those
+are setup operations, not release steps. Keep the workflow filename and environment
+aligned with the trust configuration. Do not add a bypass-2FA token or change to
+stage-only publication to automate direct releases: stage approval is interactive.
 
 ## Subsequent releases
 
-Commit the version update to `main`, then push its exact `v<version>` tag.
-`release.yml` runs the complete verification pipeline and creates a draft GitHub
-Release from the checked artifact. Publish the draft to trigger `publish.yml`, or
-run that workflow manually with an existing tag and `dry_run=false`.
+Commit the new version and intended `publishConfig.tag` to `main`, then push its
+exact `v<version>` tag. `release.yml` verifies the package and creates a draft
+GitHub Release. Publishing that draft triggers `publish.yml` automatically; this
+GitHub release decision does not require npm authentication. Alternatively, run
+`publish.yml` with an existing, unpublished tag and `dry_run=false`.
 
-The publish workflow requires the tagged commit to belong to `main`. It invokes
-the same checks, then a separate `release` environment job downloads the verified
-artifact and publishes it without rebuilding or installing source dependencies.
-Only that job has `id-token: write`; it has no `NPM_TOKEN`, no package-manager cache,
-and no dependency lifecycle scripts. OIDC generates provenance for the public
-package and repository. `next` and `latest` are selected explicitly from the version.
+The workflow requires the tagged commit to belong to `main` and validates its
+committed channel. After all source and consumer checks pass, the `release`
+environment job publishes the verified artifact once with `npm publish --tag`
+using that channel. Only this job has `id-token: write`. It checks that GitHub
+OIDC is available, uses no `NPM_TOKEN`, and neither rebuilds nor installs source
+dependencies. Provenance is generated automatically.
+
+There is no post-publish `npm dist-tag add` step. OIDC supports publishing, not
+arbitrary registry administration. In particular, it does not authenticate a
+separate `dist-tag` or `trust` command, and `npm whoami` is not an OIDC preflight.
+Publishing to `latest` updates the version used by `omp plugin install
+@hypn4/chappie` and `@latest` in the same operation. `next` remains the last
+explicit preview; the two aliases are not synchronized after each release.
+
+To move a preview into the normal release stream, publish a new release version
+to `latest`. Do not republish an existing version or automate browser approvals.
 
 A repeated publication of an existing version fails normally. Do not overwrite,
 unpublish, silently accept different bytes, or change versions to hide a failed

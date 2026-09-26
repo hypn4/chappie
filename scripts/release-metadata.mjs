@@ -32,11 +32,23 @@ export function releaseMetadata(
 	if (tag !== undefined)
 		assert.equal(tag, expected, "Release tag must match package version");
 	const prerelease = pkg.version.includes("-");
+	// Choose the channel before the OIDC publish; post-publish dist-tag changes
+	// require separate npm authentication. Preserve defaults for older tags.
+	const distTag =
+		pkg.publishConfig.tag === undefined
+			? prerelease
+				? "next"
+				: "latest"
+			: pkg.publishConfig.tag;
+	assert.ok(
+		distTag === "latest" || distTag === "next",
+		"publishConfig.tag must select the latest or next channel",
+	);
 	return {
 		name: pkg.name,
 		version: pkg.version,
 		tag: expected,
-		distTag: prerelease ? "next" : "latest",
+		distTag,
 		prerelease,
 	};
 }

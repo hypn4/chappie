@@ -139,7 +139,9 @@ must use the same endpoint; the host name alone does not filter sessions.
 The packaged broker is JavaScript; direct TypeScript execution is only for
 source checkouts outside `node_modules`.
 
-For the fork release process, see [publishing](docs/publishing.md).
+GitHub Actions publishes releases to npm using OIDC and the committed
+`publishConfig.tag`; routine releases do not require an npm login.
+See [publishing](docs/publishing.md) for the release process.
 
 ## Usage
 

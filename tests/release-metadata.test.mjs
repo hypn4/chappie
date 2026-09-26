@@ -33,7 +33,7 @@ test("the fork has its own public package identity without changing upstream att
 	);
 	assert.equal(manifest.bin["chappie-omp"], "./dist/src/cli.omp.js");
 });
-test("release candidates select next rather than latest", async () => {
+test("legacy release candidates without an explicit channel retain next", async () => {
 	const value = await metadata(fixture, {
 		tag: "v0.6.0-rc.1",
 		repository: "hypn4/chappie",
@@ -41,13 +41,45 @@ test("release candidates select next rather than latest", async () => {
 	assert.equal(value.distTag, "next");
 	assert.equal(value.prerelease, true);
 });
-test("stable versions select latest", async () => {
+test("legacy stable versions without an explicit channel retain latest", async () => {
 	const value = await metadata(
 		{ ...fixture, version: "0.6.0" },
 		{ tag: "v0.6.0", repository: "hypn4/chappie" },
 	);
 	assert.equal(value.distTag, "latest");
 	assert.equal(value.prerelease, false);
+});
+
+test("the maintained fork declares its channel before publishing", async () => {
+	const channel = manifest.publishConfig.tag;
+	assert.ok(["latest", "next"].includes(channel));
+	assert.equal((await metadata(manifest)).distTag, channel);
+});
+
+test("the committed channel is independent of prerelease classification", async () => {
+	for (const version of ["0.6.0-rc.3", "0.6.0"]) {
+		for (const tag of ["latest", "next"]) {
+			const value = await metadata({
+				...fixture,
+				version,
+				publishConfig: { ...fixture.publishConfig, tag },
+			});
+			assert.equal(value.distTag, tag);
+			assert.equal(value.prerelease, version.includes("-"));
+		}
+	}
+});
+
+test("invalid explicit publish channels fail rather than falling back", async () => {
+	for (const tag of ["", "beta", "latest; echo invalid", null, 1, ["latest"]]) {
+		await assert.rejects(
+			metadata({
+				...fixture,
+				publishConfig: { ...fixture.publishConfig, tag },
+			}),
+			/publishConfig\.tag|channel/i,
+		);
+	}
 });
 test("publishing refuses the upstream package or another repository", async () => {
 	await assert.rejects(
