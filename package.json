@@ -1,6 +1,6 @@
 {
 	"name": "@hypn4/chappie",
-	"version": "0.6.0-rc.2",
+	"version": "0.6.0-rc.3",
 	"description": "Maintained Chappie fork connecting ChatGPT to Pi and Oh My Pi",
 	"devDependencies": {
 		"@earendil-works/pi-ai": "^0.85.1",
