@@ -101,6 +101,8 @@ export class Broker {
 	readonly #ipc: IpcServer;
 	readonly #state: State;
 	readonly #sessions = new Map<string, RegisteredSession>();
+	// Pending automatic selections, keyed by chat so retries do not take a second slot.
+	readonly #selectionReservations = new Map<string, string>();
 	readonly #pending = new Map<number, PendingRequest>();
 	readonly #waiters = new Set<ChangeWaiter>();
 	readonly #cooldowns = new Map<string, number>();
@@ -687,9 +689,18 @@ export class Broker {
 			signal.throwIfAborted();
 			const boundId = this.#state.binding(chatId);
 			let target = requestedId ?? boundId;
-			if (!target) {
+			let reserved = false;
+			if (!target && !this.#selectionReservations.has(chatId)) {
 				const occupied = this.#state.bindingCounts();
-				target = [...this.#sessions.keys()].find((id) => !occupied.has(id));
+				const reservations = new Set(this.#selectionReservations.values());
+				target = [...this.#sessions.keys()].find(
+					(id) => !occupied.has(id) && !reservations.has(id),
+				);
+				if (target) {
+					// Reserve before the first await, not after the binding is saved.
+					this.#selectionReservations.set(chatId, target);
+					reserved = true;
+				}
 			}
 			if (!target) {
 				await this.#waitForChange(
@@ -703,21 +714,28 @@ export class Broker {
 				});
 				continue;
 			}
-			await this.#waitForSession(target, signal);
-			signal.throwIfAborted();
-			const initialization =
-				bindRequested || !this.#state.binding(chatId)
-					? await this.#join(chatId, target, requestId, signal, bindRequested)
-					: undefined;
-			return {
-				sessionId: target,
-				selection: requestedId
-					? "explicit"
-					: boundId
-						? "existing"
-						: "automatic",
-				...(initialization ? { initialization } : {}),
-			};
+			try {
+				await this.#waitForSession(target, signal);
+				signal.throwIfAborted();
+				const initialization =
+					bindRequested || !this.#state.binding(chatId)
+						? await this.#join(chatId, target, requestId, signal, bindRequested)
+						: undefined;
+				return {
+					sessionId: target,
+					selection: requestedId
+						? "explicit"
+						: boundId
+							? "existing"
+							: "automatic",
+					...(initialization ? { initialization } : {}),
+				};
+			} finally {
+				if (reserved) {
+					this.#selectionReservations.delete(chatId);
+					this.#notifyChange();
+				}
+			}
 		}
 	}
 
