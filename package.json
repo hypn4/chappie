@@ -17,6 +17,7 @@
 		"build": "node scripts/build.mjs",
 		"prepack": "node scripts/build.mjs",
 		"test:omp": "node scripts/verify-omp.mjs",
+		"test:otunnel": "node scripts/verify-otunnel.mjs",
 		"verify:package": "node scripts/verify-package.mjs"
 	},
 	"keywords": [

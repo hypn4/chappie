@@ -174,3 +174,39 @@ test("observer initialization does not deliver another execution's pending resul
 	assert.doesNotMatch(JSON.stringify(result), /PENDING_RESULT/);
 	assert.equal(f.acknowledgements, 0);
 });
+
+test("otunnel metadata preserves conversation and request identity at the broker boundary", async (t) => {
+	const observed: { chatId: string; requestId: unknown }[] = [];
+	const f = await mcpFixture(t, {
+		call: async (
+			chatId: string,
+			_sessionId: string | undefined,
+			_calls: unknown[],
+			requestId: unknown,
+		) => {
+			observed.push({ chatId, requestId });
+			return {
+				sessionId: "A",
+				cwd: "/fixture",
+				inputs: [],
+				toolResults: [],
+			};
+		},
+	});
+	for (let index = 0; index < 2; index++) {
+		await f.request("tools/call", {
+			name: "call",
+			arguments: {
+				calls: [{ name: "read", arguments: { path: "test.txt" } }],
+			},
+			_meta: {
+				"openai/session": "tunnel-chat",
+				"otunnel/requestId": "tunnel-request",
+			},
+		});
+	}
+	assert.deepEqual(observed, [
+		{ chatId: "tunnel-chat", requestId: "tunnel-request" },
+		{ chatId: "tunnel-chat", requestId: "tunnel-request" },
+	]);
+});

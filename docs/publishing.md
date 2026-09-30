@@ -28,6 +28,13 @@ job's environment. No script searches for npm internals or invokes Windows shims
 The installer runs as its own Actions step with npm timing logs retained on failure.
 A timeout is a failed check, not an accepted installation.
 
+The maintained tunnel compatibility baseline is `otunnel 0.2.x`. Run
+`pnpm test:otunnel` to verify an installed 0.2 runtime and Chappie's
+`openai/session`, `otunnel/requestId`, and duplicate-request contracts.
+The runtime check is skipped when `otunnel` is not installed, while the
+protocol regressions still run. A new otunnel minor line is not assumed
+compatible until this check and the package/OMP suites pass.
+
 For a local check, choose a new, empty directory outside the checkout. These
 commands work in a shell with Node, npm, pnpm, and tar on PATH:
 
