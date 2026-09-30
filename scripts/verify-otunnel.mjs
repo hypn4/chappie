@@ -6,7 +6,8 @@ export function parseOtunnelVersion(output) {
 	const match = /^otunnel\s+(\d+)\.(\d+)\.(\d+)(?:[-+][^\s]+)?\s*$/m.exec(
 		output.trim(),
 	);
-	if (!match) throw new Error(`Could not parse otunnel version from: ${output.trim()}`);
+	if (!match)
+		throw new Error(`Could not parse otunnel version from: ${output.trim()}`);
 	return {
 		major: Number(match[1]),
 		minor: Number(match[2]),
@@ -24,7 +25,9 @@ export function assertSupportedOtunnelVersion(output) {
 	return version;
 }
 
-export function verifyOtunnelBinary(command = process.env.OTUNNEL ?? "otunnel") {
+export function verifyOtunnelBinary(
+	command = process.env.OTUNNEL ?? "otunnel",
+) {
 	const result = spawnSync(command, ["--version"], { encoding: "utf8" });
 	if (result.error?.code === "ENOENT") {
 		return { skipped: true, command };
@@ -75,6 +78,10 @@ function main() {
 	if (!process.argv.includes("--version-only")) verifyProtocolContracts();
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === fileURLToPath(new URL(process.argv[1], "file://"))) {
+if (
+	process.argv[1] &&
+	fileURLToPath(import.meta.url) ===
+		fileURLToPath(new URL(process.argv[1], "file://"))
+) {
 	main();
 }

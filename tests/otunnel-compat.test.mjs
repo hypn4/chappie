@@ -23,8 +23,5 @@ test("otunnel compatibility parser rejects unsupported runtime lines", () => {
 		() => assertSupportedOtunnelVersion("otunnel 0.3.0"),
 		/requires otunnel 0\.2\.x/i,
 	);
-	assert.throws(
-		() => parseOtunnelVersion("not-a-version"),
-		/could not parse/i,
-	);
+	assert.throws(() => parseOtunnelVersion("not-a-version"), /could not parse/i);
 });
