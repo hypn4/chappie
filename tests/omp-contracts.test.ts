@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { directHostCall } from "../src/host-tools.ts";
+import type {
+	ExtensionAPI as OmpExtensionAPI,
+	ToolInfo as OmpToolInfo,
+} from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+import { directHostCall, serializableTool } from "../src/host-tools.ts";
 import { resolveOmpAgentDir } from "../src/omp-agent-dir.ts";
-import type { OmpExtensionAPI } from "../src/omp-api.ts";
 import { createOmpHostApi } from "../src/session.ts";
 import { directTools } from "../src/tools.ts";
 import { sessionFixture } from "./helpers/session-fixture.ts";
@@ -13,23 +16,87 @@ const schema = {
 	required: ["path"],
 };
 
+function legacyWireSchema(tool: OmpToolInfo): Record<string, unknown> {
+	const normalized = serializableTool({
+		name: tool.name,
+		description: tool.description,
+		parameters: tool.parameters,
+		...(tool.promptGuidelines
+			? { promptGuidelines: tool.promptGuidelines }
+			: {}),
+		sourceInfo: tool.sourceInfo,
+	});
+	if (normalized.schemaError) throw new Error(normalized.schemaError);
+	const parameters = normalized.parameters;
+	if (
+		!parameters ||
+		typeof parameters !== "object" ||
+		Array.isArray(parameters)
+	)
+		throw new Error("Native parameter schema is not an object");
+	return Object.fromEntries(Object.entries(parameters));
+}
+
 test("callable OMP parameter types survive the JSON boundary", () => {
 	const parameters = Object.assign(() => undefined, {
 		toJsonSchema: () => schema,
 	});
-	const api = createOmpHostApi({
-		getAllTools: () => [{ name: "read", description: "read", parameters }],
-	} as unknown as OmpExtensionAPI);
+	const api = createOmpHostApi(
+		{
+			getAllTools: () => [{ name: "read", description: "read", parameters }],
+		} as unknown as OmpExtensionAPI,
+		legacyWireSchema,
+	);
 	const serialized = JSON.parse(JSON.stringify(api.getAllTools()));
 	assert.deepEqual(serialized[0].parameters, schema);
 });
 
 test("unsupported schema representations are explicitly diagnosed", () => {
-	const api = createOmpHostApi({
-		getAllTools: () => [{ name: "unknown", description: "unknown" }],
-	} as unknown as OmpExtensionAPI);
+	const api = createOmpHostApi(
+		{
+			getAllTools: () => [{ name: "unknown", description: "unknown" }],
+		} as unknown as OmpExtensionAPI,
+		legacyWireSchema,
+	);
 	const serialized = JSON.parse(JSON.stringify(api.getAllTools()));
 	assert.match(serialized[0].schemaError ?? "", /schema/i);
+});
+
+test("OMP native schemas use the injected official wire normalization", () => {
+	let calls = 0;
+	const api = createOmpHostApi(
+		{
+			getAllTools: () => [
+				{
+					name: "lookup",
+					description: "lookup",
+					parameters: {
+						type: "object",
+						definitions: { Value: { type: "string" } },
+						properties: { value: { $ref: "#/definitions/Value" } },
+					},
+				},
+			],
+		} as unknown as OmpExtensionAPI,
+		() => {
+			calls++;
+			return {
+				type: "object",
+				$defs: { Value: { type: "string" } },
+				properties: { value: { $ref: "#/$defs/Value" } },
+			};
+		},
+	);
+	const parameters = api.getAllTools()[0]?.parameters as Record<
+		string,
+		unknown
+	>;
+	assert.equal(calls, 1);
+	assert.equal(parameters.definitions, undefined);
+	assert.deepEqual(parameters.$defs, { Value: { type: "string" } });
+	assert.deepEqual((parameters.properties as Record<string, unknown>).value, {
+		$ref: "#/$defs/Value",
+	});
 });
 
 test("ordinary profile prefixes are not Windows device names", () => {

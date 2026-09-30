@@ -155,10 +155,16 @@ test("both host transfer definitions expose a stable approval-resumption operati
 		string,
 		unknown
 	>;
-	const ompProperties = createOmpTransferTool(f.local).parameters
-		.properties as Record<string, unknown>;
 	assert.ok(piProperties.operationId);
-	assert.ok(ompProperties.operationId);
+	const ompParameters = createOmpTransferTool(f.local).parameters;
+	assert.ok("properties" in ompParameters);
+	const ompProperties = ompParameters.properties;
+	assert.ok(
+		ompProperties &&
+			typeof ompProperties === "object" &&
+			!Array.isArray(ompProperties),
+	);
+	assert.ok("operationId" in ompProperties);
 });
 
 test("logical transfer identity survives changing transport request IDs and signed URLs", () => {

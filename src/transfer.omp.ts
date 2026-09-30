@@ -1,6 +1,6 @@
-import type { OmpToolDefinition } from "./omp-api.ts";
+import type { ToolDefinition } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import type { LocalSession } from "./session.ts";
-import type { TransferArgs, TransferDetails } from "./transfer.ts";
+import type { TransferArgs } from "./transfer.ts";
 
 const parameters = {
 	type: "object",
@@ -53,9 +53,7 @@ const parameters = {
 	additionalProperties: false,
 } satisfies Record<string, unknown>;
 
-export function createOmpTransferTool(
-	session: LocalSession,
-): OmpToolDefinition<TransferArgs, TransferDetails> {
+export function createOmpTransferTool(session: LocalSession): ToolDefinition {
 	return {
 		name: "transfer",
 		label: "transfer",
@@ -64,7 +62,7 @@ export function createOmpTransferTool(
 		parameters,
 		async execute(_id, args, signal, update, context) {
 			return session.transfer(
-				args,
+				args as TransferArgs,
 				signal,
 				update
 					? (result) => {

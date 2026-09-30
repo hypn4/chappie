@@ -9,6 +9,11 @@ import type {
 	SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
+import type {
+	ExtensionAPI as OmpExtensionAPI,
+	ExtensionContext as OmpExtensionContext,
+	ToolInfo as OmpToolInfo,
+} from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import {
 	type Activity,
 	chatLabel,
@@ -19,11 +24,7 @@ import {
 import type { NetworkTlsConfig } from "./config.ts";
 import type { DeliveryRecord } from "./delivery.ts";
 import { historyResult } from "./history.ts";
-import {
-	directHostCall,
-	directHostResults,
-	serializableTool,
-} from "./host-tools.ts";
+import { directHostCall, directHostResults } from "./host-tools.ts";
 import {
 	type BrokerMessage,
 	IpcClient,
@@ -36,7 +37,6 @@ import {
 	type SessionStatus,
 	type SessionToolInfo,
 } from "./ipc.ts";
-import type { OmpExtensionAPI, OmpExtensionContext } from "./omp-api.ts";
 import type { ProviderOutput } from "./provider-core.ts";
 import {
 	type ResourceDescriptor,
@@ -96,6 +96,8 @@ interface ChappieContext {
 	abort(): void;
 }
 
+type OmpWireSchema = (tool: OmpToolInfo) => Record<string, unknown>;
+
 export function createPiHostApi(pi: PiExtensionAPI): ChappieHostAPI {
 	return {
 		appendEntry: (customType, data) => pi.appendEntry(customType, data),
@@ -107,12 +109,26 @@ export function createPiHostApi(pi: PiExtensionAPI): ChappieHostAPI {
 	};
 }
 
-export function createOmpHostApi(pi: OmpExtensionAPI): ChappieHostAPI {
+export function createOmpHostApi(
+	pi: OmpExtensionAPI,
+	wireSchema: OmpWireSchema,
+): ChappieHostAPI {
 	return {
 		appendEntry: (customType, data) => pi.appendEntry(customType, data),
 		getSessionName: () => pi.getSessionName(),
 		getActiveTools: () => pi.getActiveTools(),
-		getAllTools: () => pi.getAllTools().map(serializableTool),
+		getAllTools: () =>
+			pi.getAllTools().map((tool) => {
+				try {
+					return { ...tool, parameters: wireSchema(tool) };
+				} catch (error) {
+					return {
+						...tool,
+						parameters: undefined,
+						schemaError: `Cannot expose native tool schema: ${error instanceof Error ? error.message : String(error)}`,
+					};
+				}
+			}),
 		getCommands: () => pi.getCommands(),
 		sendMessage: (message, options) => pi.sendMessage(message, options),
 	};

@@ -1,11 +1,26 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import type { AssistantMessageEventStream } from "@earendil-works/pi-ai";
-import type { OmpExtensionAPI, OmpExtensionContext } from "../src/omp-api.ts";
+import type {
+	Api,
+	AssistantMessageEventStream,
+	Context,
+	Model,
+	SimpleStreamOptions,
+} from "@oh-my-pi/pi-ai";
+import type {
+	ExtensionAPI as OmpExtensionAPI,
+	ExtensionContext as OmpExtensionContext,
+	ProviderConfig as OmpProviderConfig,
+} from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { createOmpChappieProvider } from "../src/provider.omp.ts";
 import type { ProviderOutput } from "../src/provider-core.ts";
 
-const model = { api: "chappie", provider: "chappie", id: "chatgpt" };
+// Routing tests need only the provider/id fields consumed by Chappie.
+const model = {
+	api: "chappie",
+	provider: "chappie",
+	id: "chatgpt",
+} as unknown as Model<Api>;
 
 // Session-scoped request hooks, with a process-wide last-registered provider.
 // These are callback fixtures, not agents or model calls.
@@ -21,7 +36,7 @@ function owner(id: string, start?: (output: ProviderOutput) => Promise<void>) {
 			return { provider };
 		},
 		sessionManager: { getSessionId: () => currentId },
-	} as OmpExtensionContext;
+	} as unknown as OmpExtensionContext;
 	const api = {
 		on(
 			name: string,
@@ -31,7 +46,7 @@ function owner(id: string, start?: (output: ProviderOutput) => Promise<void>) {
 			list.push(handler);
 			handlers.set(name, list);
 		},
-	} as OmpExtensionAPI;
+	} as unknown as OmpExtensionAPI;
 	const starts: string[] = [];
 	const config = createOmpChappieProvider(async (output) => {
 		starts.push(currentId);
@@ -70,14 +85,14 @@ function owner(id: string, start?: (output: ProviderOutput) => Promise<void>) {
 }
 
 async function result(
-	config: ReturnType<typeof createOmpChappieProvider>,
-	options?: object,
-	context: unknown = { messages: [] },
+	config: OmpProviderConfig,
+	options?: SimpleStreamOptions,
+	context: Context = { messages: [] },
 ) {
 	const stream = config.streamSimple?.(model, context, options);
 	assert.ok(stream);
 	// The adapter returns the shared Pi/OMP event stream implementation.
-	const events = stream as AssistantMessageEventStream;
+	const events = stream as unknown as AssistantMessageEventStream;
 	return await events.result();
 }
 
@@ -196,7 +211,9 @@ test("an auxiliary error cannot replace an open primary request", async () => {
 test("auxiliary prompts sharing a session hook cannot be mistaken for a native turn", async () => {
 	const a = owner("A");
 	const reply = await result(a.config, a.options(), {
-		messages: [{ role: "user", content: "Summarize a label" }],
+		messages: [
+			{ role: "user", content: "Summarize a label", timestamp: Date.now() },
+		],
 	});
 	assert.equal(reply.stopReason, "error");
 	assert.match(reply.errorMessage ?? "", /auxiliary/i);

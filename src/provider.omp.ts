@@ -1,4 +1,8 @@
-import type { OmpExtensionAPI, OmpProviderConfig } from "./omp-api.ts";
+import type { AssistantMessageEventStream as OmpAssistantMessageEventStream } from "@oh-my-pi/pi-ai";
+import type {
+	ExtensionAPI as OmpExtensionAPI,
+	ProviderConfig as OmpProviderConfig,
+} from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { createChappieStream, type ProviderOutput } from "./provider-core.ts";
 
 const CHAPPIE_API = "chappie";
@@ -73,7 +77,12 @@ const streamSimple: OmpStreamSimple = (model, context, options) => {
 		await routed[routeTag](output, sessionId);
 	});
 	// OMP rewrites the Pi AI import to its own event-stream implementation.
-	return stream(model, context, options);
+	// The private stream classes are nominally distinct at type-check time.
+	return stream(
+		model,
+		context,
+		options,
+	) as unknown as OmpAssistantMessageEventStream;
 };
 
 export function createOmpChappieProvider(

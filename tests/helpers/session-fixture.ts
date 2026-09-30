@@ -4,11 +4,12 @@ import { join } from "node:path";
 import type { TestContext } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import type { ToolResultMessage } from "@earendil-works/pi-ai";
-import { Broker } from "../../src/broker.ts";
 import type {
-	OmpExtensionAPI,
-	OmpExtensionContext,
-} from "../../src/omp-api.ts";
+	ExtensionAPI as OmpExtensionAPI,
+	ExtensionContext as OmpExtensionContext,
+	ToolInfo as OmpToolInfo,
+} from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+import { Broker } from "../../src/broker.ts";
 import { ProviderOutput } from "../../src/provider-core.ts";
 import { createOmpHostApi, LocalSession } from "../../src/session.ts";
 
@@ -21,6 +22,17 @@ export async function until(
 		if (Date.now() >= deadline) throw new Error("Fixture condition timed out");
 		await delay(5);
 	}
+}
+
+function fixtureWireSchema(tool: OmpToolInfo): Record<string, unknown> {
+	const parameters = tool.parameters;
+	if (
+		!parameters ||
+		typeof parameters !== "object" ||
+		Array.isArray(parameters)
+	)
+		throw new Error("Fixture tool schema must be an object");
+	return Object.fromEntries(Object.entries(parameters));
 }
 
 export async function sessionFixture(t: TestContext) {
@@ -90,11 +102,16 @@ export async function sessionFixture(t: TestContext) {
 				timers.push(timer);
 				return timer;
 			},
-		};
+		} as unknown as OmpExtensionContext;
 	}
 	let current = context("A");
 	let broker = new Broker(root);
-	const local = new LocalSession(createOmpHostApi(api), root, undefined, "omp");
+	const local = new LocalSession(
+		createOmpHostApi(api, fixtureWireSchema),
+		root,
+		undefined,
+		"omp",
+	);
 	t.after(async () => {
 		controller.abort(new Error("fixture cleanup"));
 		for (const timer of timers) clearInterval(timer);
