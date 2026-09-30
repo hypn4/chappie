@@ -26,6 +26,18 @@ test("switching sessions rejects queued work and unregisters the old ID", async 
 	);
 });
 
+test("session name changes resync the existing OMP session", async (t) => {
+	const f = await sessionFixture(t);
+	assert.equal(f.broker.listSessions("A")[0]?.name, undefined);
+	f.setSessionName("Renamed session");
+	await f.emit("message_start", {});
+	await until(
+		() => f.broker.listSessions("A")[0]?.name === "Renamed session",
+		500,
+	);
+	assert.equal(f.broker.listSessions("A")[0]?.name, "Renamed session");
+});
+
 test("late completion after a switch retains its original session and cwd", async (t) => {
 	const f = await sessionFixture(t);
 	const previous = f.current;

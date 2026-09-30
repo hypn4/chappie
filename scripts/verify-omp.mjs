@@ -18,6 +18,25 @@ import { toolResultsContent } from "../src/delivery.ts";
 // These are synthetic tool requests, not a second model/agent doing inference.
 const checkout = fileURLToPath(new URL("../", import.meta.url));
 const extensionRoot = process.env.CHAPPIE_PACKAGE_ROOT || checkout;
+const extensionManifest = JSON.parse(
+	await readFile(join(extensionRoot, "package.json"), "utf8"),
+);
+const extensionEntry = extensionManifest.omp?.extensions?.[0];
+assert.equal(
+	typeof extensionEntry,
+	"string",
+	"Package must declare an OMP extension entry",
+);
+assert.match(
+	extensionEntry,
+	/^\.\/dist\/src\/index\.omp\.js$/,
+	"OMP verification requires the published compiled extension",
+);
+const candidateEntry = `./candidate/${extensionEntry.slice(2)}`;
+const candidateProviderEntry = candidateEntry.replace(
+	/index\.omp\.js$/,
+	"provider.omp.js",
+);
 const root = await mkdtemp(
 	join(process.platform === "win32" ? tmpdir() : "/tmp", "chomp-"),
 );
@@ -51,8 +70,8 @@ await writeFile(
 	probeExtension,
 	`
 import { writeFileSync } from "node:fs";
-import chappie from "./candidate/src/index.omp.ts";
-import { createOmpChappieProvider } from "./candidate/src/provider.omp.ts";
+import chappie from ${JSON.stringify(candidateEntry)};
+import { createOmpChappieProvider } from ${JSON.stringify(candidateProviderEntry)};
 export default async function probe(api) {
   await chappie(api);
   let dispose;

@@ -192,4 +192,13 @@ and Windows named pipes do not require certificates.
 
 Set `ask` to `false` to disable webpage questions.
 
+Set `cooldown` to the participation cooldown in seconds. The default is `10`;
+`0` disables observer reuse for closely spaced initializations.
+
+OMP users can set `localTools` to `true` to register the opt-in
+`sessions`, `remote_tools`, `remote_call`, `remote_chat`, and
+`history` collaboration tools. They are active only while the OMP session is
+using a non-Chappie model; selecting the Chappie provider keeps ChatGPT-driven
+execution isolated. The default is `false`.
+
 Closely spaced initializations from the same ChatGPT conversation receive guidance to observe through `history` without repeating exports or the completion response. See [participation](docs/tools.md#participation).

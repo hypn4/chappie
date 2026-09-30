@@ -68,13 +68,20 @@ anchors. Direct `edit` accepts `patch` containing the exact native patch format
 returned by `read`/`tools`; it does not synthesize anchors from Pi text edits.
 `call` always takes native arguments. Tool definitions that cannot be converted
 to JSON Schema report `schemaError` instead of silently omitting their contract.
+Normal JSON `calls` are the default. As an optional transport representation,
+`call` can instead receive `base64` containing the UTF-8 Base64 encoding of
+the same calls array; supply exactly one representation. Results stay ordinary
+MCP content.
 
 Chappie is a ChatGPT-controlled transport, not a general-purpose inference API.
-OMP requests must belong to a live session through its request hook and session
-ID. Auxiliary model prompts, such as title generation, cannot borrow that
-session's pending response. No other model is selected automatically. Creating
-an OMP task does not create a ChatGPT conversation or provide autonomous child
-inference; each Chappie session still needs an explicit ChatGPT controller.
+OMP provider requests must belong to a live session through its request hook and
+session ID. Chappie relays the recognized OMP compaction and branch-summary
+requests as `modelRequest` input with an independent request ID; answer those
+with `chat({ replyTo: modelRequest, ... })`. Unrecognized auxiliary prompts
+cannot borrow the session's primary response. No other model is selected
+automatically. Creating an OMP task does not create a ChatGPT conversation or
+provide autonomous child inference; each Chappie session still needs an explicit
+ChatGPT controller.
 
 For example:
 
@@ -93,12 +100,25 @@ A `call` array is one Pi tool batch:
 }
 ```
 
+The encoded equivalent uses the Base64 form of that exact JSON calls array:
+
+```json
+{ "base64": "<UTF-8 Base64 of the calls array>" }
+```
+
 Pi controls execution inside that batch. Separate requests run in order within one Pi session, while different Pi sessions can work independently. Extension tools retain their native Pi behavior, including interactive interfaces.
 
 `chat` creates a normal assistant message in Pi:
 
 ```json
 { "text": "Updated the parser and its callers." }
+```
+
+When a result contains `modelRequest`, use its ID as `replyTo` instead of
+starting a normal Pi turn:
+
+```json
+{ "text": "Compacted summary...", "replyTo": "<modelRequest-id>" }
 ```
 
 Pi user input consumed during the work accompanies later Chappie results, including images.
@@ -207,7 +227,8 @@ explicitly. For a directory, create an archive with a Pi tool first.
 
 ### Pi to Pi
 
-Supply `to` to copy files to another connected Pi session:
+Supply `to` to push files from the selected source session to another
+connected session:
 
 ```json
 {
@@ -221,9 +242,29 @@ Supply `to` to copy files to another connected Pi session:
 }
 ```
 
-Source and destination paths correspond by position. Each session resolves its own relative paths, absolute paths, and `~/`. Image references can also be copied. `files` and `to` select different sources and are mutually exclusive.
+Or select the destination session and use `from` to pull files from another
+connected session:
 
-Both Pi sessions need to stay connected during the transfer. `overwrite: true` replaces an existing destination. Cancellation or failure discards the incomplete file; successfully copied files remain available.
+```json
+{
+  "operationId": "pull-build-1",
+  "sessionId": "<destination-session>",
+  "paths": ["downloads/output.zip"],
+  "from": {
+    "sessionId": "<source-session>",
+    "paths": ["build/output.zip"]
+  }
+}
+```
+
+Source and destination paths correspond by position. Each session resolves its
+own relative paths, absolute paths, and `~/`. Image references can also be
+copied. `files`, `from`, and `to` select different transfer directions and
+are mutually exclusive.
+
+Both Pi sessions need to stay connected during the transfer. `overwrite: true`
+replaces an existing destination. Cancellation or failure discards the
+incomplete file; successfully copied files remain available.
 
 ### Images
 

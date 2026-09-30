@@ -426,6 +426,7 @@ export class LocalSession {
 		const shared = adaptOmpContext(context);
 		const providerActive = shared.model?.provider === "chappie";
 		const name = this.#api.getSessionName();
+		const nameChanged = name !== this.#ompSessionName;
 		const providerChanged = this.#ompProviderActive !== providerActive;
 		if (providerChanged && this.#connection) this.close(false);
 		this.#ompProviderActive = providerActive;
@@ -444,7 +445,7 @@ export class LocalSession {
 		}
 
 		this.#context = shared;
-		if (name !== this.#ompSessionName) void this.#sync().catch(() => {});
+		if (nameChanged) void this.#sync().catch(() => {});
 		return shared;
 	}
 

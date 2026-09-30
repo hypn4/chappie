@@ -169,6 +169,7 @@ export async function sessionFixture(t: TestContext) {
 	const timers: NodeJS.Timeout[] = [];
 	let probes = 0;
 	let aborts = 0;
+	let sessionName: string | undefined;
 	const api = {
 		on(
 			name: string,
@@ -178,7 +179,7 @@ export async function sessionFixture(t: TestContext) {
 		},
 		appendEntry() {},
 		getSessionName() {
-			return undefined;
+			return sessionName;
 		},
 		getActiveTools: () => ["read"],
 		getAllTools: () => [
@@ -266,6 +267,9 @@ export async function sessionFixture(t: TestContext) {
 		},
 		get aborts() {
 			return aborts;
+		},
+		setSessionName(value: string | undefined) {
+			sessionName = value;
 		},
 		async queue(requestId = "request-A") {
 			const prior = probes;

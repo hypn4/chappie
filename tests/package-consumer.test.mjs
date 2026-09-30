@@ -23,6 +23,19 @@ async function temporary(t) {
 	return root;
 }
 
+test("OMP verification loads the published compiled extension entry", async () => {
+	const ompSource = await readFile(
+		new URL("../scripts/verify-omp.mjs", import.meta.url),
+		"utf8",
+	);
+	assert.doesNotMatch(ompSource, /candidate\/src\/index\.omp\.ts/);
+	assert.match(ompSource, /omp\?\.extensions|omp\.extensions/);
+	assert.match(
+		ompSource,
+		/candidate.*extensionEntry|extensionEntry.*candidate/s,
+	);
+});
+
 test("package verification never locates or spawns a package manager", () => {
 	assert.doesNotMatch(
 		source,
