@@ -211,6 +211,54 @@ test("otunnel metadata preserves conversation and request identity at the broker
 	]);
 });
 
+test("call accepts an optional Base64 UTF-8 JSON batch", async (t) => {
+	const observed: unknown[] = [];
+	const f = await mcpFixture(t, {
+		call: async (
+			_chatId: string,
+			_sessionId: string | undefined,
+			calls: unknown[],
+		) => {
+			observed.push(calls);
+			return {
+				sessionId: "A",
+				cwd: "/fixture",
+				inputs: [],
+				toolResults: [],
+			};
+		},
+	});
+	const calls = [{ name: "read", arguments: { path: "file.txt" } }];
+	const encoded = Buffer.from(JSON.stringify(calls), "utf8").toString("base64");
+	const result = await f.call("call", { base64: encoded });
+	assert.equal(result.isError, false);
+	assert.deepEqual(observed, [calls]);
+});
+
+test("call rejects ambiguous or malformed Base64 batches before execution", async (t) => {
+	let executions = 0;
+	const f = await mcpFixture(t, {
+		call: async () => {
+			executions++;
+			throw new Error("must not execute");
+		},
+	});
+	const calls = [{ name: "read", arguments: { path: "file.txt" } }];
+	const encoded = Buffer.from(JSON.stringify(calls), "utf8").toString("base64");
+	for (const args of [
+		{ calls, base64: encoded },
+		{ base64: "not base64!" },
+		{ base64: Buffer.from([0xff, 0xfe, 0xfd]).toString("base64") },
+		{
+			base64: Buffer.from(JSON.stringify({ calls }), "utf8").toString("base64"),
+		},
+	]) {
+		const result = await f.call("call", args);
+		assert.equal(result.isError, true, JSON.stringify(args));
+	}
+	assert.equal(executions, 0);
+});
+
 test("history does not read or acknowledge pending session input", async (t) => {
 	let inputReads = 0;
 	const f = await mcpFixture(t, {

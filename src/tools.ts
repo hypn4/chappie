@@ -18,6 +18,26 @@ export interface ToolInput {
 	arguments: Record<string, unknown>;
 }
 
+export function decodeBase64ToolCalls(value: string): unknown {
+	if (
+		value.length === 0 ||
+		value.length % 4 !== 0 ||
+		!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(
+			value,
+		)
+	)
+		throw new Error("call.base64 must be canonical Base64");
+	const bytes = Buffer.from(value, "base64");
+	const text = bytes.toString("utf8");
+	if (!Buffer.from(text, "utf8").equals(bytes))
+		throw new Error("call.base64 must contain valid UTF-8");
+	try {
+		return JSON.parse(text);
+	} catch {
+		throw new Error("call.base64 must contain UTF-8 JSON");
+	}
+}
+
 const definitions = [
 	createReadToolDefinition("."),
 	createBashToolDefinition("."),

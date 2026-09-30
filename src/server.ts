@@ -13,6 +13,7 @@ import {
 	questionOutput,
 } from "./questions.ts";
 import {
+	decodeBase64ToolCalls,
 	directTools,
 	inputContent,
 	type ToolInput,
@@ -31,6 +32,12 @@ const outputSchema = z.object({
 			"Complete text output, including Pi user input, submitted webpage answers, and deferred results. Images and file resources accompany it as native content blocks.",
 		),
 });
+
+const nativeCallSchema = z.object({
+	name: z.string(),
+	arguments: z.record(z.string(), z.unknown()),
+});
+const nativeCallsSchema = z.array(nativeCallSchema).min(1).max(128);
 
 const questionTemplate = "ui://chappie/question.html";
 const questionSchema = outputSchema.extend({ question: questionOutput });
@@ -352,30 +359,39 @@ export function createServer(broker: Broker): McpServer {
 			description:
 				"Execute Pi tools using the definitions returned by tools. Each calls array is one native Pi batch.",
 			outputSchema,
-			inputSchema: z.object({
-				calls: z
-					.array(
-						z.object({
-							name: z.string(),
-							arguments: z.record(z.string(), z.unknown()),
-						}),
-					)
-					.min(1)
-					.max(128),
-				sessionId: z
-					.string()
-					.optional()
-					.describe(
-						"Pi session for this operation; becomes the default if none is set",
-					),
-			}),
+			inputSchema: z
+				.object({
+					calls: nativeCallsSchema.optional(),
+					base64: z
+						.string()
+						.optional()
+						.describe("Optional Base64-encoded UTF-8 JSON calls array"),
+					sessionId: z
+						.string()
+						.optional()
+						.describe(
+							"Pi session for this operation; becomes the default if none is set",
+						),
+				})
+				.refine(
+					(value) =>
+						(value.calls === undefined) !== (value.base64 === undefined),
+					{ message: "Supply exactly one of calls or base64" },
+				),
 			annotations: toolAnnotations("call"),
 		},
 		handle(async (args, context) => {
+			let calls: ToolInput[];
+			if (args.calls) calls = args.calls;
+			else {
+				if (!args.base64)
+					throw new Error("Supply exactly one of calls or base64");
+				calls = nativeCallsSchema.parse(decodeBase64ToolCalls(args.base64));
+			}
 			const result = await broker.call(
 				requireChatId(context),
 				args.sessionId,
-				args.calls,
+				calls,
 				context.mcpReq._meta?.["otunnel/requestId"],
 				context.mcpReq.signal,
 			);
