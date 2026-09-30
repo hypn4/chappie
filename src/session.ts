@@ -23,7 +23,7 @@ import {
 } from "./activity.ts";
 import type { NetworkTlsConfig } from "./config.ts";
 import type { DeliveryRecord } from "./delivery.ts";
-import { historyResult } from "./history.ts";
+import { type HistoryRange, historyResult } from "./history.ts";
 import { directHostCall, directHostResults } from "./host-tools.ts";
 import {
 	type BrokerMessage,
@@ -46,6 +46,7 @@ import {
 	rememberImages,
 	resourceSessionId,
 } from "./resources.ts";
+import type { ToolInput } from "./tools.ts";
 import {
 	copyFiles,
 	executeTransfer,
@@ -221,6 +222,7 @@ export class LocalSession {
 	readonly #connect: string | undefined;
 	readonly #host: SessionHost;
 	readonly #tls: NetworkTlsConfig | undefined;
+	readonly #localTools: boolean;
 	readonly #syncs = new Map<number, SyncRequest>();
 	readonly #stores = new Map<string, StoreRequest>();
 	readonly #queue: RemoteRequest[] = [];
@@ -253,12 +255,18 @@ export class LocalSession {
 		connect?: string,
 		host: SessionHost = "pi",
 		tls?: NetworkTlsConfig,
+		localTools = false,
 	) {
 		this.#api = api;
 		this.#agentDir = agentDir;
 		this.#connect = connect;
 		this.#host = host;
 		this.#tls = tls;
+		this.#localTools = localTools;
+	}
+
+	get localTools(): boolean {
+		return this.#localTools;
 	}
 
 	installPi(pi: PiExtensionAPI): void {
@@ -416,31 +424,27 @@ export class LocalSession {
 	#refreshOmpContext(context: OmpExtensionContext): ChappieContext {
 		this.#latestOmpContext = context;
 		const shared = adaptOmpContext(context);
-		const active = shared.model?.provider === "chappie";
+		const providerActive = shared.model?.provider === "chappie";
 		const name = this.#api.getSessionName();
-		if (!active) {
-			this.#ompSessionName = name;
-			if (this.#ompProviderActive) {
-				this.#ompProviderActive = false;
-				this.#update(shared, false);
-			}
+		const providerChanged = this.#ompProviderActive !== providerActive;
+		if (providerChanged && this.#connection) this.close(false);
+		this.#ompProviderActive = providerActive;
+		this.#ompSessionName = name;
+
+		if (!providerActive && !this.#localTools) {
+			this.#context = shared;
 			return shared;
 		}
 
 		const sessionChanged =
 			this.#sessionId !== shared.sessionManager.getSessionId();
-		if (!this.#ompProviderActive || sessionChanged) {
-			this.#ompProviderActive = true;
-			this.#ompSessionName = name;
+		if (!this.#connection || sessionChanged || providerChanged) {
 			this.#update(shared, true);
 			return shared;
 		}
 
 		this.#context = shared;
-		if (name !== this.#ompSessionName) {
-			this.#ompSessionName = name;
-			void this.#sync().catch(() => {});
-		}
+		if (name !== this.#ompSessionName) void this.#sync().catch(() => {});
 		return shared;
 	}
 
@@ -576,6 +580,114 @@ export class LocalSession {
 			.filter((block) => block.type === "text")
 			.map((block) => block.text)
 			.join("\n");
+	}
+
+	async sessions(sessionId?: string, signal?: AbortSignal) {
+		const result = await this.#request(
+			{ type: "sessions", ...(sessionId ? { sessionId } : {}) },
+			signal,
+		);
+		if (!("sessions" in result))
+			throw new Error("Broker returned no session list");
+		const self = this.#context?.sessionManager.getSessionId();
+		if (!self) throw new Error("Chappie session is not available");
+		return {
+			self,
+			sessions: result.sessions,
+		};
+	}
+
+	async tools(sessionId: string, names?: string[], signal?: AbortSignal) {
+		const result = await this.#request({ type: "inspect", sessionId }, signal);
+		if (!("inspection" in result))
+			throw new Error("Agent session returned no tool catalog");
+		const selected = names ? new Set(names) : undefined;
+		return {
+			...result.inspection,
+			inputs: result.inputs,
+			...(result.globalAgents ? { globalAgents: result.globalAgents } : {}),
+			tools: selected
+				? result.inspection.tools.filter((tool) => selected.has(tool.name))
+				: result.inspection.tools,
+		};
+	}
+
+	async remoteCall(
+		sessionId: string,
+		calls: ToolInput[],
+		signal?: AbortSignal,
+	) {
+		if (calls.length < 1 || calls.length > 128)
+			throw new Error("Tool batches must contain between 1 and 128 calls");
+		const self = this.#context?.sessionManager.getSessionId();
+		if (!self) throw new Error("Chappie session is not available");
+		const result = await this.#request(
+			{
+				type: "call",
+				sessionId,
+				chatId: self,
+				requestId: randomUUID(),
+				calls: calls.map((call) => ({
+					type: "toolCall",
+					id: `chappie-${randomUUID()}`,
+					name: call.name,
+					arguments: call.arguments,
+				})),
+			},
+			signal,
+		);
+		if (!("toolResults" in result))
+			throw new Error("Agent session returned no tool results");
+		return { sessionId, ...result };
+	}
+
+	async remoteChat(
+		sessionId: string,
+		text: string,
+		replyTo?: string,
+		signal?: AbortSignal,
+	) {
+		const self = this.#context?.sessionManager.getSessionId();
+		if (!self) throw new Error("Chappie session is not available");
+		const result = await this.#request(
+			{
+				type: "chat",
+				sessionId,
+				chatId: self,
+				requestId: randomUUID(),
+				text,
+				...(replyTo ? { replyTo } : {}),
+			},
+			signal,
+		);
+		if (!("message" in result))
+			throw new Error("Agent session returned no assistant message");
+		return { sessionId, ...result };
+	}
+
+	async remoteHistory(
+		range: HistoryRange,
+		sessionId?: string,
+		signal?: AbortSignal,
+	) {
+		const context = this.#context;
+		if (!context) throw new Error("Chappie session is not available");
+		const self = context.sessionManager.getSessionId();
+		if (!sessionId || sessionId === self)
+			return historyResult(context.sessionManager.getBranch(), self, range);
+		const result = await this.#request(
+			{
+				type: "history",
+				sessionId,
+				range,
+				chatId: self,
+				requestId: randomUUID(),
+			},
+			signal,
+		);
+		if (!("history" in result))
+			throw new Error("Agent session returned no history");
+		return result.history;
 	}
 
 	async transfer(
@@ -800,7 +912,7 @@ export class LocalSession {
 		if (
 			!connection?.connected ||
 			!this.#context ||
-			this.#context.model?.provider !== "chappie"
+			(this.#context.model?.provider !== "chappie" && !this.#localTools)
 		)
 			return;
 		const id = this.#nextRequestId++;
@@ -990,6 +1102,13 @@ export class LocalSession {
 					await this.#sendError(
 						message.id,
 						"The requested Pi session is no longer active",
+					);
+					break;
+				}
+				if (this.#context?.model?.provider !== "chappie") {
+					await this.#sendError(
+						message.id,
+						"The requested OMP session is not using the Chappie provider",
 					);
 					break;
 				}

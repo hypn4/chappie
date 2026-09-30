@@ -40,6 +40,10 @@ export interface SessionDescription {
 	status: SessionStatus;
 }
 
+export interface SessionListItem extends SessionDescription {
+	bindingCount: number;
+}
+
 export interface SessionToolInfo {
 	name: string;
 	description: string;
@@ -75,6 +79,7 @@ export type SessionInput = {
 } & ({ message: UserMessage } | { request: ModelRequest });
 
 export type SessionResult =
+	| { sessions: SessionListItem[] }
 	| {
 			inspection: SessionInspection;
 			inputs: SessionInput[];
@@ -94,10 +99,36 @@ export type SessionResult =
 	| { error: string };
 
 export type SessionRequest =
+	| { type: "sessions"; sessionId?: string }
 	| { type: "inspect"; sessionId: string }
 	| { type: "inputs"; sessionId: string }
 	| { type: "readResource"; sessionId: string; uri: string; offset?: number }
 	| { type: "export"; sessionId: string; paths: string[] }
+	| {
+			type: "history";
+			sessionId: string;
+			range: HistoryRange;
+			chatId: string;
+			requestId?: string;
+	  }
+	| {
+			type: "chat";
+			sessionId: string;
+			chatId: string;
+			requestId?: string;
+			operationKey?: string;
+			text: string;
+			replyTo?: string;
+	  }
+	| {
+			type: "call";
+			sessionId: string;
+			chatId: string;
+			requestId?: string;
+			operationKey?: string;
+			calls: ToolCall[];
+			direct?: boolean;
+	  }
 	| {
 			type: "copy";
 			sessionId: string;

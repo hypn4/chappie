@@ -28,10 +28,16 @@ await mkdir(work);
 await writeFile(join(work, "fixture.txt"), "Alpha\nBeta\nGamma\n");
 const probeExtension = join(root, "provider-probe.ts");
 const reminderFile = join(root, "todo-reminder.txt");
+const collaborationFile = join(root, "collaboration-tools.txt");
 const settingsFile = join(root, "settings.yml");
 await writeFile(
 	settingsFile,
 	JSON.stringify({ todo: { reminders: true, remindersMax: 1 } }),
+);
+await writeFile(
+	join(agent, "chappie.json"),
+	JSON.stringify({ localTools: true }),
+	"utf8",
 );
 // Relative imports keep the candidate in OMP's dependency-rewrite graph.
 await symlink(
@@ -62,6 +68,15 @@ export default async function probe(api) {
   api.registerProvider("chappie", foreign);
   dispose?.({}, {});
   api.on("todo_reminder", () => writeFileSync(${JSON.stringify(reminderFile)}, "seen"));
+  api.on("session_start", async () => {
+    const names = new Set(["sessions", "remote_tools", "remote_call", "remote_chat", "history"]);
+    const configured = api.getAllTools().filter((tool) => names.has(tool.name)).map((tool) => tool.name).sort();
+    const active = api.getActiveTools().filter((name) => names.has(name)).sort();
+    writeFileSync(
+      ${JSON.stringify(collaborationFile)},
+      JSON.stringify({ configured, active })
+    );
+  });
   const unsupported = foreign.streamSimple(
     { api: "chappie", provider: "chappie", id: "chatgpt" },
     { messages: [{ role: "user", content: "Auxiliary probe" }] },
@@ -157,6 +172,30 @@ try {
 		if (child.exitCode !== null)
 			throw new Error(`OMP exited with status ${child.exitCode}`);
 		await delay(20);
+	}
+	while (true) {
+		signal.throwIfAborted();
+		try {
+			const collaboration = JSON.parse(
+				await readFile(collaborationFile, "utf8"),
+			);
+			assert.deepEqual(collaboration.configured, [
+				"history",
+				"remote_call",
+				"remote_chat",
+				"remote_tools",
+				"sessions",
+			]);
+			assert.deepEqual(
+				collaboration.active,
+				[],
+				"Chappie model must keep local collaboration tools inactive",
+			);
+			break;
+		} catch (error) {
+			if (error?.code !== "ENOENT") throw error;
+			await delay(20);
+		}
 	}
 	const session = broker.listSessions()[0];
 	await broker.initialize("integration-chat", session.id, "init", signal);
@@ -356,7 +395,7 @@ try {
 		signal,
 	);
 	console.log(
-		"OMP integration passed: provider ownership after replacement/disposal, auxiliary rejection, TODO continuation, exact read, native edit, resource bytes, replay and original-URI recovery.",
+		"OMP integration passed: provider ownership after replacement/disposal, auxiliary rejection, local collaboration registration, TODO continuation, exact read, native edit, resource bytes, replay and original-URI recovery.",
 	);
 	console.log(
 		"No subagents, external model inference or live broker changes were used. ChatGPT approval UI and final response rendering are not covered.",

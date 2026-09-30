@@ -70,6 +70,7 @@ const session = z.strictObject({
 	host: z.enum(["pi", "omp"]).optional(),
 	agentDir: path.optional(),
 });
+const listedSession = session.extend({ bindingCount: id });
 const descriptor = z.strictObject({
 	uri: name,
 	name,
@@ -110,6 +111,7 @@ const transfer = z.strictObject({
 	failed: z.boolean().optional(),
 });
 const sessionRequest = z.union([
+	z.strictObject({ type: z.literal("sessions"), sessionId: name.optional() }),
 	z.strictObject({ type: z.literal("inspect"), sessionId: name }),
 	z.strictObject({ type: z.literal("inputs"), sessionId: name }),
 	z.strictObject({
@@ -122,6 +124,26 @@ const sessionRequest = z.union([
 		type: z.literal("export"),
 		sessionId: name,
 		paths: z.array(path).min(1).max(128),
+	}),
+	z.strictObject({
+		type: z.literal("history"),
+		sessionId: name,
+		range: historyInput,
+		...source,
+	}),
+	z.strictObject({
+		type: z.literal("chat"),
+		sessionId: name,
+		text,
+		replyTo: name.optional(),
+		...source,
+	}),
+	z.strictObject({
+		type: z.literal("call"),
+		sessionId: name,
+		calls: z.array(toolCall).min(1).max(128),
+		direct: z.boolean().optional(),
+		...source,
 	}),
 	z.strictObject({
 		type: z.literal("copy"),
@@ -141,6 +163,7 @@ export const deliverySchema = z.strictObject({
 	complete: z.boolean().optional(),
 });
 const resultPayloads = [
+	{ sessions: z.array(listedSession).max(4096) },
 	{ inspection, inputs, globalAgents: z.strictObject({ path }).optional() },
 	{ inputs },
 	{

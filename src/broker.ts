@@ -11,6 +11,7 @@ import {
 	type SessionDescription,
 	type SessionInput,
 	type SessionInspection,
+	type SessionListItem,
 	type SessionMessage,
 	type SessionResult,
 } from "./ipc.ts";
@@ -158,9 +159,7 @@ export class Broker {
 		await this.#state.flush();
 	}
 
-	listSessions(sessionId?: string): (SessionDescription & {
-		bindingCount: number;
-	})[] {
+	listSessions(sessionId?: string): SessionListItem[] {
 		const counts = this.#state.bindingCounts();
 		return [...this.#sessions.values()]
 			.filter(({ description }) => !sessionId || description.id === sessionId)
@@ -597,6 +596,14 @@ export class Broker {
 					![...this.#sessions.values()].some((session) => session.peer === peer)
 				)
 					throw new Error("Unregistered IPC peer cannot relay requests");
+				if (message.request.type === "sessions") {
+					await peer.send({
+						type: "response",
+						id: message.id,
+						sessions: this.listSessions(message.request.sessionId),
+					});
+					break;
+				}
 				let relays = this.#relays.get(peer);
 				if (!relays) {
 					relays = new Map();

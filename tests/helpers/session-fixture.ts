@@ -45,7 +45,15 @@ export async function multiSessionFixture(t: TestContext, ids = ["A", "B"]) {
 	const locals: LocalSession[] = [];
 	const sessions = new Map<
 		string,
-		{ id: string; cwd: string; local: LocalSession }
+		{
+			id: string;
+			cwd: string;
+			local: LocalSession;
+			context: OmpExtensionContext;
+			branch: unknown[];
+			emit(name: string, event: unknown): Promise<unknown>;
+			wakes(): number;
+		}
 	>();
 	t.after(async () => {
 		controller.abort(new Error("fixture cleanup"));
@@ -62,6 +70,8 @@ export async function multiSessionFixture(t: TestContext, ids = ["A", "B"]) {
 			string,
 			(event: unknown, context: OmpExtensionContext) => unknown
 		>();
+		const branch: unknown[] = [];
+		let wakes = 0;
 		const api = {
 			on(
 				name: string,
@@ -71,10 +81,22 @@ export async function multiSessionFixture(t: TestContext, ids = ["A", "B"]) {
 			},
 			appendEntry() {},
 			getSessionName: () => id,
-			getActiveTools: () => [],
-			getAllTools: () => [],
+			getActiveTools: () => ["read"],
+			getAllTools: () => [
+				{
+					name: "read",
+					description: "fixture read",
+					parameters: {
+						type: "object",
+						properties: { path: { type: "string" } },
+						required: ["path"],
+					},
+				},
+			],
 			getCommands: () => [],
-			sendMessage() {},
+			sendMessage() {
+				wakes++;
+			},
 		} as unknown as OmpExtensionAPI;
 		const context = {
 			cwd,
@@ -86,7 +108,7 @@ export async function multiSessionFixture(t: TestContext, ids = ["A", "B"]) {
 				getLeafId: () => null,
 				getLeafEntry: () => undefined,
 				getEntry: () => undefined,
-				getBranch: () => [],
+				getBranch: () => branch,
 			},
 			isIdle: () => true,
 			abort() {},
@@ -105,9 +127,19 @@ export async function multiSessionFixture(t: TestContext, ids = ["A", "B"]) {
 		);
 		locals.push(local);
 		local.installOmp(api);
-		await handlers.get("session_start")?.({}, context);
+		const emit = async (name: string, event: unknown) =>
+			await handlers.get(name)?.(event, context);
+		await emit("session_start", {});
 		await until(() => broker.listSessions(id).length === 1);
-		sessions.set(id, { id, cwd, local });
+		sessions.set(id, {
+			id,
+			cwd,
+			local,
+			context,
+			branch,
+			emit,
+			wakes: () => wakes,
+		});
 	}
 	return {
 		root,
