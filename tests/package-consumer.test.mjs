@@ -92,10 +92,10 @@ test("the real installed JavaScript broker is checked without package-manager in
 		"// Test fixture exits on stdin EOF.\n",
 	);
 	for (const file of [
+		"dist/src/index.omp.js",
 		"dist/src/instructions.md",
 		"dist/src/question.html",
 		"src/index.ts",
-		"src/index.omp.ts",
 		"LICENSE",
 	])
 		await writeFile(join(installed, file), "fixture");

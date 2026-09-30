@@ -8,6 +8,17 @@ import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 
+test("published OMP entry uses the compiled JavaScript artifact", async () => {
+	const pkg = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
+	assert.deepEqual(pkg.omp?.extensions, ["./dist/src/index.omp.js"]);
+	const build = spawnSync(process.execPath, [join(root, "scripts/build.mjs")], {
+		cwd: root,
+		encoding: "utf8",
+		timeout: 30000,
+	});
+	assert.equal(build.status, 0, build.stdout + build.stderr);
+	await readFile(join(root, "dist/src/index.omp.js"));
+});
 test("installed Node CLI uses JavaScript and includes runtime assets", async (t) => {
 	const pkg = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
 	assert.match(pkg.bin["chappie-omp"], /\.js$/);

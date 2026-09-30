@@ -83,7 +83,7 @@
 	},
 	"omp": {
 		"extensions": [
-			"./src/index.omp.ts"
+			"./dist/src/index.omp.js"
 		]
 	},
 	"bin": {

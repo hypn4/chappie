@@ -21,9 +21,9 @@ import { releaseMetadata } from "./release-metadata.mjs";
 const checkout = fileURLToPath(new URL("../", import.meta.url));
 const required = [
 	"dist/src/cli.omp.js",
+	"dist/src/index.omp.js",
 	"dist/src/instructions.md",
 	"dist/src/question.html",
-	"src/index.omp.ts",
 	"src/index.ts",
 	"LICENSE",
 ];
