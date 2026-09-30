@@ -210,3 +210,22 @@ test("otunnel metadata preserves conversation and request identity at the broker
 		{ chatId: "tunnel-chat", requestId: "tunnel-request" },
 	]);
 });
+
+test("history does not read or acknowledge pending session input", async (t) => {
+	let inputReads = 0;
+	const f = await mcpFixture(t, {
+		history: async () => ({
+			sessionId: "A",
+			cwd: "/fixture",
+			history: { count: 0, hasMore: false, content: [] },
+		}),
+		inputs: async () => {
+			inputReads++;
+			return [];
+		},
+	});
+	const result = await f.call("history", { sessionId: "A", limit: 20 });
+	assert.equal(result.isError, undefined);
+	assert.equal(inputReads, 0);
+	assert.equal(f.acknowledgements, 0);
+});
