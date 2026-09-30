@@ -41,14 +41,24 @@ const toolResult = z.looseObject({
 const toolResults = z.array(toolResult).max(128);
 const inputs = z
 	.array(
-		z.strictObject({
-			id: name,
-			sessionId: name,
-			message: z.looseObject({
-				role: z.literal("user"),
-				content: z.union([text, content]),
+		z.union([
+			z.strictObject({
+				id: name,
+				sessionId: name,
+				message: z.looseObject({
+					role: z.literal("user"),
+					content: z.union([text, content]),
+				}),
 			}),
-		}),
+			z.strictObject({
+				id: name,
+				sessionId: name,
+				request: z.strictObject({
+					kind: z.enum(["compaction", "branch_summary"]),
+					input: z.unknown(),
+				}),
+			}),
+		]),
 	)
 	.max(4096);
 const session = z.strictObject({
@@ -183,6 +193,7 @@ const brokerMessage = z.union([
 		id,
 		sessionId: name,
 		text,
+		replyTo: name.optional(),
 		...source,
 	}),
 	z.strictObject({

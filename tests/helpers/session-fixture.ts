@@ -14,11 +14,11 @@ import { ProviderOutput } from "../../src/provider-core.ts";
 import { createOmpHostApi, LocalSession } from "../../src/session.ts";
 
 export async function until(
-	condition: () => boolean,
+	condition: () => boolean | Promise<boolean>,
 	milliseconds = 2500,
 ): Promise<void> {
 	const deadline = Date.now() + milliseconds;
-	while (!condition()) {
+	while (!(await condition())) {
 		if (Date.now() >= deadline) throw new Error("Fixture condition timed out");
 		await delay(5);
 	}
@@ -208,7 +208,7 @@ export async function sessionFixture(t: TestContext) {
 		await rm(root, { recursive: true, force: true });
 	});
 	async function emit(name: string, event: unknown, ctx = current) {
-		await handlers.get(name)?.(event, ctx);
+		return await handlers.get(name)?.(event, ctx);
 	}
 	await broker.start();
 	local.installOmp(api);

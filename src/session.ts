@@ -28,6 +28,7 @@ import { directHostCall, directHostResults } from "./host-tools.ts";
 import {
 	type BrokerMessage,
 	IpcClient,
+	type ModelRequest,
 	type SessionDescription,
 	type SessionInput,
 	type SessionInspection,
@@ -37,7 +38,7 @@ import {
 	type SessionStatus,
 	type SessionToolInfo,
 } from "./ipc.ts";
-import type { ProviderOutput } from "./provider-core.ts";
+import { ProviderOutput } from "./provider-core.ts";
 import {
 	type ResourceDescriptor,
 	readSessionResource,
@@ -207,6 +208,13 @@ interface ActiveRequest {
 	toolResults: ToolResultMessage[];
 }
 
+interface GenerationRequest {
+	output: ProviderOutput;
+	request: ModelRequest;
+	sessionId: string;
+	connectionGeneration: number;
+}
+
 export class LocalSession {
 	readonly #api: ChappieHostAPI;
 	readonly #agentDir: string;
@@ -217,6 +225,7 @@ export class LocalSession {
 	readonly #stores = new Map<string, StoreRequest>();
 	readonly #queue: RemoteRequest[] = [];
 	readonly #pendingInputs = new Map<string, SessionInput>();
+	readonly #generations = new Map<string, GenerationRequest>();
 	readonly #deliveries = new Map<string, DeliveryRecord>();
 	readonly #histories = new Map<number, HistoryRequest>();
 	readonly #requests = new Map<number, PendingRequest>();
@@ -332,6 +341,33 @@ export class LocalSession {
 		pi.on("session_branch", (_event, context) => {
 			this.#refreshOmpContext(context);
 			this.#historyChanged();
+		});
+		pi.on("session_before_tree", async (event, context) => {
+			const shared = this.#refreshOmpContext(context);
+			if (
+				shared.model?.provider !== "chappie" ||
+				!event.preparation.userWantsSummary ||
+				event.preparation.entriesToSummarize.length === 0
+			)
+				return;
+			try {
+				const summary = await this.requestGeneration(
+					{
+						kind: "branch_summary",
+						input: {
+							preparation: event.preparation,
+							instructions:
+								"Summarize the abandoned branch for the new branch. Preserve important decisions, progress, unresolved work, and relevant file operations.",
+						},
+					},
+					event.signal,
+					shared.sessionManager.getSessionId(),
+				);
+				return { summary: { summary } };
+			} catch (error) {
+				if (event.signal.aborted) return { cancel: true };
+				throw error;
+			}
 		});
 		pi.on("session_tree", (event, context) => {
 			const shared = this.#refreshOmpContext(context);
@@ -478,6 +514,70 @@ export class LocalSession {
 		}
 	}
 
+	async generate(
+		output: ProviderOutput,
+		request: ModelRequest,
+		expectedSessionId?: string,
+	): Promise<void> {
+		const context = this.#context;
+		const connection = this.#connection;
+		if (context?.model?.provider !== "chappie" || !connection)
+			throw new Error("Chappie is not active for this session");
+		const sessionId = context.sessionManager.getSessionId();
+		if (expectedSessionId !== undefined && expectedSessionId !== sessionId)
+			throw new Error("Chappie generation has a mismatched session identity");
+		if (output.closed) return;
+		const id = randomUUID();
+		const generation: GenerationRequest = {
+			output,
+			request,
+			sessionId,
+			connectionGeneration: this.#connectionGeneration,
+		};
+		this.#generations.set(id, generation);
+		this.#pendingInputs.set(id, { id, sessionId, request });
+		this.#starting = false;
+		try {
+			await connection.connect();
+			if (output.closed) return;
+			if (
+				this.#context?.model?.provider !== "chappie" ||
+				this.#context.sessionManager.getSessionId() !== sessionId
+			)
+				throw new Error("Chappie's owning OMP session is no longer active");
+			generation.connectionGeneration = this.#connectionGeneration;
+			output.begin();
+			await this.#sync();
+			await output.finished;
+		} finally {
+			this.#generations.delete(id);
+			this.#pendingInputs.delete(id);
+			void this.#sync().catch(() => {});
+		}
+	}
+
+	async requestGeneration(
+		request: ModelRequest,
+		signal: AbortSignal,
+		expectedSessionId: string,
+	): Promise<string> {
+		const output = new ProviderOutput(
+			{ api: "chappie", provider: "chappie", id: "chatgpt" },
+			signal,
+		);
+		await this.generate(output, request, expectedSessionId);
+		if (output.message.stopReason === "aborted")
+			throw signal.reason ?? new Error("Chappie generation was cancelled");
+		if (output.message.stopReason === "error")
+			throw new Error(
+				output.message.errorMessage ?? "Chappie generation failed",
+			);
+		return output.message.content
+			.filter((block) => block.type === "text")
+			.map((block) => block.text)
+			.join("\n");
+	}
+
 	async transfer(
 		args: TransferArgs,
 		signal: AbortSignal | undefined,
@@ -570,6 +670,7 @@ export class LocalSession {
 				.catch(() => {});
 		}
 		this.#output?.fail(new Error("Chappie session ended"), true);
+		this.#failGenerations(new Error("Chappie session ended"));
 		this.#output = undefined;
 		this.#active = undefined;
 		this.#queue.length = 0;
@@ -615,6 +716,7 @@ export class LocalSession {
 						this.#rejectStores(error);
 						if (this.#output && !this.#output.closed) this.#output.fail(error);
 						else this.#notify(error.message, "error");
+						this.#failGenerations(error);
 						if (this.#active) {
 							this.#active.cancelled ??=
 								"Connection lost before result delivery";
@@ -667,6 +769,7 @@ export class LocalSession {
 		}
 		this.#cancelRequests(error);
 		this.#output?.fail(error, true);
+		this.#failGenerations(error);
 		this.#output = undefined;
 		this.#starting = false;
 		this.#status = "idle";
@@ -888,6 +991,34 @@ export class LocalSession {
 						message.id,
 						"The requested Pi session is no longer active",
 					);
+					break;
+				}
+				if (message.type === "chat" && message.replyTo) {
+					const generation = this.#generations.get(message.replyTo);
+					if (
+						!generation ||
+						generation.output.closed ||
+						generation.sessionId !== message.sessionId ||
+						generation.connectionGeneration !== this.#connectionGeneration ||
+						this.#context?.model?.provider !== "chappie"
+					) {
+						await this.#sendError(message.id, "The model request has ended");
+						break;
+					}
+					generation.output.message.chappie = source(
+						message.chatId,
+						message.requestId,
+					);
+					generation.output.text(message.text);
+					generation.output.done();
+					this.#pendingInputs.delete(message.replyTo);
+					await this.#connection?.send({
+						type: "result",
+						id: message.id,
+						cwd: this.#context.cwd,
+						message: generation.output.message,
+						inputs: this.#inputs(),
+					});
 					break;
 				}
 				if (message.type === "call" && message.direct) {
@@ -1284,6 +1415,12 @@ export class LocalSession {
 	#inputs(): SessionInput[] {
 		this.#collectInputs();
 		return [...this.#pendingInputs.values()];
+	}
+
+	#failGenerations(error: Error): void {
+		for (const generation of this.#generations.values()) {
+			if (!generation.output.closed) generation.output.fail(error, true);
+		}
 	}
 
 	async #flushDeliveries(): Promise<void> {

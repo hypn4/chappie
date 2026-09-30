@@ -114,7 +114,8 @@ export function createServer(broker: Broker): McpServer {
 		"chat",
 		{
 			title: "Reply in Pi",
-			description: "Send a Markdown assistant message to Pi.",
+			description:
+				"Send a Markdown assistant message to Pi. When modelRequest is returned by a prior Chappie result, set replyTo to that modelRequest ID.",
 			outputSchema,
 			inputSchema: z.object({
 				text: z.string().min(1).describe("Assistant message in Markdown"),
@@ -124,6 +125,11 @@ export function createServer(broker: Broker): McpServer {
 					.describe(
 						"Pi session for this operation; becomes the default if none is set",
 					),
+				replyTo: z
+					.string()
+					.min(1)
+					.optional()
+					.describe("Model request ID to answer instead of starting a Pi turn"),
 			}),
 			annotations: toolAnnotations("chat"),
 		},
@@ -136,6 +142,7 @@ export function createServer(broker: Broker): McpServer {
 					args.text,
 					context.mcpReq._meta?.["otunnel/requestId"],
 					context.mcpReq.signal,
+					args.replyTo,
 				);
 			return finishResult(
 				broker,

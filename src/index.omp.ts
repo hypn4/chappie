@@ -22,6 +22,8 @@ export default async function chappie(pi: OmpExtensionAPI): Promise<void> {
 		"chappie",
 		createOmpChappieProvider(
 			(output, sessionId) => session.start(output, sessionId),
+			(output, request, sessionId) =>
+				session.generate(output, request, sessionId),
 			pi,
 		),
 	);

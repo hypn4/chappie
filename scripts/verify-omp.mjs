@@ -50,9 +50,15 @@ import { createOmpChappieProvider } from "./candidate/src/provider.omp.ts";
 export default async function probe(api) {
   await chappie(api);
   let dispose;
-  const foreign = createOmpChappieProvider(async () => {
-    throw new Error("Provider request was routed to the wrong owner");
-  }, { on(event, handler) { if (event === "session_shutdown") dispose = handler; } });
+  const foreign = createOmpChappieProvider(
+    async () => {
+      throw new Error("Provider request was routed to the wrong owner");
+    },
+    async () => {
+      throw new Error("Generation request was routed to the wrong owner");
+    },
+    { on(event, handler) { if (event === "session_shutdown") dispose = handler; } }
+  );
   api.registerProvider("chappie", foreign);
   dispose?.({}, {});
   api.on("todo_reminder", () => writeFileSync(${JSON.stringify(reminderFile)}, "seen"));

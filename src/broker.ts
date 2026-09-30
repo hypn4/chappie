@@ -214,6 +214,7 @@ export class Broker {
 		text: string,
 		requestId: unknown,
 		signal: AbortSignal,
+		replyTo?: string,
 	): Promise<ChatResult> {
 		const { sessionId: target, initialization } = await this.#selectSession(
 			chatId,
@@ -221,7 +222,13 @@ export class Broker {
 			requestId,
 			signal,
 		);
-		const identity = operationIdentity(chatId, target, "chat", requestId, text);
+		const identity = operationIdentity(
+			chatId,
+			target,
+			"chat",
+			requestId,
+			replyTo ? JSON.stringify({ text, replyTo }) : text,
+		);
 		if (identity) {
 			const session = this.#sessions.get(target);
 			if (!session) throw new Error("Target session disconnected");
@@ -251,6 +258,7 @@ export class Broker {
 				...(identity ? { operationKey: identity.key } : {}),
 				sessionId: target,
 				text,
+				...(replyTo ? { replyTo } : {}),
 			}),
 			signal,
 		).catch(async (error: unknown) => {

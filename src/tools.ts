@@ -72,15 +72,33 @@ export function toolResult(
 }
 
 export function inputContent(inputs: SessionInput[]) {
-	return inputs.flatMap(({ id, sessionId, message }) => [
-		{
-			type: "text" as const,
-			text: JSON.stringify({ piInput: id, sessionId }),
-		},
-		...(typeof message.content === "string"
-			? [{ type: "text" as const, text: message.content }]
-			: contentWithImageReferences(sessionId, message.content)),
-	]);
+	return inputs.flatMap((input) => {
+		const { id, sessionId } = input;
+		if ("request" in input) {
+			return [
+				{
+					type: "text" as const,
+					text: JSON.stringify({
+						modelRequest: id,
+						sessionId,
+						request: input.request,
+						instructions:
+							"Reply with chat using replyTo=modelRequest for this request.",
+					}),
+				},
+			];
+		}
+		const { message } = input;
+		return [
+			{
+				type: "text" as const,
+				text: JSON.stringify({ piInput: id, sessionId }),
+			},
+			...(typeof message.content === "string"
+				? [{ type: "text" as const, text: message.content }]
+				: contentWithImageReferences(sessionId, message.content)),
+		];
+	});
 }
 
 function withSessionId(

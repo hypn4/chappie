@@ -24,7 +24,11 @@ const model = {
 
 // Session-scoped request hooks, with a process-wide last-registered provider.
 // These are callback fixtures, not agents or model calls.
-function owner(id: string, start?: (output: ProviderOutput) => Promise<void>) {
+function owner(
+	id: string,
+	start?: (output: ProviderOutput) => Promise<void>,
+	generate?: (output: ProviderOutput, kind: string) => Promise<void>,
+) {
 	let currentId = id;
 	let provider = "chappie";
 	const handlers = new Map<
@@ -48,12 +52,19 @@ function owner(id: string, start?: (output: ProviderOutput) => Promise<void>) {
 		},
 	} as unknown as OmpExtensionAPI;
 	const starts: string[] = [];
-	const config = createOmpChappieProvider(async (output) => {
-		starts.push(currentId);
-		if (start) return start(output);
-		output.text(currentId);
-		output.done();
-	}, api);
+	const config = createOmpChappieProvider(
+		async (output) => {
+			starts.push(currentId);
+			if (start) return start(output);
+			output.text(currentId);
+			output.done();
+		},
+		async (output, request) => {
+			if (generate) return generate(output, request.kind);
+			throw new Error("unexpected generation");
+		},
+		api,
+	);
 	async function emit(name: string, event: unknown) {
 		for (const handler of handlers.get(name) ?? [])
 			await handler(event, context);
@@ -180,6 +191,46 @@ test("cancellation while a request hook awaits does not claim a provider slot", 
 	assert.deepEqual(a.starts, []);
 });
 
+test("stale or cancelled compaction routes never start a generation owner", async () => {
+	for (const invalidate of [
+		"shutdown",
+		"model",
+		"session",
+		"cancel",
+	] as const) {
+		let generations = 0;
+		const a = owner("A", undefined, async (output) => {
+			generations++;
+			output.text("summary");
+			output.done();
+		});
+		const controller = new AbortController();
+		const options: SimpleStreamOptions = {
+			...a.options(),
+			signal: controller.signal,
+			codexCompaction: {} as NonNullable<
+				SimpleStreamOptions["codexCompaction"]
+			>,
+		};
+		options.onPayload = async (payload: unknown) => {
+			const routed = await a.onPayload(payload);
+			if (invalidate === "shutdown") await a.emit("session_shutdown", {});
+			else if (invalidate === "model") a.setProvider("other");
+			else if (invalidate === "session") a.switchTo("C");
+			else controller.abort();
+			return routed;
+		};
+		const reply = await result(a.config, options, {
+			messages: [{ role: "user", content: "compact", timestamp: Date.now() }],
+		});
+		assert.ok(
+			reply.stopReason === "error" || reply.stopReason === "aborted",
+			invalidate,
+		);
+		assert.equal(generations, 0, invalidate);
+	}
+});
+
 test("an auxiliary error cannot replace an open primary request", async () => {
 	const entered = Promise.withResolvers<void>();
 	let primary: ProviderOutput | undefined;
@@ -229,6 +280,9 @@ test("separately loaded provider modules still use the caller's hook", async () 
 		async () => {
 			throw new Error("wrong owner");
 		},
+		async () => {
+			throw new Error("wrong generation owner");
+		},
 		{ on() {} },
 	);
 	assert.equal((await result(foreign, a.options())).stopReason, "stop");
@@ -243,4 +297,65 @@ test("unrelated provider payloads are not modified by the Chappie hook", async (
 	};
 	assert.equal(await a.onPayload(payload), payload);
 	assert.deepEqual(a.starts, []);
+});
+
+test("recognized compaction requests use a separate generation route", async () => {
+	const handlers = new Map<
+		string,
+		Array<(event: unknown, ctx: OmpExtensionContext) => unknown>
+	>();
+	const context = {
+		model: { provider: "chappie" },
+		sessionManager: { getSessionId: () => "A" },
+	} as unknown as OmpExtensionContext;
+	const api = {
+		on(
+			name: string,
+			handler: (event: unknown, ctx: OmpExtensionContext) => unknown,
+		) {
+			const values = handlers.get(name) ?? [];
+			values.push(handler);
+			handlers.set(name, values);
+		},
+	} as unknown as OmpExtensionAPI;
+	const generations: string[] = [];
+	const onPayload = async (payload: unknown) => {
+		let value = payload;
+		for (const handler of handlers.get("before_provider_request") ?? []) {
+			const next = await handler(
+				{ type: "before_provider_request", payload: value },
+				context,
+			);
+			if (next !== undefined) value = next;
+		}
+		return value;
+	};
+	const config = Reflect.apply(createOmpChappieProvider, undefined, [
+		async () => {
+			throw new Error("primary route must not run");
+		},
+		async (output: ProviderOutput, request: { kind: string }) => {
+			generations.push(request.kind);
+			output.text("summary");
+			output.done();
+		},
+		api,
+	]) as OmpProviderConfig;
+	const reply = await result(
+		config,
+		{
+			sessionId: "A",
+			onPayload,
+			codexCompaction: {} as NonNullable<
+				SimpleStreamOptions["codexCompaction"]
+			>,
+		},
+		{
+			messages: [
+				{ role: "user", content: "compact this", timestamp: Date.now() },
+			],
+		},
+	);
+	assert.equal(reply.stopReason, "stop");
+	assert.deepEqual(generations, ["compaction"]);
 });

@@ -248,7 +248,11 @@ test("input retrieval remains responsive while inspection is stalled", async (t)
 	const peer = await f.register();
 	const inputs = await f.broker.inputs("chat", "stalled", t.signal);
 	assert.equal(inputs.length, 1);
-	assert.equal(inputs[0]?.message.content, "new input");
+	assert.ok(inputs[0] && "message" in inputs[0]);
+	assert.equal(
+		inputs[0] && "message" in inputs[0] ? inputs[0].message.content : undefined,
+		"new input",
+	);
 	assert.equal((await peer.inputting).type, "inputs");
 	assert.deepEqual(await peer.acknowledged, ["input-1"]);
 	assert.equal(f.clock.count(inspectionTimeoutMs), 0);

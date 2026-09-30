@@ -64,11 +64,15 @@ export interface SessionInspection {
 	skills: SessionSkillInfo[];
 }
 
-export interface SessionInput {
+export interface ModelRequest {
+	kind: "compaction" | "branch_summary";
+	input: unknown;
+}
+
+export type SessionInput = {
 	id: string;
 	sessionId: string;
-	message: UserMessage;
-}
+} & ({ message: UserMessage } | { request: ModelRequest });
 
 export type SessionResult =
 	| {
@@ -131,6 +135,7 @@ export type BrokerMessage =
 			operationKey?: string;
 			sessionId: string;
 			text: string;
+			replyTo?: string;
 	  }
 	| {
 			type: "call";

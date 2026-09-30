@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { IpcClient, type SessionMessage } from "../src/ipc.ts";
 import { ProviderOutput } from "../src/provider-core.ts";
-import { sessionFixture } from "./helpers/session-fixture.ts";
+import { sessionFixture, until } from "./helpers/session-fixture.ts";
 
 const model = { api: "chappie", provider: "chappie", id: "chatgpt" };
 
@@ -14,6 +14,88 @@ test("a mismatched provider identity cannot acquire a local session", async (t) 
 		output.done();
 		return pending;
 	}, /session.*identity|identity.*session/i);
+});
+
+test("auxiliary generation replies without replacing the open primary provider", async (t) => {
+	const f = await sessionFixture(t);
+	const primary = new ProviderOutput(model, f.controller.signal);
+	const primaryRun = f.local.start(primary, "A");
+	await until(() => f.broker.listSessions("A")[0]?.status === "ready");
+
+	const auxiliary = new ProviderOutput(model, f.controller.signal);
+	const generationRun = f.local.generate(
+		auxiliary,
+		{ kind: "compaction", input: { messages: ["compact"] } },
+		"A",
+	);
+	let generationId: string | undefined;
+	await until(async () => {
+		const inputs = await f.broker.inputs("test-chat", "A", f.controller.signal);
+		const request = inputs.find((input) => "request" in input);
+		generationId = request?.id;
+		return generationId !== undefined;
+	});
+	assert.ok(generationId);
+	await f.broker.chat(
+		"test-chat",
+		"A",
+		"compacted summary",
+		"generation-reply",
+		f.controller.signal,
+		generationId,
+	);
+	await generationRun;
+	assert.equal(auxiliary.message.stopReason, "stop");
+	assert.match(JSON.stringify(auxiliary.message.content), /compacted summary/);
+	assert.equal(primary.closed, false);
+	primary.done();
+	await primaryRun;
+});
+
+test("OMP tree summarization is relayed as a branch summary generation", async (t) => {
+	const f = await sessionFixture(t);
+	const event = {
+		type: "session_before_tree",
+		preparation: {
+			targetId: "target",
+			oldLeafId: "old",
+			commonAncestorId: null,
+			entriesToSummarize: [
+				{
+					type: "custom",
+					id: "entry",
+					parentId: null,
+					timestamp: new Date(1).toISOString(),
+					customType: "fixture",
+					data: { progress: "done" },
+				},
+			],
+			userWantsSummary: true,
+		},
+		signal: f.controller.signal,
+	};
+	const summaryPending = f.emit("session_before_tree", event);
+	let generationId: string | undefined;
+	await until(async () => {
+		const inputs = await f.broker.inputs("test-chat", "A", f.controller.signal);
+		const request = inputs.find(
+			(input) => "request" in input && input.request.kind === "branch_summary",
+		);
+		generationId = request?.id;
+		return generationId !== undefined;
+	});
+	assert.ok(generationId);
+	await f.broker.chat(
+		"test-chat",
+		"A",
+		"branch summary text",
+		"branch-reply",
+		f.controller.signal,
+		generationId,
+	);
+	assert.deepEqual(await summaryPending, {
+		summary: { summary: "branch summary text" },
+	});
 });
 
 for (const continuation of [true, false]) {
