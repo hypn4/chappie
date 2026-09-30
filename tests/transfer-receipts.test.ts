@@ -7,7 +7,10 @@ import { operationIdentity } from "../src/operations.ts";
 import { type ResourceDescriptor, registerFile } from "../src/resources.ts";
 import { State } from "../src/state.ts";
 import { toolResult } from "../src/tools.ts";
-import { sessionFixture } from "./helpers/session-fixture.ts";
+import {
+	multiSessionFixture,
+	sessionFixture,
+} from "./helpers/session-fixture.ts";
 
 async function exportedFixture(t: TestContext) {
 	const f = await sessionFixture(t);
@@ -220,4 +223,176 @@ test("replay metadata is an independent snapshot, not a mutable state handle", a
 	assert.deepEqual((await f.replay()).replay?.delivery?.resources, [
 		f.resource,
 	]);
+});
+
+test("transfer.from retrieves a source session file into the selected session", async (t) => {
+	const f = await multiSessionFixture(t);
+	const source = f.session("A");
+	const destination = f.session("B");
+	await writeFile(join(source.cwd, "source.txt"), "source bytes");
+	const result = await destination.local.transfer(
+		{
+			operationId: "pull-one",
+			paths: ["copied.txt"],
+			from: { sessionId: "A", paths: ["source.txt"] },
+		},
+		f.controller.signal,
+		undefined,
+		{ sessionId: "B", cwd: destination.cwd },
+	);
+	assert.equal(
+		await readFile(join(destination.cwd, "copied.txt"), "utf8"),
+		"source bytes",
+	);
+	assert.equal(result.isError, false);
+	assert.equal(result.details.from?.sessionId, "A");
+});
+
+test("transfer.from preserves partial successes and existing destinations", async (t) => {
+	const f = await multiSessionFixture(t);
+	const source = f.session("A");
+	const destination = f.session("B");
+	await writeFile(join(source.cwd, "first.txt"), "FIRST");
+	await writeFile(join(source.cwd, "second.txt"), "SECOND");
+	await writeFile(join(destination.cwd, "blocked.txt"), "ORIGINAL");
+	const result = await destination.local.transfer(
+		{
+			operationId: "pull-partial",
+			paths: ["blocked.txt", "copied.txt"],
+			from: {
+				sessionId: "A",
+				paths: ["first.txt", "second.txt"],
+			},
+		},
+		f.controller.signal,
+		undefined,
+		{ sessionId: "B", cwd: destination.cwd },
+	);
+	assert.equal(result.isError, true);
+	assert.equal(
+		await readFile(join(destination.cwd, "blocked.txt"), "utf8"),
+		"ORIGINAL",
+	);
+	assert.equal(
+		await readFile(join(destination.cwd, "copied.txt"), "utf8"),
+		"SECOND",
+	);
+});
+
+test("transfer.from overwrite replaces only completed destinations", async (t) => {
+	const f = await multiSessionFixture(t);
+	const source = f.session("A");
+	const destination = f.session("B");
+	await writeFile(join(source.cwd, "source.txt"), "NEW");
+	await writeFile(join(destination.cwd, "target.txt"), "OLD");
+	const result = await destination.local.transfer(
+		{
+			operationId: "pull-overwrite",
+			paths: ["target.txt"],
+			from: { sessionId: "A", paths: ["source.txt"] },
+			overwrite: true,
+		},
+		f.controller.signal,
+		undefined,
+		{ sessionId: "B", cwd: destination.cwd },
+	);
+	assert.equal(result.isError, false);
+	assert.equal(
+		await readFile(join(destination.cwd, "target.txt"), "utf8"),
+		"NEW",
+	);
+});
+
+test("transfer.from operation identity survives transport retries but binds the source", () => {
+	const call = (source: string, path: string) => [
+		{
+			name: "transfer",
+			arguments: {
+				operationId: "pull-stable",
+				paths: ["target.txt"],
+				from: { sessionId: source, paths: [path] },
+			},
+		},
+	];
+	const first = operationIdentity(
+		"chat",
+		"B",
+		"call",
+		"transport-one",
+		call("A", "source.txt"),
+	);
+	const retry = operationIdentity(
+		"chat",
+		"B",
+		"call",
+		"transport-two",
+		call("A", "source.txt"),
+	);
+	const changedPath = operationIdentity(
+		"chat",
+		"B",
+		"call",
+		"transport-three",
+		call("A", "other.txt"),
+	);
+	const changedSource = operationIdentity(
+		"chat",
+		"B",
+		"call",
+		"transport-four",
+		call("C", "source.txt"),
+	);
+	assert.ok(first && retry && changedPath && changedSource);
+	assert.equal(first.key, retry.key);
+	assert.equal(first.signature, retry.signature);
+	assert.equal(first.key, changedPath.key);
+	assert.notEqual(first.signature, changedPath.signature);
+	assert.equal(first.key, changedSource.key);
+	assert.notEqual(first.signature, changedSource.signature);
+});
+
+test("transfer.from cancellation does not create a destination", async (t) => {
+	const f = await multiSessionFixture(t);
+	const source = f.session("A");
+	const destination = f.session("B");
+	await writeFile(join(source.cwd, "source.txt"), "source bytes");
+	const cancelled = new AbortController();
+	const reason = new Error("cancel pull");
+	cancelled.abort(reason);
+	await assert.rejects(
+		destination.local.transfer(
+			{
+				operationId: "pull-cancelled",
+				paths: ["cancelled.txt"],
+				from: { sessionId: "A", paths: ["source.txt"] },
+			},
+			cancelled.signal,
+			undefined,
+			{ sessionId: "B", cwd: destination.cwd },
+		),
+		(error) => error === reason,
+	);
+	await assert.rejects(
+		readFile(join(destination.cwd, "cancelled.txt"), "utf8"),
+		/ENOENT/,
+	);
+});
+
+test("transfer direction selectors are mutually exclusive", async (t) => {
+	const f = await multiSessionFixture(t);
+	const destination = f.session("B");
+	await assert.rejects(
+		destination.local.transfer(
+			{
+				operationId: "invalid-directions",
+				paths: ["target.txt"],
+				from: { sessionId: "A", paths: ["source.txt"] },
+				to: { sessionId: "A", paths: ["other.txt"] },
+			},
+			f.controller.signal,
+			undefined,
+			{ sessionId: "B", cwd: destination.cwd },
+		),
+		/files|from|to|one of/i,
+	);
 });

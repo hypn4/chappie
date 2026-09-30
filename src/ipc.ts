@@ -91,6 +91,7 @@ export type SessionResult =
 export type SessionRequest =
 	| { type: "inspect"; sessionId: string }
 	| { type: "readResource"; sessionId: string; uri: string; offset?: number }
+	| { type: "export"; sessionId: string; paths: string[] }
 	| {
 			type: "copy";
 			sessionId: string;

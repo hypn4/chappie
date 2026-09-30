@@ -96,6 +96,7 @@ const transfer = z.strictObject({
 	resources: z.array(descriptor).max(128),
 	device: name,
 	to: z.strictObject({ sessionId: name, device: name }).optional(),
+	from: z.strictObject({ sessionId: name, device: name }).optional(),
 	failed: z.boolean().optional(),
 });
 const sessionRequest = z.union([
@@ -105,6 +106,11 @@ const sessionRequest = z.union([
 		sessionId: name,
 		uri: name,
 		offset: id.optional(),
+	}),
+	z.strictObject({
+		type: z.literal("export"),
+		sessionId: name,
+		paths: z.array(path).min(1).max(128),
 	}),
 	z.strictObject({
 		type: z.literal("copy"),

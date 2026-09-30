@@ -486,18 +486,47 @@ export class LocalSession {
 	): Promise<TransferResult> {
 		if (args.paths.length < 1 || args.paths.length > 128)
 			throw new Error("Transfers require between 1 and 128 paths");
-		if (!args.to) return executeTransfer(args, signal, update, context);
-		if (args.files) throw new Error("files and to are mutually exclusive");
-		if (args.paths.length !== args.to.paths.length) {
-			throw new Error("Source and destination counts must match");
+		if ([args.files, args.from, args.to].filter(Boolean).length > 1)
+			throw new Error("Supply one of files, from, or to");
+		if (args.from) {
+			const exported = await this.#request(
+				{
+					type: "export",
+					sessionId: args.from.sessionId,
+					paths: args.from.paths,
+				},
+				signal,
+			);
+			if (!("transfer" in exported))
+				throw new Error("Agent session returned no resources");
+			const copySignal = signal ?? new AbortController().signal;
+			const files = await copyFiles(
+				args.paths,
+				exported.transfer.resources,
+				context.cwd,
+				args.overwrite === true,
+				(resource) => this.#readChunks(resource, copySignal),
+				copySignal,
+			);
+			return transferResult({
+				device: hostname(),
+				files,
+				resources: [],
+				from: {
+					sessionId: args.from.sessionId,
+					device: exported.transfer.device,
+				},
+			});
 		}
+		if (!args.to) return executeTransfer(args, signal, update, context);
+		if (args.paths.length !== args.to.paths.length)
+			throw new Error("Source and destination counts must match");
 		const inspected = await this.#request(
 			{ type: "inspect", sessionId: args.to.sessionId },
 			signal,
 		);
-		if (!("inspection" in inspected)) {
-			throw new Error("Pi session returned no environment");
-		}
+		if (!("inspection" in inspected))
+			throw new Error("Agent session returned no environment");
 		const exported = await executeTransfer(
 			{ paths: args.paths },
 			signal,
@@ -524,9 +553,8 @@ export class LocalSession {
 			},
 			signal,
 		);
-		if (!("transfer" in result)) {
-			throw new Error("Pi session returned no transfer result");
-		}
+		if (!("transfer" in result))
+			throw new Error("Agent session returned no transfer result");
 		return transferResult({ ...result.transfer, device: hostname() });
 	}
 
@@ -750,6 +778,26 @@ export class LocalSession {
 						message.offset,
 					),
 				}));
+				break;
+			case "export":
+				await this.#reply(message.id, message.sessionId, async () => {
+					const context = this.#context;
+					if (!context) throw new Error("Chappie session is not available");
+					const result = await executeTransfer(
+						{ paths: message.paths },
+						undefined,
+						undefined,
+						{
+							sessionId: message.sessionId,
+							cwd: context.cwd,
+						},
+					);
+					return {
+						type: "result",
+						id: message.id,
+						transfer: result.details,
+					};
+				});
 				break;
 			case "copy": {
 				const controller = new AbortController();

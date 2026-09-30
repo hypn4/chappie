@@ -32,6 +32,7 @@ export interface TransferDetails {
 	files: ({ path: string; bytes: number } | { path: string; error: string })[];
 	resources: ResourceDescriptor[];
 	to?: { sessionId: string; device: string };
+	from?: { sessionId: string; device: string };
 }
 
 export interface TransferResult {
@@ -66,6 +67,15 @@ const parameters = Type.Object({
 			minItems: 1,
 			description:
 				"ChatGPT files paired with paths in order; omit for Pi sources",
+		}),
+	),
+	from: Type.Optional(
+		Type.Object({
+			sessionId: Type.String({ description: "Source agent session" }),
+			paths: Type.Array(Type.String(), {
+				minItems: 1,
+				description: "Source paths paired with local destinations",
+			}),
 		}),
 	),
 	to: Type.Optional(
@@ -150,7 +160,7 @@ export const transfer = {
 	name: "transfer",
 	label: "transfer",
 	description:
-		"Copy ChatGPT files into Pi paths with files, or copy Pi files to another session with to. Otherwise, return resource links for Pi paths or Chappie image references.",
+		"Import ChatGPT files with files, send local paths to a session with to, retrieve session files with from, or export local paths and images.",
 	parameters,
 	async execute(_id, args, signal, update, context) {
 		return executeTransfer(args, signal, update, {
@@ -160,10 +170,16 @@ export const transfer = {
 	},
 	renderCall(args, theme, context) {
 		const device = context.state.device ?? hostname();
-		const from = args.files ? "ChatGPT" : device;
+		const from = args.files
+			? "ChatGPT"
+			: args.from
+				? (context.state.from ?? "Agent")
+				: device;
 		const to = args.files
 			? device
-			: (context.state.to ?? (args.to ? "Pi" : "ChatGPT"));
+			: args.from
+				? device
+				: (context.state.to ?? (args.to ? "Agent" : "ChatGPT"));
 		const header =
 			context.lastComponent instanceof Text
 				? context.lastComponent
@@ -187,8 +203,18 @@ export const transfer = {
 		const args = context.args;
 		context.state.device = details.device;
 		context.state.to = details.to?.device ?? "ChatGPT";
-		const from = args.files ? "ChatGPT" : details.device;
-		const to = args.files ? details.device : (details.to?.device ?? "ChatGPT");
+		if (details.from) context.state.from = details.from.device;
+		else delete context.state.from;
+		const from = args.files
+			? "ChatGPT"
+			: args.from
+				? (details.from?.device ?? "Agent")
+				: details.device;
+		const to = args.files
+			? details.device
+			: args.from
+				? details.device
+				: (details.to?.device ?? "ChatGPT");
 		context.state.header?.setText(
 			theme.fg("toolTitle", theme.bold(`${from} → ${to}`)),
 		);
@@ -203,7 +229,9 @@ export const transfer = {
 					? details.files.map((file, index) => {
 							const source = args.to
 								? args.paths?.[index]
-								: args.files?.[index]?.file_name;
+								: args.from
+									? args.from.paths[index]
+									: args.files?.[index]?.file_name;
 							const path = source
 								? `${displayPath(source)} → ${file.path}`
 								: file.path;
@@ -221,7 +249,7 @@ export const transfer = {
 } satisfies ToolDefinition<
 	typeof parameters,
 	TransferDetails,
-	{ header?: Text; device?: string; to?: string }
+	{ header?: Text; device?: string; to?: string; from?: string }
 >;
 
 function displayPath(path: string): string {

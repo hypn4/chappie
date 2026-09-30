@@ -35,6 +35,18 @@ const parameters = {
 			description:
 				"ChatGPT files paired with paths in order; omit for agent sources",
 		},
+		from: {
+			type: "object",
+			properties: {
+				sessionId: { type: "string" },
+				paths: {
+					type: "array",
+					items: { type: "string" },
+					minItems: 1,
+				},
+			},
+			required: ["sessionId", "paths"],
+		},
 		to: {
 			type: "object",
 			properties: {
@@ -58,7 +70,7 @@ export function createOmpTransferTool(session: LocalSession): ToolDefinition {
 		name: "transfer",
 		label: "transfer",
 		description:
-			"Copy ChatGPT files into agent paths with files, copy between connected sessions with to, or export agent files and images.",
+			"Import ChatGPT files with files, send local paths to a session with to, retrieve session files with from, or export local paths and images.",
 		parameters,
 		async execute(_id, args, signal, update, context) {
 			return session.transfer(

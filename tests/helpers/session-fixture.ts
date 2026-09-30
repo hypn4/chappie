@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { TestContext } from "node:test";
@@ -33,6 +33,92 @@ function fixtureWireSchema(tool: OmpToolInfo): Record<string, unknown> {
 	)
 		throw new Error("Fixture tool schema must be an object");
 	return Object.fromEntries(Object.entries(parameters));
+}
+
+export async function multiSessionFixture(t: TestContext, ids = ["A", "B"]) {
+	const root = await mkdtemp(
+		join(process.platform === "win32" ? tmpdir() : "/tmp", "chmulti-"),
+	);
+	const broker = new Broker(root);
+	const controller = new AbortController();
+	const timers: NodeJS.Timeout[] = [];
+	const locals: LocalSession[] = [];
+	const sessions = new Map<
+		string,
+		{ id: string; cwd: string; local: LocalSession }
+	>();
+	t.after(async () => {
+		controller.abort(new Error("fixture cleanup"));
+		for (const timer of timers) clearInterval(timer);
+		for (const local of locals) local.close();
+		await broker.close();
+		await rm(root, { recursive: true, force: true });
+	});
+	await broker.start();
+	for (const id of ids) {
+		const cwd = join(root, id);
+		await mkdir(cwd, { recursive: true });
+		const handlers = new Map<
+			string,
+			(event: unknown, context: OmpExtensionContext) => unknown
+		>();
+		const api = {
+			on(
+				name: string,
+				handler: (event: unknown, context: OmpExtensionContext) => unknown,
+			) {
+				handlers.set(name, handler);
+			},
+			appendEntry() {},
+			getSessionName: () => id,
+			getActiveTools: () => [],
+			getAllTools: () => [],
+			getCommands: () => [],
+			sendMessage() {},
+		} as unknown as OmpExtensionAPI;
+		const context = {
+			cwd,
+			model: { provider: "chappie" },
+			ui: { notify() {} },
+			sessionManager: {
+				getSessionId: () => id,
+				getCwd: () => cwd,
+				getLeafId: () => null,
+				getLeafEntry: () => undefined,
+				getEntry: () => undefined,
+				getBranch: () => [],
+			},
+			isIdle: () => true,
+			abort() {},
+			setInterval() {
+				const timer = setInterval(() => {}, 100000);
+				timer.unref();
+				timers.push(timer);
+				return timer;
+			},
+		} as unknown as OmpExtensionContext;
+		const local = new LocalSession(
+			createOmpHostApi(api, fixtureWireSchema),
+			root,
+			undefined,
+			"omp",
+		);
+		locals.push(local);
+		local.installOmp(api);
+		await handlers.get("session_start")?.({}, context);
+		await until(() => broker.listSessions(id).length === 1);
+		sessions.set(id, { id, cwd, local });
+	}
+	return {
+		root,
+		broker,
+		controller,
+		session(id: string) {
+			const value = sessions.get(id);
+			if (!value) throw new Error(`Unknown fixture session: ${id}`);
+			return value;
+		},
+	};
 }
 
 export async function sessionFixture(t: TestContext) {
