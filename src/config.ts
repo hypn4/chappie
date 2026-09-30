@@ -12,6 +12,7 @@ export interface NetworkTlsConfig {
 const configSchema = z
 	.strictObject({
 		ask: z.boolean().optional(),
+		cooldown: z.number().nonnegative().optional(),
 		listenHost: z.string().min(1).optional(),
 		tls: z
 			.strictObject({

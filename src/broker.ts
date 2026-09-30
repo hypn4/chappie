@@ -111,6 +111,7 @@ export class Broker {
 		Map<number, AbortController>
 	>();
 	#ask = true;
+	#cooldownMs = 10_000;
 	#nextRequestId = 1;
 
 	constructor(agentDir: string, options: BrokerOptions = {}) {
@@ -128,6 +129,7 @@ export class Broker {
 	async start(): Promise<void> {
 		const config = await readConfig(this.#agentDir);
 		this.#ask = config.ask ?? true;
+		this.#cooldownMs = (config.cooldown ?? 10) * 1000;
 		await this.#state.load();
 		await this.#ipc.start(config.listen ?? false, {
 			...(config.tls ? { tls: config.tls } : {}),
@@ -780,7 +782,12 @@ export class Broker {
 		for (const [key, expires] of this.#cooldowns) {
 			if (expires <= now) this.#cooldowns.delete(key);
 		}
-		this.#cooldowns.set(JSON.stringify([chatId, sessionId]), now + 10_000);
+		const key = JSON.stringify([chatId, sessionId]);
+		if (this.#cooldownMs === 0) {
+			this.#cooldowns.delete(key);
+			return;
+		}
+		this.#cooldowns.set(key, now + this.#cooldownMs);
 	}
 
 	async #notify(

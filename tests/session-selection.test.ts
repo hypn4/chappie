@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createConnection, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -17,10 +17,16 @@ import {
 import { State } from "../src/state.ts";
 
 // Real IPC peers share a cwd; session identity, not a path, must select the peer.
-async function selectionFixture(t: TestContext, ids = ["A", "B"]) {
+async function selectionFixture(
+	t: TestContext,
+	ids = ["A", "B"],
+	config?: Record<string, unknown>,
+) {
 	const root = await mkdtemp(
 		join(process.platform === "win32" ? tmpdir() : "/tmp", "chselect-"),
 	);
+	if (config)
+		await writeFile(join(root, "chappie.json"), JSON.stringify(config), "utf8");
 	const broker = new Broker(root);
 	const sockets = new Map<string, Socket>();
 	t.after(async () => {
@@ -315,6 +321,58 @@ describe("automatic session selection", { timeout: 10000 }, () => {
 		assert.deepEqual(
 			results.map((r) => r.selection),
 			["existing", "explicit", "automatic"],
+		);
+	});
+
+	test("default participation cooldown remains ten seconds", async (t) => {
+		let now = 100_000;
+		t.mock.method(Date, "now", () => now);
+		const f = await selectionFixture(t, ["A"]);
+		assert.equal(
+			(await f.init("cooldown", "A")).initialization?.mode,
+			"executor",
+		);
+		now += 9_999;
+		assert.equal(
+			(await f.init("cooldown", "A")).initialization?.mode,
+			"observer",
+		);
+		now += 2;
+		assert.equal(
+			(await f.init("cooldown", "A")).initialization?.mode,
+			"executor",
+		);
+	});
+
+	test("configured participation cooldown controls observer expiry", async (t) => {
+		let now = 200_000;
+		t.mock.method(Date, "now", () => now);
+		const f = await selectionFixture(t, ["A"], { cooldown: 2 });
+		assert.equal(
+			(await f.init("cooldown", "A")).initialization?.mode,
+			"executor",
+		);
+		now += 1_999;
+		assert.equal(
+			(await f.init("cooldown", "A")).initialization?.mode,
+			"observer",
+		);
+		now += 2;
+		assert.equal(
+			(await f.init("cooldown", "A")).initialization?.mode,
+			"executor",
+		);
+	});
+
+	test("zero participation cooldown disables observer reuse", async (t) => {
+		const f = await selectionFixture(t, ["A"], { cooldown: 0 });
+		assert.equal(
+			(await f.init("cooldown", "A")).initialization?.mode,
+			"executor",
+		);
+		assert.equal(
+			(await f.init("cooldown", "A")).initialization?.mode,
+			"executor",
 		);
 	});
 });
