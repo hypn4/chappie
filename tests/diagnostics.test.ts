@@ -65,15 +65,36 @@ async function diagnosticFixture(t: TestContext) {
 			const registered = Promise.withResolvers<void>();
 			const inspecting =
 				Promise.withResolvers<Extract<BrokerMessage, { type: "inspect" }>>();
+			const inputting = Promise.withResolvers<BrokerMessage>();
+			const acknowledged = Promise.withResolvers<string[]>();
 			const cancelled =
 				Promise.withResolvers<Extract<BrokerMessage, { type: "cancel" }>>();
 			socket = createConnection(ipcEndpoint(root));
 			const connected = once(socket, "connect", { signal: t.signal });
 			const peer = new JsonLinePeer<BrokerMessage, SessionMessage>(
 				socket,
-				(message) => {
+				async (message) => {
 					if (message.type === "synced") registered.resolve();
 					if (message.type === "inspect") inspecting.resolve(message);
+					if (message.type === "inputs") {
+						inputting.resolve(message);
+						await peer.send({
+							type: "result",
+							id: message.id,
+							inputs: [
+								{
+									id: "input-1",
+									sessionId: "stalled",
+									message: {
+										role: "user",
+										content: "new input",
+										timestamp: Date.now(),
+									},
+								},
+							],
+						} as unknown as SessionMessage);
+					}
+					if (message.type === "ackInputs") acknowledged.resolve(message.ids);
 					if (message.type === "cancel") cancelled.resolve(message);
 				},
 				() => {},
@@ -85,7 +106,12 @@ async function diagnosticFixture(t: TestContext) {
 				session: { id: "stalled", cwd: root, device: "test", status: "idle" },
 			});
 			await registered.promise;
-			return { inspecting: inspecting.promise, cancelled: cancelled.promise };
+			return {
+				inspecting: inspecting.promise,
+				inputting: inputting.promise,
+				acknowledged: acknowledged.promise,
+				cancelled: cancelled.promise,
+			};
 		},
 	};
 }
@@ -215,6 +241,30 @@ describe("session diagnostic deadlines", { timeout: 10000 }, () => {
 			assert.equal((await peer.cancelled).id, request.id);
 		});
 	}
+});
+
+test("input retrieval remains responsive while inspection is stalled", async (t) => {
+	const f = await diagnosticFixture(t);
+	const peer = await f.register();
+	const inputs = await f.broker.inputs("chat", "stalled", t.signal);
+	assert.equal(inputs.length, 1);
+	assert.equal(inputs[0]?.message.content, "new input");
+	assert.equal((await peer.inputting).type, "inputs");
+	assert.deepEqual(await peer.acknowledged, ["input-1"]);
+	assert.equal(f.clock.count(inspectionTimeoutMs), 0);
+});
+
+test("input retrieval preserves caller cancellation without inspection", async (t) => {
+	const f = await diagnosticFixture(t);
+	await f.register();
+	const caller = new AbortController();
+	const reason = new Error("cancel inputs");
+	caller.abort(reason);
+	await assert.rejects(
+		f.broker.inputs("chat", "stalled", caller.signal),
+		(error: unknown) => error === reason,
+	);
+	assert.equal(f.clock.count(inspectionTimeoutMs), 0);
 });
 
 test("invalid persisted state is rejected instead of entering live maps", async (t) => {

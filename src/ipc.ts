@@ -83,6 +83,7 @@ export type SessionResult =
 			toolResults: ToolResultMessage[];
 			inputs: SessionInput[];
 	  }
+	| { inputs: SessionInput[] }
 	| { history: HistoryResult; cwd: string }
 	| { resource: ResourceData }
 	| { transfer: TransferDetails }
@@ -90,6 +91,7 @@ export type SessionResult =
 
 export type SessionRequest =
 	| { type: "inspect"; sessionId: string }
+	| { type: "inputs"; sessionId: string }
 	| { type: "readResource"; sessionId: string; uri: string; offset?: number }
 	| { type: "export"; sessionId: string; paths: string[] }
 	| {

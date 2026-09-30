@@ -758,6 +758,13 @@ export class LocalSession {
 					};
 				});
 				break;
+			case "inputs":
+				await this.#reply(message.id, message.sessionId, async () => ({
+					type: "result",
+					id: message.id,
+					inputs: this.#inputs(),
+				}));
+				break;
 			case "history":
 				await this.#readHistory(message);
 				break;

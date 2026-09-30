@@ -101,6 +101,7 @@ const transfer = z.strictObject({
 });
 const sessionRequest = z.union([
 	z.strictObject({ type: z.literal("inspect"), sessionId: name }),
+	z.strictObject({ type: z.literal("inputs"), sessionId: name }),
 	z.strictObject({
 		type: z.literal("readResource"),
 		sessionId: name,
@@ -131,6 +132,7 @@ export const deliverySchema = z.strictObject({
 });
 const resultPayloads = [
 	{ inspection, inputs, globalAgents: z.strictObject({ path }).optional() },
+	{ inputs },
 	{
 		message: assistant,
 		cwd: path,
