@@ -121,13 +121,6 @@ export async function verifyInstalled(directory, expected) {
 	);
 	assert.deepEqual(pkg.bin, expected.bin, "Installed executable differs");
 	for (const name of required) await access(join(installed, name));
-	await access(
-		join(
-			directory,
-			"node_modules/.bin",
-			process.platform === "win32" ? "chappie-omp.cmd" : "chappie-omp",
-		),
-	);
 	const agent = await mkdtemp(
 		join(process.platform === "win32" ? tmpdir() : "/tmp", "chbroker-"),
 	);
@@ -185,15 +178,31 @@ async function main() {
 		stage = "prepared";
 	}
 	if (values.installed) {
-		const installed = await verifyInstalled(resolve(values.installed), pkg);
+		const consumer = resolve(values.installed);
+		const installed = await verifyInstalled(consumer, pkg);
 		if (values.omp) {
+			const ompRoot = join(consumer, "node_modules/@oh-my-pi/pi-coding-agent");
+			const ompPackage = JSON.parse(
+				await readFile(join(ompRoot, "package.json"), "utf8"),
+			);
+			assert.equal(
+				typeof ompPackage.bin?.omp,
+				"string",
+				"Installed OMP package exposes no omp executable",
+			);
+			const ompEntry = join(ompRoot, ompPackage.bin.omp);
+			await access(ompEntry);
 			const result = run(
 				process.execPath,
 				[join(checkout, "scripts/verify-omp.mjs")],
 				{
 					cwd: checkout,
 					timeout: 60000,
-					env: { ...process.env, CHAPPIE_PACKAGE_ROOT: installed },
+					env: {
+						...process.env,
+						CHAPPIE_PACKAGE_ROOT: installed,
+						OMP_ENTRY: ompEntry,
+					},
 				},
 			);
 			console.log(result.stdout.trim());

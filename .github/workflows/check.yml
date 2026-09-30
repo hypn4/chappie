@@ -113,6 +113,9 @@ jobs:
         working-directory: ${{ runner.temp }}/chappie-consumer
         timeout-minutes: 5
         run: bun add --ignore-scripts "${{ github.workspace }}/package.tgz"
+      - name: Install pinned OMP runtime for package integration
+        working-directory: ${{ runner.temp }}/chappie-consumer
+        run: bun add --ignore-scripts @oh-my-pi/pi-coding-agent@18.4.4
       - name: Verify installed broker and packaged OMP runtime
         run: >-
           bun scripts/verify-package.mjs package.tgz

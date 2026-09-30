@@ -98,7 +98,6 @@ test("the real installed JavaScript broker is checked without package-manager in
 	const installed = join(root, "node_modules", manifest.name);
 	await mkdir(join(installed, "dist/src"), { recursive: true });
 	await mkdir(join(installed, "src"));
-	await mkdir(join(root, "node_modules/.bin"));
 	await writeFile(join(installed, "package.json"), JSON.stringify(manifest));
 	await writeFile(
 		join(installed, "dist/src/cli.omp.js"),
@@ -112,14 +111,6 @@ test("the real installed JavaScript broker is checked without package-manager in
 		"LICENSE",
 	])
 		await writeFile(join(installed, file), "fixture");
-	await writeFile(
-		join(
-			root,
-			"node_modules/.bin",
-			process.platform === "win32" ? "chappie-omp.cmd" : "chappie-omp",
-		),
-		"fixture",
-	);
 	assert.equal(await verifyInstalled(root, manifest), installed);
 });
 test("consumer CI uses setup-bun and installs the shared artifact with Bun", async () => {
@@ -135,6 +126,15 @@ test("consumer CI uses setup-bun and installs the shared artifact with Bun", asy
 	assert.match(consumer, /actions\/download-artifact@/);
 	assert.doesNotMatch(consumer, /pnpm|setup-node|npm install/);
 	assert.match(consumer, /bun add --ignore-scripts/);
+	const ompVersion = manifest.devDependencies[
+		"@oh-my-pi/pi-coding-agent"
+	].replace(/^\^/, "");
+	assert.match(
+		consumer,
+		new RegExp(
+			`@oh-my-pi/pi-coding-agent@${ompVersion.replaceAll(".", "\\.")}`,
+		),
+	);
 	assert.match(consumer, /--omp/);
 });
 

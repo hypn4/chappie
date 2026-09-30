@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 import { spawnSync } from "node:child_process";
+import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export function parseOtunnelVersion(output) {
@@ -80,8 +81,7 @@ function main() {
 
 if (
 	process.argv[1] &&
-	fileURLToPath(import.meta.url) ===
-		fileURLToPath(new URL(process.argv[1], "file://"))
+	resolve(process.argv[1]) === fileURLToPath(import.meta.url)
 ) {
 	main();
 }

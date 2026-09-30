@@ -36,9 +36,10 @@ installation scripts are required by this dependency graph are listed in
 4. Build one tarball on Linux with `bun run build` followed by
    `bun pm pack --ignore-scripts`, then upload it as `npm-package`.
 5. Download those exact bytes on all three operating systems, install them in a
-   clean consumer with `bun add --ignore-scripts`, start the installed broker,
-   and run the packaged OMP integration suite. Each consumer verifies the
-   archive's SHA-512 integrity.
+   clean consumer with `bun add --ignore-scripts`, add the pinned OMP runtime
+   used by the checkout integration suite, start the installed broker, and run
+   the packaged OMP integration suite. Each consumer verifies the archive's
+   SHA-512 integrity.
 
 The maintained tunnel compatibility baseline is `otunnel 0.2.x`. Run
 `bun run test:otunnel` to verify an installed 0.2 runtime and Chappie's
@@ -58,6 +59,7 @@ bun pm pack --ignore-scripts --filename package.tgz
 bun scripts/verify-package.mjs package.tgz --prepare /path/to/empty-consumer
 cd /path/to/empty-consumer
 bun add --ignore-scripts /path/to/chappie/package.tgz
+bun add --ignore-scripts @oh-my-pi/pi-coding-agent@18.4.4
 cd /path/to/chappie
 bun scripts/verify-package.mjs package.tgz --installed /path/to/empty-consumer --omp
 ```

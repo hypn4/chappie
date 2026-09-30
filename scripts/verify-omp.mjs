@@ -138,7 +138,9 @@ try {
 		"--model",
 		"chappie/chatgpt",
 	];
-	const command = process.env.OMP_BINARY || "omp";
+	const ompEntry = process.env.OMP_ENTRY;
+	const command = ompEntry ? process.execPath : process.env.OMP_BINARY || "omp";
+	const commandArgs = ompEntry ? [ompEntry] : [];
 	const env = {
 		...process.env,
 		PI_CODING_AGENT_DIR: agent,
@@ -148,7 +150,7 @@ try {
 	};
 	// Windows command shims require cmd.exe. Quote every fixed/test-generated
 	// argument and reject expansion characters rather than interpolating shell text.
-	if (process.platform === "win32") {
+	if (process.platform === "win32" && !ompEntry) {
 		const quote = (value) => {
 			if (/["%\r\n]/.test(value))
 				throw new Error("Unsafe Windows launcher argument");
@@ -161,7 +163,7 @@ try {
 				"/s",
 				"/v:off",
 				"/c",
-				`"${[command, ...args].map(quote).join(" ")}"`,
+				`"${[command, ...commandArgs, ...args].map(quote).join(" ")}"`,
 			],
 			{
 				cwd: work,
@@ -171,7 +173,7 @@ try {
 			},
 		);
 	} else {
-		child = spawn(command, args, {
+		child = spawn(command, [...commandArgs, ...args], {
 			cwd: work,
 			env,
 			stdio: ["pipe", "pipe", "pipe"],
