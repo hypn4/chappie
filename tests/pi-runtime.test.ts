@@ -8,7 +8,9 @@ import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { Broker } from "../src/broker.ts";
 
-test("the pinned Pi runtime retains native read, edit, write and bash behavior", async (t) => {
+test("the pinned Pi runtime retains native read, edit, write and bash behavior", {
+	timeout: 30_000,
+}, async (t) => {
 	const checkout = fileURLToPath(new URL("../", import.meta.url));
 	const packageRoot = join(
 		checkout,
