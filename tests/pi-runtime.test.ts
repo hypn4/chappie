@@ -132,7 +132,10 @@ test("the pinned Pi runtime retains native read, edit, write and bash behavior",
 			"write",
 			{ name: "write", arguments: { path: "new.txt", content: "written" } },
 		],
-		["bash", { name: "bash", arguments: { command: 'node -p "12345"' } }],
+		[
+			"bash",
+			{ name: "bash", arguments: { command: 'bun -e "console.log(12345)"' } },
+		],
 	] as const) {
 		const result = await broker.call(
 			"pi-test",

@@ -6,7 +6,11 @@ import { setTimeout as delay } from "node:timers/promises";
 import { withFileMutationQueue } from "../src/file-mutation-queue.ts";
 import { IpcClient } from "../src/ipc.ts";
 import { createChappieStream } from "../src/provider-core.ts";
-import { sessionFixture, until } from "./helpers/session-fixture.ts";
+import {
+	multiSessionFixture,
+	sessionFixture,
+	until,
+} from "./helpers/session-fixture.ts";
 
 test("switching sessions rejects queued work and unregisters the old ID", async (t) => {
 	const f = await sessionFixture(t);
@@ -26,16 +30,17 @@ test("switching sessions rejects queued work and unregisters the old ID", async 
 	);
 });
 
-test("session name changes resync the existing OMP session", async (t) => {
+test("session name changes resync without OMP polling", async (t) => {
 	const f = await sessionFixture(t);
+	assert.equal(f.intervalCount, 0);
 	assert.equal(f.broker.listSessions("A")[0]?.name, undefined);
 	f.setSessionName("Renamed session");
-	await f.emit("message_start", {});
 	await until(
 		() => f.broker.listSessions("A")[0]?.name === "Renamed session",
 		500,
 	);
 	assert.equal(f.broker.listSessions("A")[0]?.name, "Renamed session");
+	assert.equal(f.intervalCount, 0);
 });
 
 test("late completion after a switch retains its original session and cwd", async (t) => {
@@ -85,11 +90,41 @@ test("a cloned result with the same source but different call IDs cannot complet
 		finished = true;
 	});
 	await f.emit("turn_end", { message: stale, toolResults: [] });
-	await f.emit("agent_end", { willContinue: false });
 	await delay(10);
 	assert.equal(finished, false);
 	await f.complete(output);
 	assert.ok("result" in (await pending));
+});
+
+test("terminal agent end fails work that never produced its matching turn result", async (t) => {
+	const f = await sessionFixture(t);
+	const { pending } = await f.queue();
+	const output = await f.dispatch();
+	await f.emit("agent_end", { willContinue: false });
+	const outcome = await pending;
+	assert.ok(
+		"error" in outcome &&
+			/session ended before the request completed/i.test(outcome.error),
+	);
+	await f.complete(output);
+	await delay(10);
+	assert.equal(f.broker.deliveries("test-chat").length, 0);
+});
+
+test("terminal agent end rejects queued work that only woke the provider", async (t) => {
+	const f = await multiSessionFixture(t, ["A"]);
+	const session = f.session("A");
+	const pending = f.broker.call(
+		"test-chat",
+		"A",
+		[{ name: "read", arguments: { path: "test.txt" } }],
+		"wake-failed",
+		f.controller.signal,
+	);
+	await until(() => session.wakes() === 1);
+	await session.emit("agent_end", { willContinue: false });
+	await assert.rejects(pending, /session ended before the request completed/i);
+	assert.equal(session.wakes(), 1);
 });
 
 test("an immediately cancelled provider stream never starts local work", async () => {
@@ -125,6 +160,7 @@ test("session switch cancels copies still waiting for a destination lock", async
 		mimeType: "text/plain",
 		size: 4,
 	};
+	const copyResponse = Promise.withResolvers<string>();
 	const source = new IpcClient(f.root, undefined, {
 		onOpen: () =>
 			source.send({
@@ -147,6 +183,8 @@ test("session switch cancels copies still waiting for a destination lock", async
 						blob: Buffer.from("DATA").toString("base64"),
 					},
 				});
+			if (message.type === "response" && message.id === 2)
+				copyResponse.resolve("error" in message ? message.error : "success");
 		},
 		onClose() {},
 	});
@@ -167,6 +205,14 @@ test("session switch cancels copies still waiting for a destination lock", async
 		});
 		await delay(30);
 		await f.switchTo("B");
+		const response = await Promise.race([
+			copyResponse.promise,
+			delay(500, "copy response timed out"),
+		]);
+		assert.match(
+			response,
+			/session changed(?: or disconnected)? before request completion/i,
+		);
 	} finally {
 		gate.resolve();
 		await lock;

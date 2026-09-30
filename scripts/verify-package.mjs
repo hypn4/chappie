@@ -102,11 +102,6 @@ export async function prepareConsumer(directory) {
 		JSON.stringify({ name: "chappie-package-check", private: true }),
 		{ flag: "wx" },
 	);
-	await writeFile(
-		join(directory, ".npmrc"),
-		"registry=https://registry.npmjs.org\nengine-strict=true\n",
-		{ flag: "wx" },
-	);
 }
 export async function verifyInstalled(directory, expected) {
 	const installed = join(resolve(directory), "node_modules", expected.name);
@@ -175,7 +170,7 @@ async function main() {
 	assert.equal(
 		positionals.length,
 		1,
-		"Usage: node scripts/verify-package.mjs package.tgz [--prepare DIR | --installed DIR [--omp]]",
+		"Usage: bun scripts/verify-package.mjs package.tgz [--prepare DIR | --installed DIR [--omp]]",
 	);
 	assert.ok(
 		!(values.prepare && values.installed),

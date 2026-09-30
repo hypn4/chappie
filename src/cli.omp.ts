@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 
 import { resolveOmpAgentDir } from "./omp-agent-dir.ts";
 import { serveChappie } from "./stdio.ts";

@@ -170,6 +170,7 @@ export async function sessionFixture(t: TestContext) {
 	let probes = 0;
 	let aborts = 0;
 	let sessionName: string | undefined;
+	let sessionNameChanged: (() => void) | undefined;
 	const api = {
 		on(
 			name: string,
@@ -207,6 +208,12 @@ export async function sessionFixture(t: TestContext) {
 				getLeafEntry: () => undefined,
 				getEntry: () => undefined,
 				getBranch: () => [],
+				onSessionNameChanged(callback: () => void) {
+					sessionNameChanged = callback;
+					return () => {
+						if (sessionNameChanged === callback) sessionNameChanged = undefined;
+					};
+				},
 			},
 			isIdle() {
 				probes++;
@@ -268,16 +275,23 @@ export async function sessionFixture(t: TestContext) {
 		get aborts() {
 			return aborts;
 		},
+		get intervalCount() {
+			return timers.length;
+		},
 		setSessionName(value: string | undefined) {
 			sessionName = value;
+			sessionNameChanged?.();
 		},
-		async queue(requestId = "request-A") {
+		async queue(
+			requestId = "request-A",
+			calls = [{ name: "read", arguments: { path: "test.txt" } }],
+		) {
 			const prior = probes;
 			const pending = broker
 				.call(
 					"test-chat",
 					current.sessionManager.getSessionId(),
-					[{ name: "read", arguments: { path: "test.txt" } }],
+					calls,
 					requestId,
 					controller.signal,
 				)

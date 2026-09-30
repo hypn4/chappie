@@ -37,16 +37,15 @@ jobs:
           ref: ${{ env.RELEASE_TAG }}
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          node-version-file: .node-version
-          package-manager-cache: false
+          bun-version-file: .bun-version
       - name: Require a release commit on main
         id: source
         run: |
           test "$(git rev-list -n 1 "$RELEASE_TAG")" = "$(git rev-parse HEAD)"
           git merge-base --is-ancestor HEAD origin/main
-          node scripts/release-metadata.mjs "$RELEASE_TAG"
+          bun scripts/release-metadata.mjs "$RELEASE_TAG"
           echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
   verify:
@@ -71,24 +70,41 @@ jobs:
         with:
           ref: ${{ needs.policy.outputs.commit }}
           persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version-file: .bun-version
+      # npm's trusted-publishing OIDC exchange is still handled by npm CLI.
+      # Bun owns install/build/test/pack; no registry token is stored.
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version-file: .node-version
+          node-version: 26
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
+      - name: Verify npm Trusted Publishing client
+        run: |
+          npm_version="$(npm --version)"
+          npm_core="${npm_version%%[-+]*}"
+          npm_major="${npm_core%%.*}"
+          npm_rest="${npm_core#*.}"
+          npm_minor="${npm_rest%%.*}"
+          npm_patch="${npm_rest#*.}"
+          test "$npm_major" -gt 11 || {
+            test "$npm_major" -eq 11 &&
+            { test "$npm_minor" -gt 5 || { test "$npm_minor" -eq 5 && test "$npm_patch" -ge 1; }; }
+          }
       - name: Validate committed release channel
         id: metadata
-        run: node scripts/release-metadata.mjs "$RELEASE_TAG"
+        run: bun scripts/release-metadata.mjs "$RELEASE_TAG"
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: npm-package
-      - run: node scripts/verify-package.mjs package.tgz
+      - run: bun scripts/verify-package.mjs package.tgz
       - name: Dry run
         if: inputs.dry_run == true
         env:
           DIST_TAG: ${{ steps.metadata.outputs.distTag }}
         run: npm publish ./package.tgz --ignore-scripts --access public --tag "$DIST_TAG" --dry-run
-      - name: Publish tested artifact and selected channel with OIDC
+      - name: Publish tested artifact and selected channel with npm OIDC
         if: inputs.dry_run != true
         env:
           DIST_TAG: ${{ steps.metadata.outputs.distTag }}

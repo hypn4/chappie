@@ -9,8 +9,8 @@ The original MIT license and attribution are retained.
 
 ## Setup
 
-The broker requires Node.js 26 or newer. Use npm's `npx`, or install Bun to
-use `bun x`; both launch the published `chappie-omp` executable with Node.js.
+The broker requires Bun 1.4.2 or newer. The repository, standalone broker,
+build, tests, package installation, and CI all use Bun.
 
 Install Chappie for the host you use:
 
@@ -44,19 +44,8 @@ mcp:
       command: pi --chappie
 ```
 
-For OMP, choose one of these commands. The standalone broker works with
-unmodified OMP; it does not require `omp --chappie` or an OMP fork.
-
-[npx](https://docs.npmjs.com/cli/v11/commands/npx/):
-
-```yaml
-mcp:
-  commands:
-    - channel: main
-      command: npx --yes --package @hypn4/chappie@latest chappie-omp
-```
-
-Or [Bun (`bun x`)](https://bun.sh/docs/pm/bunx):
+For OMP, run the standalone broker with [Bun](https://bun.sh/docs/pm/bunx).
+It works with unmodified OMP; it does not require `omp --chappie` or an OMP fork.
 
 ```yaml
 mcp:
@@ -65,20 +54,15 @@ mcp:
       command: bun x --package @hypn4/chappie@latest chappie-omp
 ```
 
-`bunx` is Bun's documented alias for `bun x`; both accept the same arguments.
-Prefer `bun x` in configuration so a separate `bunx` command is not required
-on `PATH`, including Windows installations that expose only `bun`. If `bunx`
-is available, it remains an equivalent alternative.
+`bunx` is Bun's alias for `bun x`; prefer `bun x` in shared configuration
+so the same command works on macOS, Linux, and Windows. `--package` selects
+the package that provides `chappie-omp`. The first run may download
+dependencies; later runs use Bun's package cache. This command does not install
+the OMP plugin for you.
 
-`--package` selects the package that provides `chappie-omp`. The npx `--yes`
-option accepts package installation without prompting on the MCP input stream.
-The first run may download dependencies; later runs can use the package cache.
-Neither command installs the OMP plugin for you. Bun respects the broker's
-Node.js shebang, so no `--bun` override is needed.
-
-Make sure the chosen runner and Node.js are on otunnel's `PATH`. If necessary,
-use the runner's actual absolute path, not a `$HOME` or `%USERPROFILE%` placeholder.
-This avoids depending on shell expansion or the plugin's internal install path.
+Make sure `bun` is on otunnel's `PATH`. If necessary, use Bun's actual
+absolute path rather than a `$HOME` or `%USERPROFILE%` placeholder. This
+avoids relying on shell expansion or the plugin's internal install path.
 
 Start the tunnel with the updated profile:
 
@@ -105,9 +89,9 @@ and OMP with the same environment so the broker and session resolve the same soc
 Install dependencies and run the repository checks:
 
 ```sh
-pnpm install
-pnpm check
-pnpm build
+bun install
+bun run check
+bun run build
 ```
 
 For a local OMP checkout, point the otunnel profile at the built broker:
@@ -116,7 +100,7 @@ For a local OMP checkout, point the otunnel profile at the built broker:
 mcp:
   commands:
     - channel: main
-      command: node /absolute/path/to/chappie/dist/src/cli.omp.js
+      command: bun /absolute/path/to/chappie/dist/src/cli.omp.js
 ```
 
 Then load the source extension directly:
@@ -134,10 +118,10 @@ Pi and OMP use different local sockets by default: `~/.pi/agent/chappie.sock`
 and `~/.omp/agent/chappie.sock` (named pipes on Windows). The broker and agent
 must use the same endpoint; the host name alone does not filter sessions.
 
-`pnpm check` includes installed-layout Node CLI and pinned Pi runtime tests. With OMP on `PATH`,
-`pnpm test:omp` also checks a temporary OMP session without using a model API.
-The packaged broker is JavaScript; direct TypeScript execution is only for
-source checkouts outside `node_modules`.
+`bun run check` runs formatting, type checks, and the Bun test suite.
+`bun run test:omp` builds the package and checks a temporary native OMP session
+without model inference. CI runs that OMP verification on Linux, macOS, and
+Windows and also checks the declared OMP 18.3 compatibility floor.
 
 GitHub Actions publishes releases to npm using OIDC and the committed
 `publishConfig.tag`; routine releases do not require an npm login.

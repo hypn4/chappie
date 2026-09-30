@@ -3,6 +3,7 @@
 	"version": "0.6.0-rc.3",
 	"description": "Maintained Chappie fork connecting ChatGPT to Pi and Oh My Pi",
 	"devDependencies": {
+		"@biomejs/biome": "2.5.14",
 		"@earendil-works/pi-ai": "^0.85.1",
 		"@earendil-works/pi-coding-agent": "^0.85.1",
 		"@earendil-works/pi-tui": "^0.85.1",
@@ -15,13 +16,13 @@
 	},
 	"scripts": {
 		"format": "biome check --write .",
-		"check": "biome check . && tsc && node --test",
-		"test": "node --test",
-		"build": "node scripts/build.mjs",
-		"prepack": "node scripts/build.mjs",
-		"test:omp": "node scripts/build.mjs && node scripts/verify-omp.mjs",
-		"test:otunnel": "node scripts/verify-otunnel.mjs",
-		"verify:package": "node scripts/verify-package.mjs"
+		"check": "biome check . && tsc && bun test",
+		"test": "bun test",
+		"build": "bun scripts/build.mjs",
+		"prepack": "bun scripts/build.mjs",
+		"test:omp": "bun scripts/build.mjs && bun scripts/verify-omp.mjs",
+		"test:otunnel": "bun scripts/verify-otunnel.mjs",
+		"verify:package": "bun scripts/verify-package.mjs"
 	},
 	"keywords": [
 		"pi-package",
@@ -31,12 +32,8 @@
 	],
 	"author": "zetaloop",
 	"license": "MIT",
-	"packageManager": "pnpm@12.4.1",
+	"packageManager": "bun@1.4.2",
 	"type": "module",
-	"engines": {
-		"node": ">=26",
-		"pnpm": ">=12"
-	},
 	"pi": {
 		"extensions": [
 			"./src/index.ts"
@@ -98,5 +95,11 @@
 			"name": "hypn4",
 			"url": "https://github.com/hypn4"
 		}
+	],
+	"trustedDependencies": [
+		"@google/genai",
+		"esbuild",
+		"onnxruntime-node",
+		"protobufjs"
 	]
 }

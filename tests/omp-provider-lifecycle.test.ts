@@ -143,3 +143,51 @@ for (const continuation of [true, false]) {
 		assert.equal(f.broker.deliveries("test-chat").length, 0);
 	});
 }
+
+test("OMP rejects partial native tool result batches", async (t) => {
+	const f = await sessionFixture(t);
+	const queued = await f.queue("partial-call", [
+		{ name: "read", arguments: { path: "first.txt" } },
+		{ name: "read", arguments: { path: "second.txt" } },
+	]);
+	const output = await f.dispatch();
+	const calls = output.message.content.filter(
+		(block) => block.type === "toolCall",
+	);
+	assert.equal(calls.length, 2);
+	const first = calls[0];
+	assert.ok(first?.type === "toolCall");
+	await f.emit("turn_end", {
+		message: structuredClone(output.message),
+		toolResults: [
+			{
+				role: "toolResult" as const,
+				toolName: first.name,
+				toolCallId: first.id,
+				content: [{ type: "text" as const, text: "first only" }],
+				isError: false,
+				timestamp: Date.now(),
+			},
+		],
+	});
+	const outcome = await queued.pending;
+	assert.ok(
+		"error" in outcome &&
+			/no results for calls 2 \(read\)/i.test(outcome.error),
+	);
+});
+
+test("OMP preserves provider errors even when the failed message has no Chappie source", async (t) => {
+	const f = await sessionFixture(t);
+	const queued = await f.queue("provider-error");
+	const output = await f.dispatch();
+	const failed = structuredClone(output.message);
+	delete failed.chappie;
+	failed.content = [];
+	failed.errorMessage = "native provider failed";
+	await f.emit("turn_end", { message: failed, toolResults: [] });
+	const outcome = await queued.pending;
+	assert.ok(
+		"error" in outcome && /native provider failed/i.test(outcome.error),
+	);
+});

@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
@@ -46,11 +46,11 @@ export function verifyOtunnelBinary(
 }
 
 function verifyProtocolContracts() {
-	const node = process.execPath;
+	const bun = process.execPath;
 	const result = spawnSync(
-		node,
+		bun,
 		[
-			"--test",
+			"test",
 			"--test-name-pattern=otunnel|duplicate request IDs",
 			"tests/server.test.ts",
 			"tests/replay.test.ts",

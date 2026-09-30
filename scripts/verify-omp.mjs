@@ -122,7 +122,6 @@ try {
 	const args = [
 		"--mode",
 		"rpc",
-		"--no-ui",
 		"--no-session",
 		"--no-extensions",
 		"--no-skills",
@@ -147,8 +146,8 @@ try {
 		OMP_PROFILE: "",
 		PI_PROFILE: "",
 	};
-	// npm .cmd shims need cmd.exe. Quote every fixed/test-generated argument and
-	// reject expansion characters rather than interpolating arbitrary shell text.
+	// Windows command shims require cmd.exe. Quote every fixed/test-generated
+	// argument and reject expansion characters rather than interpolating shell text.
 	if (process.platform === "win32") {
 		const quote = (value) => {
 			if (/["%\r\n]/.test(value))

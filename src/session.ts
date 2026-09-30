@@ -205,6 +205,7 @@ interface ActiveRequest {
 	session: SessionDescription;
 	message: ProviderOutput["message"];
 	completed: boolean;
+	error?: string;
 	cancelled: string | undefined;
 	toolResults: ToolResultMessage[];
 }
@@ -231,7 +232,10 @@ export class LocalSession {
 	readonly #deliveries = new Map<string, DeliveryRecord>();
 	readonly #histories = new Map<number, HistoryRequest>();
 	readonly #requests = new Map<number, PendingRequest>();
-	readonly #copies = new Map<number, AbortController>();
+	readonly #operations = new Map<
+		number,
+		{ controller: AbortController; suppressAbortResponse: boolean }
+	>();
 	#context: ChappieContext | undefined;
 	#connection: IpcClient | undefined;
 	#output: ProviderOutput | undefined;
@@ -246,7 +250,8 @@ export class LocalSession {
 	#flushing = Promise.resolve();
 	#ompProviderActive = false;
 	#ompSessionName: string | undefined;
-	#ompPollStarted = false;
+	#ompSessionManager: OmpExtensionContext["sessionManager"] | undefined;
+	#ompSessionNameUnsubscribe: (() => void) | undefined;
 	#latestOmpContext: OmpExtensionContext | undefined;
 
 	constructor(
@@ -334,13 +339,6 @@ export class LocalSession {
 	installOmp(pi: OmpExtensionAPI): void {
 		pi.on("session_start", (_event, context) => {
 			this.#refreshOmpContext(context);
-			if (!this.#ompPollStarted) {
-				this.#ompPollStarted = true;
-				context.setInterval(() => {
-					const current = this.#latestOmpContext;
-					if (current) this.#refreshOmpContext(current);
-				}, 500);
-			}
 		});
 		pi.on("session_switch", (_event, context) => {
 			this.#refreshOmpContext(context);
@@ -349,6 +347,9 @@ export class LocalSession {
 		pi.on("session_branch", (_event, context) => {
 			this.#refreshOmpContext(context);
 			this.#historyChanged();
+		});
+		pi.on("before_agent_start", (_event, context) => {
+			this.#refreshOmpContext(context);
 		});
 		pi.on("session_before_tree", async (event, context) => {
 			const shared = this.#refreshOmpContext(context);
@@ -418,11 +419,15 @@ export class LocalSession {
 			if (event.willContinue === true) return;
 			return this.#settled(shared);
 		});
-		pi.on("session_shutdown", () => this.close());
+		pi.on("session_shutdown", () => {
+			this.#stopOmpSessionObservers();
+			this.close();
+		});
 	}
 
 	#refreshOmpContext(context: OmpExtensionContext): ChappieContext {
 		this.#latestOmpContext = context;
+		this.#observeOmpSession(context);
 		const shared = adaptOmpContext(context);
 		const providerActive = shared.model?.provider === "chappie";
 		const name = this.#api.getSessionName();
@@ -449,10 +454,41 @@ export class LocalSession {
 		return shared;
 	}
 
+	#observeOmpSession(context: OmpExtensionContext): void {
+		const manager = context.sessionManager;
+		if (manager === this.#ompSessionManager) return;
+		this.#ompSessionNameUnsubscribe?.();
+		this.#ompSessionManager = manager;
+		const observable = manager as typeof manager & {
+			onSessionNameChanged?: (callback: () => void) => () => void;
+		};
+		this.#ompSessionNameUnsubscribe = observable.onSessionNameChanged?.(() => {
+			const current = this.#latestOmpContext;
+			if (current?.sessionManager === manager) this.#refreshOmpContext(current);
+		});
+	}
+
+	#stopOmpSessionObservers(): void {
+		this.#ompSessionNameUnsubscribe?.();
+		this.#ompSessionNameUnsubscribe = undefined;
+		this.#ompSessionManager = undefined;
+		this.#latestOmpContext = undefined;
+	}
+
 	async #settled(context: ChappieContext): Promise<void> {
 		if (context.sessionManager.getSessionId() !== this.#sessionId) return;
 		this.#context = context;
+		const starting = this.#starting;
 		this.#starting = false;
+		const reason = "Session ended before the request completed";
+		const active = this.#active;
+		if (active && !active.completed) {
+			active.completed = true;
+			active.error ??= reason;
+		} else if (!active && starting) {
+			const request = this.#queue.shift();
+			if (request) await this.#sendError(request.id, reason);
+		}
 		this.#collectInputs();
 		this.#historyChanged();
 		await this.#completeActive();
@@ -963,7 +999,8 @@ export class LocalSession {
 				}
 				break;
 			case "inspect":
-				await this.#reply(message.id, message.sessionId, async () => {
+				await this.#reply(message.id, message.sessionId, async (signal) => {
+					signal.throwIfAborted();
 					const globalAgents = await this.#globalAgents();
 					return {
 						type: "result",
@@ -975,11 +1012,14 @@ export class LocalSession {
 				});
 				break;
 			case "inputs":
-				await this.#reply(message.id, message.sessionId, async () => ({
-					type: "result",
-					id: message.id,
-					inputs: this.#inputs(),
-				}));
+				await this.#reply(message.id, message.sessionId, async (signal) => {
+					signal.throwIfAborted();
+					return {
+						type: "result",
+						id: message.id,
+						inputs: this.#inputs(),
+					};
+				});
 				break;
 			case "history":
 				await this.#readHistory(message);
@@ -992,23 +1032,26 @@ export class LocalSession {
 				}
 				break;
 			case "readResource":
-				await this.#reply(message.id, message.sessionId, async () => ({
-					type: "result",
-					id: message.id,
-					resource: await readSessionResource(
-						message.sessionId,
-						message.uri,
-						message.offset,
-					),
-				}));
+				await this.#reply(message.id, message.sessionId, async (signal) => {
+					signal.throwIfAborted();
+					return {
+						type: "result",
+						id: message.id,
+						resource: await readSessionResource(
+							message.sessionId,
+							message.uri,
+							message.offset,
+						),
+					};
+				});
 				break;
 			case "export":
-				await this.#reply(message.id, message.sessionId, async () => {
+				await this.#reply(message.id, message.sessionId, async (signal) => {
 					const context = this.#context;
 					if (!context) throw new Error("Chappie session is not available");
 					const result = await executeTransfer(
 						{ paths: message.paths },
-						undefined,
+						signal,
 						undefined,
 						{
 							sessionId: message.sessionId,
@@ -1022,10 +1065,8 @@ export class LocalSession {
 					};
 				});
 				break;
-			case "copy": {
-				const controller = new AbortController();
-				this.#copies.set(message.id, controller);
-				void this.#reply(message.id, message.sessionId, async () => {
+			case "copy":
+				void this.#reply(message.id, message.sessionId, async (signal) => {
 					const context = this.#context;
 					if (!context) throw new Error("Chappie session is not available");
 					const files = await copyFiles(
@@ -1033,8 +1074,8 @@ export class LocalSession {
 						message.resources,
 						context.cwd,
 						message.overwrite === true,
-						(resource) => this.#readChunks(resource, controller.signal),
-						controller.signal,
+						(resource) => this.#readChunks(resource, signal),
+						signal,
 					);
 					return {
 						type: "result",
@@ -1046,16 +1087,14 @@ export class LocalSession {
 							to: { sessionId: message.sessionId, device: hostname() },
 						},
 					};
-				})
-					.finally(() => this.#copies.delete(message.id))
-					.catch(() => {});
+				}).catch(() => {});
 				break;
-			}
 			case "cancel": {
 				if (message.sessionId !== this.#sessionId) break;
-				const copying = this.#copies.get(message.id);
-				if (copying) {
-					copying.abort(new Error(message.reason));
+				const operation = this.#operations.get(message.id);
+				if (operation) {
+					operation.suppressAbortResponse = true;
+					operation.controller.abort(new Error(message.reason));
 					break;
 				}
 				if (this.#histories.has(message.id)) {
@@ -1224,8 +1263,9 @@ export class LocalSession {
 	#cancelRequests(error: Error): void {
 		for (const pending of this.#requests.values()) pending.reject(error);
 		this.#requests.clear();
-		for (const controller of this.#copies.values()) controller.abort(error);
-		this.#copies.clear();
+		for (const operation of this.#operations.values())
+			operation.controller.abort(error);
+		this.#operations.clear();
 	}
 
 	async #readHistory(
@@ -1391,6 +1431,8 @@ export class LocalSession {
 			this.#context = context;
 			this.#historyChanged();
 		}
+		const completed = message as Partial<ProviderOutput["message"]> | undefined;
+		const failure = completed?.errorMessage;
 		const responseSource =
 			typeof message === "object" && message !== null
 				? (message as { chappie?: Source }).chappie
@@ -1400,17 +1442,20 @@ export class LocalSession {
 				? this.#active
 				: responseSource?.invocationId
 					? this.#retired.get(responseSource.invocationId)
-					: undefined;
+					: failure !== undefined
+						? this.#active
+						: undefined;
 		if (!active || active.completed) return;
 		if (
+			failure === undefined &&
 			message !== active.message &&
 			(this.#host !== "omp" ||
 				!sameSource(responseSource, active.message.chappie))
 		)
 			return;
-		if (active.request.type === "call") {
+		if (failure === undefined && active.request.type === "call") {
 			const expectedCalls = active.request.calls;
-			const content = (message as ProviderOutput["message"]).content;
+			const content = completed?.content ?? [];
 			const ids = content
 				.filter((block) => block.type === "toolCall")
 				.map((block) => block.id);
@@ -1422,13 +1467,27 @@ export class LocalSession {
 		}
 		for (const result of toolResults)
 			rememberImages(active.session.id, result.content);
+		if (failure !== undefined) active.error = failure;
+		if (active.request.type === "call") {
+			const results = new Map(
+				toolResults.map((result) => [result.toolCallId, result]),
+			);
+			const ordered = active.request.calls.flatMap(
+				(call) => results.get(call.id) ?? [],
+			);
+			const missing = active.request.calls.flatMap((call, index) =>
+				results.has(call.id) ? [] : [`${index + 1} (${call.name})`],
+			);
+			if (missing.length)
+				active.error ??= `No results for calls ${missing.join(", ")}`;
+			active.toolResults =
+				this.#host === "omp" && active.request.direct
+					? directHostResults(active.request.calls, ordered)
+					: ordered;
+		} else {
+			active.toolResults = toolResults;
+		}
 		active.completed = true;
-		active.toolResults =
-			this.#host === "omp" &&
-			active.request.type === "call" &&
-			active.request.direct
-				? directHostResults(active.request.calls, toolResults)
-				: toolResults;
 		if (this.#retired.delete(active.id)) this.#retainResult(active);
 		else if (this.#host === "omp") {
 			// A completed tool batch belongs to its caller even when OMP continues
@@ -1448,7 +1507,9 @@ export class LocalSession {
 			sessionId: active.session.id,
 			cwd: active.session.cwd,
 			toolResults: active.toolResults,
-			...(active.cancelled ? { error: active.cancelled } : {}),
+			...(active.cancelled || active.error
+				? { error: active.cancelled ?? active.error }
+				: {}),
 		};
 		this.#deliveries.set(delivery.id, delivery);
 		void this.#flushDeliveries().catch(() => {});
@@ -1469,16 +1530,24 @@ export class LocalSession {
 			this.#retainResult(active);
 		} else {
 			try {
-				await connection.send({
-					type: "result",
-					id: active.request.id,
-					cwd: active.session.cwd,
-					message: active.message,
-					inputs: active.session.id === this.#sessionId ? this.#inputs() : [],
-					...(active.request.type === "call"
-						? { toolResults: active.toolResults }
-						: {}),
-				});
+				if (active.error !== undefined) {
+					await connection.send({
+						type: "result",
+						id: active.request.id,
+						error: active.error,
+					});
+				} else {
+					await connection.send({
+						type: "result",
+						id: active.request.id,
+						cwd: active.session.cwd,
+						message: active.message,
+						inputs: active.session.id === this.#sessionId ? this.#inputs() : [],
+						...(active.request.type === "call"
+							? { toolResults: active.toolResults }
+							: {}),
+					});
+				}
 			} catch (error) {
 				active.cancelled =
 					error instanceof Error ? error.message : String(error);
@@ -1584,16 +1653,25 @@ export class LocalSession {
 	async #reply(
 		id: number,
 		sessionId: string,
-		response: () =>
+		response: (
+			signal: AbortSignal,
+		) =>
 			| Parameters<IpcClient["send"]>[0]
 			| Promise<Parameters<IpcClient["send"]>[0]>,
 	): Promise<void> {
 		const connection = this.#connection;
 		const generation = this.#connectionGeneration;
+		const operation = {
+			controller: new AbortController(),
+			suppressAbortResponse: false,
+		};
+		this.#operations.set(id, operation);
 		try {
 			if (sessionId !== this.#sessionId)
 				throw new Error("The requested Pi session is no longer active");
-			const result = await response();
+			operation.controller.signal.throwIfAborted();
+			const result = await response(operation.controller.signal);
+			operation.controller.signal.throwIfAborted();
 			if (
 				connection !== this.#connection ||
 				generation !== this.#connectionGeneration
@@ -1605,7 +1683,9 @@ export class LocalSession {
 		} catch (error) {
 			if (
 				connection === this.#connection &&
-				generation === this.#connectionGeneration
+				generation === this.#connectionGeneration &&
+				connection?.connected &&
+				!operation.suppressAbortResponse
 			) {
 				await connection?.send({
 					type: "result",
@@ -1613,6 +1693,8 @@ export class LocalSession {
 					error: error instanceof Error ? error.message : String(error),
 				});
 			}
+		} finally {
+			this.#operations.delete(id);
 		}
 	}
 

@@ -13,7 +13,7 @@ async function api() {
 	assert.match(
 		source,
 		/export async function prepareConsumer/,
-		"Separate preparation from npm installation",
+		"Separate preparation from Bun installation",
 	);
 	return import(script.href);
 }
@@ -122,22 +122,39 @@ test("the real installed JavaScript broker is checked without package-manager in
 	);
 	assert.equal(await verifyInstalled(root, manifest), installed);
 });
-test("consumer CI uses only setup-node and installs the shared artifact as an ordinary step", async () => {
+test("consumer CI uses setup-bun and installs the shared artifact with Bun", async () => {
 	const text = await readFile(
 		new URL("../.github/workflows/check.yml", import.meta.url),
 		"utf8",
 	);
 	assert.match(text, /workflow_call:/);
 	const consumer = text.split("\n  install:\n")[1];
-	assert.ok(
-		consumer,
-		"A dedicated consumer job must not inherit pnpm's runtime environment",
-	);
+	assert.ok(consumer, "A dedicated Bun consumer job must exist");
 	assert.match(consumer, /needs: package/);
-	assert.match(consumer, /actions\/setup-node@/);
+	assert.match(consumer, /oven-sh\/setup-bun@[a-f0-9]{40}/);
 	assert.match(consumer, /actions\/download-artifact@/);
-	assert.doesNotMatch(consumer, /uses: pnpm\//);
-	assert.match(consumer, /npm install/);
-	assert.match(consumer, /--timing/);
-	assert.doesNotMatch(consumer, /legacy-peer-deps|--force|omit=optional/);
+	assert.doesNotMatch(consumer, /pnpm|setup-node|npm install/);
+	assert.match(consumer, /bun add --ignore-scripts/);
+	assert.match(consumer, /--omp/);
+});
+
+test("Node is isolated to the npm OIDC publish boundary", async () => {
+	const check = await readFile(
+		new URL("../.github/workflows/check.yml", import.meta.url),
+		"utf8",
+	);
+	const release = await readFile(
+		new URL("../.github/workflows/release.yml", import.meta.url),
+		"utf8",
+	);
+	const publish = await readFile(
+		new URL("../.github/workflows/publish.yml", import.meta.url),
+		"utf8",
+	);
+	assert.doesNotMatch(check, /actions\/setup-node@|npm publish/);
+	assert.doesNotMatch(release, /actions\/setup-node@|npm publish/);
+	assert.equal((publish.match(/actions\/setup-node@/g) ?? []).length, 1);
+	assert.match(publish, /Verify npm Trusted Publishing client/);
+	assert.match(publish, /npm publish/);
+	assert.doesNotMatch(publish, /npm (?:ci|install|pack|test)\b/);
 });
