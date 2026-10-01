@@ -1,6 +1,6 @@
 {
 	"name": "@hypn4/chappie",
-	"version": "0.6.0-rc.8",
+	"version": "0.6.0-rc.9",
 	"description": "Maintained Chappie fork connecting ChatGPT to Pi and Oh My Pi",
 	"devDependencies": {
 		"@biomejs/biome": "2.5.15",
