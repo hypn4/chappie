@@ -58,6 +58,110 @@ test("MCP tool annotations describe mutation and external access accurately", as
 	);
 });
 
+test("long-operation tools expose safe annotations and stable IDs", async (t) => {
+	const f = await mcpFixture(t);
+	const result = await f.request("tools/list", {});
+	const tools = result.tools as {
+		name: string;
+		annotations: Record<string, boolean>;
+		inputSchema: { required?: string[] };
+	}[];
+	const start = tools.find((tool) => tool.name === "start_call");
+	assert.equal(start?.annotations.readOnlyHint, false);
+	assert.equal(start?.annotations.destructiveHint, true);
+	assert.equal(start?.annotations.idempotentHint, true);
+	assert.ok(start?.inputSchema.required?.includes("operationId"));
+	const status = tools.find((tool) => tool.name === "get_operation");
+	assert.equal(status?.annotations.readOnlyHint, true);
+	assert.equal(status?.annotations.idempotentHint, true);
+	const cancel = tools.find((tool) => tool.name === "cancel_operation");
+	assert.equal(cancel?.annotations.readOnlyHint, false);
+	assert.equal(cancel?.annotations.destructiveHint, true);
+	assert.equal(cancel?.annotations.idempotentHint, true);
+});
+
+test("get_operation delivers and acknowledges the matching detached result", async (t) => {
+	const pending = {
+		...delivery,
+		id: "operation-result",
+		operationKey: "operation-key",
+	};
+	const f = await mcpFixture(t, {
+		operation: () => ({
+			operation: {
+				operationId: "long-read",
+				status: "completed",
+				sessionId: "A",
+				cwd: "/fixture",
+				updatedAt: 1,
+			},
+			deliveries: [pending],
+		}),
+	});
+	const result = await f.call("get_operation", { operationId: "long-read" });
+	assert.notEqual(result.isError, true);
+	assert.match(JSON.stringify(result), /long-read/);
+	assert.match(JSON.stringify(result), /PENDING_RESULT/);
+	assert.equal(f.acknowledgements, 1);
+});
+
+test("start_call returns durable acceptance without waiting for native completion", async (t) => {
+	let starts = 0;
+	const f = await mcpFixture(t, {
+		startCall: async () => {
+			starts++;
+			return {
+				operation: {
+					operationId: "long-read",
+					status: "running",
+					sessionId: "A",
+					cwd: "/fixture",
+					updatedAt: 1,
+				},
+			};
+		},
+	});
+	const result = await f.call("start_call", {
+		operationId: "long-read",
+		calls: [{ name: "read", arguments: { path: "test.txt" } }],
+	});
+	assert.notEqual(result.isError, true);
+	assert.match(
+		String((result.structuredContent as { text?: string } | undefined)?.text),
+		/"status":"running"/,
+	);
+	assert.equal(starts, 1);
+});
+
+test("cancel_operation returns durable cancellation state", async (t) => {
+	let cancellations = 0;
+	const f = await mcpFixture(t, {
+		cancelOperation: async () => {
+			cancellations++;
+			return {
+				operation: {
+					operationId: "long-read",
+					status: "cancelled",
+					sessionId: "A",
+					cwd: "/fixture",
+					updatedAt: 2,
+					error: "Operation cancelled by ChatGPT",
+				},
+				deliveries: [],
+			};
+		},
+	});
+	const result = await f.call("cancel_operation", {
+		operationId: "long-read",
+	});
+	assert.notEqual(result.isError, true);
+	assert.match(
+		String((result.structuredContent as { text?: string } | undefined)?.text),
+		/"status":"cancelled"/,
+	);
+	assert.equal(cancellations, 1);
+});
+
 test("sessions remains responsive when a registered session never answers inspect", async (t) => {
 	const f = await mcpFixture(t, { inputs: () => new Promise(() => {}) });
 	const result = await f.call("sessions");
@@ -186,7 +290,7 @@ test("direct transfer requires a stable operation ID in its public schema", asyn
 	assert.equal(rejected.isError, true);
 });
 
-test("legacy native failure details remain an MCP error with all member results", async (t) => {
+test("native transfer failure details remain an MCP error with all member results", async (t) => {
 	const f = await mcpFixture(t, {
 		call: async () => ({
 			sessionId: "A",
@@ -269,7 +373,7 @@ test("otunnel metadata preserves conversation and request identity at the broker
 	]);
 });
 
-test("call accepts an optional Base64 UTF-8 JSON batch", async (t) => {
+test("call accepts the native JSON batch", async (t) => {
 	const observed: unknown[] = [];
 	const f = await mcpFixture(t, {
 		call: async (
@@ -287,13 +391,12 @@ test("call accepts an optional Base64 UTF-8 JSON batch", async (t) => {
 		},
 	});
 	const calls = [{ name: "read", arguments: { path: "file.txt" } }];
-	const encoded = Buffer.from(JSON.stringify(calls), "utf8").toString("base64");
-	const result = await f.call("call", { base64: encoded });
+	const result = await f.call("call", { calls });
 	assert.equal(result.isError, false);
 	assert.deepEqual(observed, [calls]);
 });
 
-test("call rejects ambiguous or malformed Base64 batches before execution", async (t) => {
+test("call rejects removed Base64 arguments before execution", async (t) => {
 	let executions = 0;
 	const f = await mcpFixture(t, {
 		call: async () => {

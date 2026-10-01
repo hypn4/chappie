@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import type { SessionEntry } from "@earendil-works/pi-coding-agent";
+import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { historyInput, historyResult } from "../src/history.ts";
 
 test("re-reading the same history range reflects an updated native entry", () => {

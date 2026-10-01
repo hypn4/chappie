@@ -84,6 +84,7 @@ test("TCP accepts authenticated clients but rejects clients without certificates
 						id: "authenticated",
 						cwd: f.root,
 						device: "test",
+						host: "omp",
 						status: "idle",
 					},
 				}),

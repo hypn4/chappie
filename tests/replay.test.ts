@@ -3,15 +3,16 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import type { ToolResultMessage } from "@earendil-works/pi-ai";
-import type { SessionEntry } from "@earendil-works/pi-coding-agent";
+import type { ToolResultMessage } from "@oh-my-pi/pi-ai";
+import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import * as z from "zod";
 import { deliveryContent, toolResultsContent } from "../src/delivery.ts";
 import { historyResult } from "../src/history.ts";
 import { operationIdentity } from "../src/operations.ts";
 import { questionInput } from "../src/questions.ts";
 import { State } from "../src/state.ts";
 import { createOmpTransferTool } from "../src/transfer.omp.ts";
-import { transfer } from "../src/transfer.ts";
+import { transferSchema } from "../src/transfer.ts";
 import { sessionFixture } from "./helpers/session-fixture.ts";
 
 const transferResult: ToolResultMessage = {
@@ -188,22 +189,13 @@ test("new request IDs keep intentional repeated work independent", async (t) => 
 	}
 });
 
-test("both host transfer definitions expose a stable approval-resumption operationId", async (t) => {
+test("native transfer uses the single stable operation schema", async (t) => {
 	const f = await sessionFixture(t);
-	const piProperties = transfer.parameters.properties as Record<
-		string,
-		unknown
-	>;
-	assert.ok(piProperties.operationId);
-	const ompParameters = createOmpTransferTool(f.local).parameters;
-	assert.ok("properties" in ompParameters);
-	const ompProperties = ompParameters.properties;
-	assert.ok(
-		ompProperties &&
-			typeof ompProperties === "object" &&
-			!Array.isArray(ompProperties),
+	assert.deepEqual(
+		createOmpTransferTool(f.local).parameters,
+		z.toJSONSchema(transferSchema, { io: "input" }),
 	);
-	assert.ok("operationId" in ompProperties);
+	assert.ok(transferSchema.shape.operationId);
 });
 
 test("logical transfer identity survives changing transport request IDs and signed URLs", () => {
@@ -251,6 +243,44 @@ test("logical transfer identity survives changing transport request IDs and sign
 	);
 });
 
+test("explicit detached operation identity is stable across transport request IDs", () => {
+	const calls = [{ name: "read", arguments: { path: "file.txt" } }];
+	const first = operationIdentity(
+		"chat",
+		"A",
+		"call",
+		"request-one",
+		calls,
+		"long-read",
+	);
+	const second = operationIdentity(
+		"chat",
+		"A",
+		"call",
+		"request-two",
+		calls,
+		"long-read",
+	);
+	assert.deepEqual(first, second);
+	assert.equal(first?.operationId, "long-read");
+	assert.equal(
+		operationIdentity(
+			"chat",
+			"A",
+			"call",
+			"request-three",
+			[{ name: "read", arguments: { path: "other.txt" } }],
+			"long-read",
+		)?.key,
+		first?.key,
+	);
+	assert.notEqual(
+		operationIdentity("chat", "B", "call", "request-four", calls, "long-read")
+			?.key,
+		first?.key,
+	);
+});
+
 test("unfinished operations remain uncertain after restart rather than being retried", async (t) => {
 	const root = await mkdtemp(join(tmpdir(), "chappie-receipt-"));
 	t.after(() => rm(root, { recursive: true, force: true }));
@@ -268,6 +298,72 @@ test("unfinished operations remain uncertain after restart rather than being ret
 	const resumed = new State(root);
 	await resumed.load();
 	assert.equal((await resumed.reserveOperation(receipt))?.status, "uncertain");
+});
+
+test("detached operation failures persist and late delivery cannot overwrite them", async (t) => {
+	const root = await mkdtemp(join(tmpdir(), "chappie-operation-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const state = new State(root);
+	const receipt = {
+		key: "detached-key",
+		operationId: "detached-op",
+		signature: "signature",
+		chatId: "chat",
+		sessionId: "A",
+		cwd: root,
+		status: "running" as const,
+		updatedAt: Date.now(),
+	};
+	assert.equal(await state.reserveOperation(receipt), undefined);
+	await state.finishOperation("detached-key", "failed", [], "native failure");
+	await state.addDelivery({
+		id: "detached-result",
+		chatId: "chat",
+		operationKey: "detached-key",
+		sessionId: "A",
+		cwd: root,
+		toolResults: [],
+		complete: true,
+	});
+	assert.equal(state.operation("chat", "detached-op").status, "failed");
+	assert.equal(state.operation("chat", "detached-op").error, "native failure");
+
+	const resumed = new State(root);
+	await resumed.load();
+	assert.equal(resumed.operation("chat", "detached-op").status, "failed");
+	assert.equal(
+		resumed.deliveriesForOperation("chat", "detached-key").length,
+		1,
+	);
+});
+
+test("detached operation IDs cannot be reused across sessions in one conversation", async (t) => {
+	const root = await mkdtemp(join(tmpdir(), "chappie-operation-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const state = new State(root);
+	await state.reserveOperation({
+		key: "key-a",
+		operationId: "same-id",
+		signature: "sig-a",
+		chatId: "chat",
+		sessionId: "A",
+		cwd: root,
+		status: "running",
+		updatedAt: Date.now(),
+	});
+	await assert.rejects(
+		state.reserveOperation({
+			key: "key-b",
+			operationId: "same-id",
+			signature: "sig-b",
+			chatId: "chat",
+			sessionId: "B",
+			cwd: root,
+			status: "running",
+			updatedAt: Date.now(),
+		}),
+		/another session|identifier/i,
+	);
 });
 
 test("acknowledged deferred results are not resurrected by delivery retries", async (t) => {
@@ -349,7 +445,7 @@ test("question input is bounded and old delivered questions are pruned", async (
 	assert.equal(state.question("chat", "new-question").id, "new-question");
 });
 
-test("bindings migrate, persist active touches, and prune after 30 idle days", async (t) => {
+test("current bindings persist active touches and prune after 30 idle days", async (t) => {
 	const root = await mkdtemp(join(tmpdir(), "chappie-binding-retention-"));
 	t.after(() => rm(root, { recursive: true, force: true }));
 	const day = 24 * 60 * 60 * 1000;
@@ -359,7 +455,7 @@ test("bindings migrate, persist active touches, and prune after 30 idle days", a
 		join(root, "chappie.state.json"),
 		JSON.stringify({
 			bindings: {
-				legacy: "legacy-session",
+				recent: { sessionId: "recent-session", lastUsedAt: now },
 				stale: {
 					sessionId: "stale-session",
 					lastUsedAt: now - 31 * day,
@@ -377,7 +473,7 @@ test("bindings migrate, persist active touches, and prune after 30 idle days", a
 		await readFile(join(root, "chappie.state.json"), "utf8"),
 	);
 	assert.equal(saved.bindings.stale, undefined);
-	assert.equal(saved.bindings.legacy.sessionId, "legacy-session");
+	assert.equal(saved.bindings.recent.sessionId, "recent-session");
 
 	assert.equal(state.binding("fresh"), "fresh-session");
 	await state.confirmBindingUse("fresh", "fresh-session");

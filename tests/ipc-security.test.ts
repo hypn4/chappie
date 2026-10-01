@@ -83,7 +83,13 @@ test("unregistered peers cannot relay inspect requests", async (t) => {
 	target.send({
 		type: "sync",
 		id: 1,
-		session: { id: "target", cwd: root, device: "test", status: "idle" },
+		session: {
+			id: "target",
+			cwd: root,
+			device: "test",
+			host: "omp",
+			status: "idle",
+		},
 	});
 	await until(() => broker.listSessions().length === 1);
 	const stranger = await peer(t, root);
@@ -222,14 +228,26 @@ test("a second connection cannot replace an online session owner", async (t) => 
 	original.send({
 		type: "sync",
 		id: 1,
-		session: { id: "target", cwd: root, device: "original", status: "idle" },
+		session: {
+			id: "target",
+			cwd: root,
+			device: "original",
+			host: "omp",
+			status: "idle",
+		},
 	});
 	await until(() => broker.listSessions().length === 1);
 	const impostor = await peer(t, root);
 	impostor.send({
 		type: "sync",
 		id: 1,
-		session: { id: "target", cwd: root, device: "replacement", status: "idle" },
+		session: {
+			id: "target",
+			cwd: root,
+			device: "replacement",
+			host: "omp",
+			status: "idle",
+		},
 	});
 	await delay(60);
 	assert.equal(broker.listSessions()[0]?.device, "original");

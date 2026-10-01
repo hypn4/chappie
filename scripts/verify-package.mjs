@@ -24,7 +24,10 @@ const required = [
 	"dist/src/index.omp.js",
 	"dist/src/instructions.md",
 	"dist/src/question.html",
-	"src/index.ts",
+	"dist/src/event-types.js",
+	"dist/src/events.js",
+	"dist/src/webhook.js",
+	"src/index.omp.ts",
 	"LICENSE",
 ];
 function run(command, args, options = {}) {
@@ -77,6 +80,33 @@ export async function inspectPackage(archive) {
 	);
 	releaseMetadata(pkg, { tag: `v${expected.version}` });
 	assert.equal(pkg.name, expected.name);
+	assert.equal(
+		pkg.pi,
+		undefined,
+		"Retired Pi package entry must not be published",
+	);
+	assert.deepEqual(pkg.omp?.extensions, ["./dist/src/index.omp.js"]);
+	for (const key of Object.keys({
+		...pkg.dependencies,
+		...pkg.peerDependencies,
+		...pkg.devDependencies,
+	}))
+		assert.ok(
+			!key.startsWith("@earendil-works/") && key !== "typebox",
+			`Retired host dependency: ${key}`,
+		);
+	for (const removed of [
+		"src/index.ts",
+		"src/provider.ts",
+		"src/host-tools.ts",
+		"dist/src/index.js",
+		"dist/src/provider.js",
+		"dist/src/host-tools.js",
+	])
+		assert.ok(
+			!files.includes(`package/${removed}`),
+			`Retired entry in archive: ${removed}`,
+		);
 	for (const name of required)
 		assert.ok(files.includes(`package/${name}`), `Missing ${name}`);
 	const integrity = `sha512-${createHash("sha512")

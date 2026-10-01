@@ -40,7 +40,7 @@ jobs:
       - if: matrix.os == 'windows-latest'
         run: bun run test:omp
 
-  compat:
+  runtime:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -53,12 +53,8 @@ jobs:
           bun-version-file: .bun-version
       - run: bun ci
       - run: bun audit --audit-level=high
-      - name: Verify the declared OMP 18.3 floor
-        run: >-
-          bun add --dev --exact --no-save
-          @oh-my-pi/pi-ai@18.3.0
-          @oh-my-pi/pi-coding-agent@18.3.0
-          @oh-my-pi/pi-utils@18.3.0
+      - name: Verify the pinned native OMP runtime
+        run: bun -e 'const p = await Bun.file("node_modules/@oh-my-pi/pi-coding-agent/package.json").json(); console.log("OMP", p.version)'
       - run: bun run test:omp
       - name: Download otunnel 0.2
         env:
@@ -72,7 +68,7 @@ jobs:
           OTUNNEL="$PWD/otunnel" bun run test:otunnel
 
   package:
-    needs: [source, compat]
+    needs: [source, runtime]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
@@ -96,7 +92,7 @@ jobs:
           bun scripts/verify-package.mjs package.tgz --prepare "$consumer"
           cd "$consumer"
           bun add --ignore-scripts "${{ github.workspace }}/package.tgz"
-          bun add --ignore-scripts @oh-my-pi/pi-coding-agent@18.4.6
+          bun add --ignore-scripts @oh-my-pi/pi-coding-agent@18.4.8
           cd "${{ github.workspace }}"
           bun scripts/verify-package.mjs package.tgz --installed "$consumer" --omp
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

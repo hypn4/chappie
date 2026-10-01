@@ -36,8 +36,8 @@ installation scripts are required by this dependency graph are listed in
 1. Run `bun ci` and source checks on Linux and Windows. Windows also runs
    the current native OMP integration to cover platform-specific process and
    path behavior.
-2. On Linux, run `bun audit --audit-level=high`, verify the declared OMP 18.3
-   compatibility floor, and exercise the real otunnel 0.2.0 release binary.
+2. On Linux, run `bun audit --audit-level=high`, verify the pinned OMP 18.4.8
+   native runtime, and exercise the real otunnel 0.2.0 release binary.
 3. Build one tarball on Linux, verify its contents and SHA-512 integrity, then
    install those same bytes once in a clean Bun consumer with the current OMP
    runtime.
@@ -60,7 +60,7 @@ bun pm pack --ignore-scripts --filename package.tgz
 bun scripts/verify-package.mjs package.tgz --prepare /path/to/empty-consumer
 cd /path/to/empty-consumer
 bun add --ignore-scripts /path/to/chappie/package.tgz
-bun add --ignore-scripts @oh-my-pi/pi-coding-agent@18.4.6
+bun add --ignore-scripts @oh-my-pi/pi-coding-agent@18.4.8
 cd /path/to/chappie
 bun scripts/verify-package.mjs package.tgz --installed /path/to/empty-consumer --omp
 ```

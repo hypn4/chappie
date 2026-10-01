@@ -244,11 +244,11 @@ test("a failed acknowledgement cannot revive a delivery consumed by another resp
 	assert.deepEqual(restored.deliveries("chat"), []);
 });
 
-test("legacy completion receipts never claim host delivery or fabricate resource references", async (t) => {
+test("completion receipts without exports never fabricate host delivery or resource references", async (t) => {
 	const root = await mkdtemp(join(tmpdir(), "ch-recovery-"));
 	t.after(() => rm(root, { recursive: true, force: true }));
-	const legacy = {
-		key: "legacy",
+	const withoutResources = {
+		key: "withoutResources",
 		signature: "sig",
 		chatId: "chat",
 		sessionId: "A",
@@ -258,11 +258,14 @@ test("legacy completion receipts never claim host delivery or fabricate resource
 	};
 	await writeFile(
 		join(root, "chappie.state.json"),
-		JSON.stringify({ operations: [legacy] }),
+		JSON.stringify({ operations: [withoutResources] }),
 	);
 	const state = new State(root);
 	await state.load();
-	assert.deepEqual(await state.reserveOperation(legacy), legacy);
+	assert.deepEqual(
+		await state.reserveOperation(withoutResources),
+		withoutResources,
+	);
 	const stored = JSON.parse(
 		await readFile(join(root, "chappie.state.json"), "utf8"),
 	);

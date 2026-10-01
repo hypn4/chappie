@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { TestContext } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
-import type { ToolResultMessage } from "@earendil-works/pi-ai";
+import type { ToolResultMessage } from "@oh-my-pi/pi-ai";
 import type {
 	ExtensionAPI as OmpExtensionAPI,
 	ExtensionContext as OmpExtensionContext,
@@ -122,6 +122,7 @@ export async function multiSessionFixture(
 				getLeafEntry: () => undefined,
 				getEntry: () => undefined,
 				getBranch: () => branch,
+				onSessionNameChanged: () => () => {},
 			},
 			isIdle: () => true,
 			abort() {},
@@ -136,7 +137,6 @@ export async function multiSessionFixture(
 			createOmpHostApi(api, fixtureWireSchema),
 			root,
 			undefined,
-			"omp",
 			undefined,
 			localTools,
 		);
@@ -254,7 +254,6 @@ export async function sessionFixture(t: TestContext) {
 		createOmpHostApi(api, fixtureWireSchema),
 		root,
 		undefined,
-		"omp",
 	);
 	t.after(async () => {
 		controller.abort(new Error("fixture cleanup"));

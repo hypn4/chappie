@@ -33,22 +33,14 @@ test("the fork has its own public package identity without changing upstream att
 	);
 	assert.equal(manifest.bin["chappie-omp"], "./dist/src/cli.omp.js");
 });
-test("legacy release candidates without an explicit channel retain next", async () => {
-	const value = await metadata(fixture, {
-		tag: "v0.6.0-rc.1",
-		repository: "hypn4/chappie",
+for (const version of ["0.6.0-rc.1", "0.6.0"]) {
+	test(`publication requires an explicit channel for ${version}`, async () => {
+		await assert.rejects(
+			metadata({ ...fixture, version }, { tag: `v${version}` }),
+			/publishConfig\.tag|channel/i,
+		);
 	});
-	assert.equal(value.distTag, "next");
-	assert.equal(value.prerelease, true);
-});
-test("legacy stable versions without an explicit channel retain latest", async () => {
-	const value = await metadata(
-		{ ...fixture, version: "0.6.0" },
-		{ tag: "v0.6.0", repository: "hypn4/chappie" },
-	);
-	assert.equal(value.distTag, "latest");
-	assert.equal(value.prerelease, false);
-});
+}
 
 test("the maintained fork declares its channel before publishing", async () => {
 	const channel = manifest.publishConfig.tag;

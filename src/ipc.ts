@@ -18,7 +18,7 @@ import type {
 	TextContent,
 	ToolCall,
 	UserMessage,
-} from "@earendil-works/pi-ai";
+} from "@oh-my-pi/pi-ai";
 import type { Activity } from "./activity.ts";
 import type { NetworkTlsConfig } from "./config.ts";
 import type { DeliveryRecord } from "./delivery.ts";
@@ -32,7 +32,7 @@ const defaultPort = 24274;
 export type SessionStatus = "idle" | "ready" | "executing";
 
 export interface SessionDescription {
-	host?: "pi" | "omp";
+	host: "omp";
 	agentDir?: string;
 	id: string;
 	cwd: string;

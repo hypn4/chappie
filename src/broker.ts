@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto";
-import type { ToolCall } from "@earendil-works/pi-ai";
+import type { ToolCall } from "@oh-my-pi/pi-ai";
 import { type Activity, chatLabel, source } from "./activity.ts";
 import { readConfig } from "./config.ts";
 import type { DeliveryRecord } from "./delivery.ts";
+import { OPERATION_FINISHED_EVENT } from "./event-types.ts";
+import { EventService, type WebhookTransport } from "./events.ts";
 import { type HistoryRange, historyInstructions } from "./history.ts";
 import {
 	type BrokerMessage,
@@ -18,9 +20,13 @@ import {
 	type SessionToolResult,
 } from "./ipc.ts";
 import {
+	type OperationReceipt,
+	type OperationView,
 	operationIdentity,
+	operationView,
 	type ReplayReceipt,
 	replayReceipt,
+	validateOperationId,
 } from "./operations.ts";
 import {
 	type Question,
@@ -38,7 +44,7 @@ import { type BindingMutation, State } from "./state.ts";
 import type { ToolInput } from "./tools.ts";
 
 const observerInstructions =
-	"This ChatGPT conversation recently initialized or resumed work in this Pi session. A recent initialization may still own this task; do not assume another completion is needed. Participate as an observer for this task: read history with observer: true, follow new entries with after and wait: true, and think independently. Leave execution and Pi communication to the ongoing work. Do not export files, repeat the completed report, or publish a second completion response. Leave the single completion response to the original execution. Continue observing rather than reinitializing to take over.";
+	"This ChatGPT conversation recently initialized or resumed work in this OMP session. A recent initialization may still own this task; do not assume another completion is needed. Participate as an observer for this task: read history with observer: true, follow new entries with after and wait: true, and think independently. Leave execution and OMP communication to the ongoing work. Do not export files, repeat the completed report, or publish a second completion response. Leave the single completion response to the original execution. Continue observing rather than reinitializing to take over.";
 
 function hasHostFileImport(
 	calls: readonly { name: string; arguments: Record<string, unknown> }[],
@@ -46,6 +52,13 @@ function hasHostFileImport(
 	return calls.some(
 		(call) => call.name === "transfer" && Array.isArray(call.arguments.files),
 	);
+}
+
+const operationCancelledMessage = "Operation cancelled by ChatGPT";
+
+interface DetachedOperation {
+	controller: AbortController;
+	promise: Promise<void>;
 }
 
 interface RegisteredSession {
@@ -100,6 +113,17 @@ export interface CallResult extends ChatResult {
 	toolResults: SessionToolResult[];
 }
 
+export interface StartedOperation {
+	operation: OperationView;
+	initialization?: Initialization;
+}
+
+export interface OperationResult {
+	operation: OperationView;
+	deliveries: DeliveryRecord[];
+	result?: DeliveryRecord | undefined;
+}
+
 interface InFlightOperation {
 	signature: string;
 	promise: Promise<ChatResult | CallResult>;
@@ -110,6 +134,7 @@ interface InFlightOperation {
 export interface BrokerOptions {
 	sessionWaitMs?: number;
 	inspectionTimeoutMs?: number;
+	webhookTransport?: WebhookTransport;
 }
 
 export class Broker {
@@ -118,6 +143,7 @@ export class Broker {
 	readonly #inspectionTimeoutMs: number;
 	readonly #ipc: IpcServer;
 	readonly #state: State;
+	readonly #events: EventService;
 	readonly #sessions = new Map<string, RegisteredSession>();
 	// Pending automatic selections, keyed by chat so retries do not take a second slot.
 	readonly #selectionReservations = new Map<string, string>();
@@ -129,6 +155,7 @@ export class Broker {
 		Map<number, AbortController>
 	>();
 	readonly #inFlightOperations = new Map<string, InFlightOperation>();
+	readonly #detachedOperations = new Map<string, DetachedOperation>();
 	#ask = true;
 	#cooldownMs = 10_000;
 	#localTools = false;
@@ -139,6 +166,7 @@ export class Broker {
 		this.#inspectionTimeoutMs = options.inspectionTimeoutMs ?? 3000;
 		this.#agentDir = agentDir;
 		this.#state = new State(agentDir);
+		this.#events = new EventService(this.#state, options.webhookTransport);
 		this.#ipc = new IpcServer(
 			agentDir,
 			(peer, message) => this.#receive(peer, message),
@@ -156,10 +184,14 @@ export class Broker {
 			...(config.tls ? { tls: config.tls } : {}),
 			...(config.listenHost ? { host: config.listenHost } : {}),
 		});
+		this.#events.start();
 	}
 
 	async close(): Promise<void> {
+		await this.#events.close();
 		const error = new Error("Chappie broker ended");
+		for (const operation of this.#detachedOperations.values())
+			operation.controller.abort(error);
 		this.#cooldowns.clear();
 		for (const relays of this.#relays.values()) {
 			for (const controller of relays.values()) controller.abort(error);
@@ -176,6 +208,12 @@ export class Broker {
 		this.#waiters.clear();
 		this.#sessions.clear();
 		await this.#ipc.close();
+		if (this.#detachedOperations.size > 0)
+			await Promise.allSettled(
+				[...this.#detachedOperations.values()].map(
+					(operation) => operation.promise,
+				),
+			);
 		await this.#state.flush();
 	}
 
@@ -317,7 +355,7 @@ export class Broker {
 						...(initialization ? { initialization } : {}),
 					};
 				}
-				throw new Error("Pi session returned no assistant message");
+				throw new Error("OMP session returned no assistant message");
 			},
 		);
 	}
@@ -442,9 +480,220 @@ export class Broker {
 					};
 				}
 				await this.#state.finishOperation(identity?.key, "uncertain");
-				throw new Error("Pi session returned no tool results");
+				throw new Error("OMP session returned no tool results");
 			},
 		);
+	}
+
+	async startCall(
+		chatId: string,
+		sessionId: string | undefined,
+		calls: ToolInput[],
+		operationId: string,
+		requestId: unknown,
+		signal: AbortSignal,
+	): Promise<StartedOperation> {
+		signal.throwIfAborted();
+		if (calls.length < 1 || calls.length > 128)
+			throw new Error("Tool batches must contain between 1 and 128 calls");
+		if (hasHostFileImport(calls))
+			throw new Error("Host file imports require the direct transfer tool");
+		const stableId = validateOperationId(operationId);
+		const prior = this.#state.findOperation(chatId, stableId);
+		if (prior) {
+			if (sessionId && sessionId !== prior.sessionId)
+				throw new Error(
+					"Operation identifier already belongs to another session",
+				);
+			const replay = operationIdentity(
+				chatId,
+				prior.sessionId,
+				"call",
+				requestId,
+				calls,
+				stableId,
+			);
+			if (replay?.signature !== prior.signature)
+				throw new Error("Operation identifier reused with different arguments");
+			await this.#state.flush();
+			return {
+				operation: operationView(this.#state.operation(chatId, stableId)),
+			};
+		}
+		const { sessionId: target, initialization } = await this.#selectSession(
+			chatId,
+			sessionId,
+			requestId,
+			signal,
+		);
+		const identity = operationIdentity(
+			chatId,
+			target,
+			"call",
+			requestId,
+			calls,
+			stableId,
+		);
+		if (!identity?.operationId)
+			throw new Error("Detached calls require a stable operationId");
+		const session = this.#sessions.get(target);
+		if (!session) throw new Error("Target session disconnected");
+		await this.#confirmBindingUse(chatId, sessionId, target);
+		signal.throwIfAborted();
+		const createdAt = Date.now();
+		const receipt = {
+			...identity,
+			chatId,
+			sessionId: target,
+			cwd: session.description.cwd,
+			createdAt,
+			status: "running" as const,
+			updatedAt: createdAt,
+		};
+		const existing = await this.#state.reserveOperation(receipt);
+		if (existing) {
+			return {
+				operation: operationView(existing),
+				...(initialization ? { initialization } : {}),
+			};
+		}
+
+		const toolCalls: ToolCall[] = calls.map((call) => ({
+			type: "toolCall",
+			id: `chappie-${randomUUID()}`,
+			name: call.name,
+			arguments: call.arguments,
+		}));
+		const execution = new AbortController();
+		const detached = this.#request(
+			target,
+			(id) => ({
+				type: "call",
+				id,
+				chatId,
+				requestId: stableId,
+				operationKey: identity.key,
+				sessionId: target,
+				calls: toolCalls,
+			}),
+			execution.signal,
+		)
+			.then(async (result) => {
+				if (!("toolResults" in result)) {
+					await this.#state.finishOperation(
+						identity.key,
+						"uncertain",
+						[],
+						"Agent session returned no tool results",
+					);
+					return;
+				}
+				await this.#state.addDelivery({
+					id: `operation:${identity.key}`,
+					chatId,
+					operationKey: identity.key,
+					sessionId: target,
+					cwd: result.cwd,
+					toolResults: result.toolResults,
+					complete: true,
+				});
+			})
+			.catch(async (error: unknown) => {
+				const cancelled =
+					execution.signal.aborted &&
+					execution.signal.reason instanceof Error &&
+					execution.signal.reason.message === operationCancelledMessage;
+				await this.#state.finishOperation(
+					identity.key,
+					cancelled ? "cancelled" : "uncertain",
+					[],
+					error instanceof Error ? error.message : String(error),
+				);
+			});
+		this.#detachedOperations.set(identity.key, {
+			controller: execution,
+			promise: detached,
+		});
+		void detached
+			.finally(() => this.#detachedOperations.delete(identity.key))
+			.catch(() => {});
+
+		return {
+			operation: operationView(receipt),
+			...(initialization ? { initialization } : {}),
+		};
+	}
+
+	operation(chatId: string, operationId: string): OperationResult {
+		const receipt = this.#state.operation(
+			chatId,
+			validateOperationId(operationId),
+		);
+		return {
+			operation: operationView(receipt),
+			deliveries: this.#state.deliveriesForOperation(chatId, receipt.key),
+			result: this.#state.resultForOperation(chatId, operationId),
+		};
+	}
+
+	async subscribeOperationEvent(
+		chatId: string,
+		operationId: string,
+		url: string,
+		secret: string,
+		ttlMs?: number | null,
+		signal?: AbortSignal,
+	) {
+		return await this.#events.subscribe({
+			chatId,
+			name: OPERATION_FINISHED_EVENT,
+			operationId,
+			url,
+			secret,
+			...(ttlMs !== undefined ? { ttlMs } : {}),
+			...(signal ? { signal } : {}),
+		});
+	}
+
+	async unsubscribeOperationEvent(
+		chatId: string,
+		operationId: string,
+		url: string,
+	): Promise<void> {
+		await this.#events.unsubscribe({
+			chatId,
+			name: OPERATION_FINISHED_EVENT,
+			operationId,
+			url,
+		});
+	}
+
+	async cancelOperation(
+		chatId: string,
+		operationId: string,
+	): Promise<OperationResult> {
+		const receipt = this.#state.operation(
+			chatId,
+			validateOperationId(operationId),
+		);
+		await this.#cancelDetached(receipt);
+		return this.operation(chatId, operationId);
+	}
+
+	async #cancelDetached(receipt: OperationReceipt) {
+		if (receipt.status !== "running") return;
+		const detached = this.#detachedOperations.get(receipt.key);
+		if (!detached) {
+			await this.#state.finishOperation(
+				receipt.key,
+				"uncertain",
+				[],
+				"Detached execution is no longer attached to this broker",
+			);
+			return;
+		}
+		detached.controller.abort(new Error(operationCancelledMessage));
+		await detached.promise;
 	}
 	async history(
 		chatId: string,
@@ -455,7 +704,7 @@ export class Broker {
 	) {
 		const boundId = sessionId ? undefined : this.#state.binding(chatId);
 		const target = sessionId ?? boundId;
-		if (!target) throw new Error("Specify a Pi sessionId to read history");
+		if (!target) throw new Error("Specify a OMP sessionId to read history");
 		await this.#waitForSession(target, signal);
 		const result = await this.#request(
 			target,
@@ -472,7 +721,7 @@ export class Broker {
 			await this.#confirmBindingUse(chatId, sessionId, target);
 			return { sessionId: target, ...result };
 		}
-		throw new Error("Pi session returned no history");
+		throw new Error("OMP session returned no history");
 	}
 
 	async inputs(
@@ -489,7 +738,7 @@ export class Broker {
 			signal,
 		);
 		if (!("inputs" in result))
-			throw new Error("Pi session returned no pending inputs");
+			throw new Error("OMP session returned no pending inputs");
 		await this.#ackInputs(target, result.inputs, signal);
 		await this.#confirmBindingUse(chatId, sessionId, target);
 		return result.inputs;
@@ -510,7 +759,7 @@ export class Broker {
 		);
 		signal.throwIfAborted();
 		const session = this.#sessions.get(target);
-		if (!session) throw new Error(`Pi session ${target} is offline`);
+		if (!session) throw new Error(`OMP session ${target} is offline`);
 		const question: QuestionRecord = {
 			...input,
 			id: randomUUID(),
@@ -568,7 +817,7 @@ export class Broker {
 				).catch(() => {});
 			}
 			throw new Error(
-				"Question widget did not load within 10 seconds. The question was automatically skipped. Use an installed Pi interactive tool through call if an answer is needed.",
+				"Question widget did not load within 10 seconds. The question was automatically skipped. Use an installed OMP interactive tool through call if an answer is needed.",
 			);
 		}
 	}
@@ -633,7 +882,7 @@ export class Broker {
 			if (chatId) this.#cooldown(chatId, sessionId);
 			return { ...result.resource, uri };
 		}
-		throw new Error("Pi session returned no resource");
+		throw new Error("OMP session returned no resource");
 	}
 
 	deliveries(chatId: string): DeliveryRecord[] {
@@ -1060,7 +1309,7 @@ export class Broker {
 			throw error;
 		});
 		if ("inspection" in result) return result;
-		throw new Error("Pi session returned no inspection");
+		throw new Error("OMP session returned no inspection");
 	}
 
 	async #ackInputs(
@@ -1071,7 +1320,7 @@ export class Broker {
 		signal.throwIfAborted();
 		if (inputs.length === 0) return;
 		const session = this.#sessions.get(sessionId);
-		if (!session) throw new Error(`Pi session ${sessionId} is offline`);
+		if (!session) throw new Error(`OMP session ${sessionId} is offline`);
 		await session.peer.send({
 			type: "ackInputs",
 			sessionId,
@@ -1159,7 +1408,7 @@ export class Broker {
 		signal: AbortSignal,
 	): Promise<SessionResult> {
 		const session = this.#sessions.get(sessionId);
-		if (!session) throw new Error(`Pi session ${sessionId} is offline`);
+		if (!session) throw new Error(`OMP session ${sessionId} is offline`);
 		if (signal.aborted) throw abortError(signal);
 		if (this.#pending.size >= 512)
 			throw new Error("Too many pending session requests");
@@ -1229,7 +1478,7 @@ export class Broker {
 
 	#removePeer(peer: JsonLinePeer<SessionMessage, BrokerMessage>): void {
 		for (const controller of this.#relays.get(peer)?.values() ?? []) {
-			controller.abort(new Error("Pi session disconnected"));
+			controller.abort(new Error("OMP session disconnected"));
 		}
 		this.#relays.delete(peer);
 		for (const [sessionId, session] of this.#sessions) {
@@ -1238,7 +1487,7 @@ export class Broker {
 		for (const [id, pending] of this.#pending) {
 			if (pending.peer !== peer) continue;
 			this.#finishRequest(id, pending);
-			pending.reject(new Error("Pi session disconnected"));
+			pending.reject(new Error("OMP session disconnected"));
 		}
 	}
 

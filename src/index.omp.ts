@@ -14,7 +14,6 @@ export default async function chappie(pi: OmpExtensionAPI): Promise<void> {
 		createOmpHostApi(pi, toolWireSchema),
 		agentDir,
 		config.connect,
-		"omp",
 		config.tls,
 		config.localTools === true,
 	);

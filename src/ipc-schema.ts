@@ -67,7 +67,7 @@ const session = z.strictObject({
 	device: name,
 	name: z.string().max(4096).optional(),
 	status: z.enum(["idle", "ready", "executing"]),
-	host: z.enum(["pi", "omp"]).optional(),
+	host: z.literal("omp"),
 	agentDir: path.optional(),
 });
 const listedSession = session.extend({ bindingCount: id });

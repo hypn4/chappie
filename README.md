@@ -1,10 +1,10 @@
 # Chappie
 
-Use ChatGPT to work through [Pi](https://github.com/earendil-works/pi) or [Oh My Pi (OMP)](https://github.com/can1357/oh-my-pi): edit local files, run commands, call agent extensions, exchange files and images, and move between sessions on one or more devices.
+Use ChatGPT to work through [Oh My Pi (OMP)](https://github.com/can1357/oh-my-pi): edit local files, run commands, call agent extensions, exchange files and images, and move between sessions on one or more devices.
 
 This is the maintained [hypn4/chappie](https://github.com/hypn4/chappie) fork of
 [zetaloop/chappie](https://github.com/zetaloop/chappie), published as
-`@hypn4/chappie`. It includes OMP support and connection and file-transfer fixes.
+`@hypn4/chappie`. It targets native OMP, MCP 2.0, durable operations, and completion events.
 The original MIT license and attribution are retained.
 
 ## Setup
@@ -12,21 +12,17 @@ The original MIT license and attribution are retained.
 The broker requires Bun 1.4.2 or newer. The repository, standalone broker,
 build, tests, package installation, and CI all use Bun.
 
-Install Chappie for the host you use:
+Use OMP 18.4.8 or newer within the supported 18.x release line. Install the extension:
 
 ```sh
-# Pi
-pi install npm:@hypn4/chappie
-
-# OMP
 omp plugin install @hypn4/chappie
 ```
 
-Omitting the version selects npm's `latest` tag. To install or update that
-version explicitly, run `omp plugin install @hypn4/chappie@latest`; use
-`omp plugin list` to inspect installed plugins. Release candidates are also
-available on `next`. Pin a version, such as `@hypn4/chappie@0.6.0-rc.1`,
-for reproducible installations, and pin the same version in the broker command.
+Omitting the version selects npm's `latest` tag. Install once with the command
+above, then update an existing OMP installation in place with
+`omp plugin upgrade @hypn4/chappie`; `omp plugin list` shows the resolved
+version. Pin the same released version in the plugin and broker command for
+reproducible installations. Uncommitted branch changes are not part of npm latest.
 
 Remove the upstream package or stop loading the source extension before enabling
 this package; both register the same `chappie/chatgpt` provider. Updating the
@@ -36,15 +32,7 @@ Run the broker through [otunnel](https://github.com/zetaloop/otunnel). Use
 `otunnel profiles list` to find the active profile; it is typically
 `~/.config/tunnel-client/chappie.yaml`.
 
-```yaml
-# Pi
-mcp:
-  commands:
-    - channel: main
-      command: pi --chappie
-```
-
-For OMP, run the standalone broker with [Bun](https://bun.sh/docs/pm/bunx).
+Run the standalone broker with [Bun](https://bun.sh/docs/pm/bunx).
 It works with unmodified OMP; it does not require `omp --chappie` or an OMP fork.
 
 ```yaml
@@ -73,16 +61,20 @@ otunnel run --profile chappie
 Add the tunnel as a developer-mode app in ChatGPT, then start the agent in a project:
 
 ```sh
-# Pi
-pi --provider chappie --model chatgpt
-
-# OMP
 omp --model chappie/chatgpt
 ```
 
 Call `sessions` or `init` from ChatGPT to connect to the agent session. When using
 an OMP profile or custom `PI_CONFIG_DIR` / `PI_CODING_AGENT_DIR`, launch otunnel
 and OMP with the same environment so the broker and session resolve the same socket.
+
+## Modern-only contract
+
+This branch is a breaking update from RC.9. The server only accepts MCP `2026-07-28`: it opens with `server/discover` and request-scoped metadata, and rejects legacy `initialize` with `-32022`. A tunnel/client that sends only the old handshake must be upgraded before deployment. Refresh the ChatGPT plugin tool/event catalog after deployment; an active old session is not hot-patched.
+
+Direct `read` takes native selectors in `path`, and direct `edit` takes the native hashline `input`. `offset`/`limit`, `patch`, Pi exact-text edits, and the Base64 calls alias are removed. `call` and `start_call` require a JSON `calls` array. The standalone Pi extension and its package dependencies are removed. Existing timestamped state and operation receipts are preserved; obsolete string bindings are rejected without rewriting the file. Never discard receipts to force migration or retry a side effect.
+
+OMP host packages remain optional peers because the standalone MCP broker runs in a different process and does not require an inference host installation. This is process separation, not support for an older OMP runtime. Use `OMP_PROFILE`; `PI_CONFIG_DIR` and `PI_CODING_AGENT_DIR` retain their current OMP-defined names. The historical `PI_PROFILE` alias is no longer interpreted by Chappie.
 
 ## Development
 
@@ -114,14 +106,11 @@ Restart otunnel after changing its broker command, then use `sessions` or
 After changing tool schemas, refresh the plugin connection in ChatGPT and test
 in a new conversation. Restarting the broker alone does not refresh cached tools.
 
-Pi and OMP use different local sockets by default: `~/.pi/agent/chappie.sock`
-and `~/.omp/agent/chappie.sock` (named pipes on Windows). The broker and agent
-must use the same endpoint; the host name alone does not filter sessions.
+The broker and extension use `~/.omp/agent/chappie.sock` or the corresponding Windows named pipe. They must use the same OMP profile and agent-directory configuration. OMP is the only accepted IPC host.
 
 `bun run check` runs formatting, type checks, and the Bun test suite.
 `bun run test:omp` builds the package and checks a temporary native OMP session
-without model inference. CI runs current OMP on Windows, verifies the OMP 18.3
-floor and packaged current OMP on Linux, and exercises otunnel 0.2 on Linux.
+without model inference. CI tests the pinned OMP 18.4.8 runtime and its packaged installation, including Windows process/path behavior. No old-runtime floor is installed.
 
 GitHub Actions publishes releases to npm using OIDC and the committed
 `publishConfig.tag`; routine releases do not require an npm login.
@@ -129,16 +118,15 @@ See [publishing](docs/publishing.md) for the release process.
 
 ## Usage
 
-Chappie exposes common coding tools directly and every active agent tool through `tools` and `call`. `chat` sends an assistant message to the agent, agent input accompanies later tool results, and `transfer` moves files between ChatGPT and the agent or between connected devices. `history` reads recent agent messages and activity with timestamps. `ask` can present a persistent question in ChatGPT when webpage questions are enabled.
+Chappie exposes common coding tools directly and every active agent tool through `tools` and `call`. Use `start_call` with a stable `operationId` for native batches that may outlive a ChatGPT MCP request, `get_operation` for repeatable result retrieval, and `cancel_operation` for explicit cancellation. Accepted detached execution is independent of the original request's cancellation signal; it does not make child processes survive the host exiting.
 
-See the [tool guide](docs/tools.md) for session selection, history, agent tools, webpage questions, and file transfer.
+On MCP 2.0, Chappie exposes the `operation.finished` event through OpenAI's MCP Events webhook profile. Completion and its notification outbox are persisted together. An authorized ChatGPT subscription can receive completion without keeping a long tool request open. Deploy and rescan before testing that host-side lifecycle; no heartbeat or fake MCP Tasks capability is required.
+
+`chat` sends assistant messages to the agent, `history` reads native progress, and `transfer` moves files between connected environments. See the [tool guide](docs/tools.md) for session selection, operation lifetime, completion events, and file transfer.
 
 ## Configuration
 
-`chappie.json` lives in the selected host's agent directory:
-
-- Pi: `~/.pi/agent/chappie.json`
-- OMP: `~/.omp/agent/chappie.json`
+`chappie.json` lives in the OMP agent directory, normally `~/.omp/agent/chappie.json`.
 
 Local-only use needs no network settings. For sessions on another device,
 configure mutual TLS with a private CA and a separate certificate/key per

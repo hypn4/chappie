@@ -4,7 +4,7 @@ import {
 	type AssistantMessageEventStream,
 	createAssistantMessageEventStream,
 	type ToolCall,
-} from "@earendil-works/pi-ai";
+} from "@oh-my-pi/pi-ai";
 import type { Source } from "./activity.ts";
 
 export interface ChappieStreamOptions {
@@ -42,7 +42,7 @@ export class ProviderOutput {
 				totalTokens: 0,
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 			},
-			stopReason: "pending",
+			stopReason: "stop",
 			timestamp: Date.now(),
 		};
 		const completion = Promise.withResolvers<void>();

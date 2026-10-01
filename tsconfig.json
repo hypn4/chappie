@@ -13,7 +13,7 @@
 		"resolveJsonModule": true,
 		"skipLibCheck": true,
 		"strict": true,
-		"target": "ES2024",
+		"target": "ESNext",
 		"types": ["node"],
 		"verbatimModuleSyntax": true
 	},

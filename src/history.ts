@@ -1,4 +1,4 @@
-import type { SessionEntry } from "@earendil-works/pi-coding-agent";
+import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import * as z from "zod";
 import type { Activity, Source } from "./activity.ts";
 import { toolResultsContent } from "./delivery.ts";

@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type { BigIntStats } from "node:fs";
 import { open, stat } from "node:fs/promises";
 import { basename } from "node:path";
-import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
+import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
 import mime from "mime";
 
 export interface ResourceDescriptor {

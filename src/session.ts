@@ -3,18 +3,13 @@ import { access } from "node:fs/promises";
 import { hostname } from "node:os";
 import { resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import type { UserMessage } from "@earendil-works/pi-ai";
-import type {
-	ExtensionAPI as PiExtensionAPI,
-	ExtensionContext as PiExtensionContext,
-	SessionEntry,
-} from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
+import type { UserMessage } from "@oh-my-pi/pi-ai";
 import type {
 	ExtensionAPI as OmpExtensionAPI,
 	ExtensionContext as OmpExtensionContext,
 	ToolInfo as OmpToolInfo,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import {
 	type Activity,
 	chatLabel,
@@ -25,7 +20,6 @@ import {
 import type { NetworkTlsConfig } from "./config.ts";
 import type { DeliveryRecord } from "./delivery.ts";
 import { type HistoryRange, historyResult } from "./history.ts";
-import { directHostCall, directHostResults } from "./host-tools.ts";
 import {
 	type BrokerMessage,
 	IpcClient,
@@ -67,57 +61,30 @@ interface Notice extends Activity {
 	type: "info" | "warning" | "error";
 }
 
-type SessionHost = "pi" | "omp";
-
-interface ChappieHostAPI {
-	appendEntry(customType: string, data?: unknown): void;
-	getSessionName(): string | undefined;
-	getActiveTools(): string[];
+type OmpHostApi = Pick<
+	OmpExtensionAPI,
+	"appendEntry" | "getSessionName" | "getActiveTools" | "sendMessage"
+> & {
 	getAllTools(): SessionToolInfo[];
 	getCommands(): SessionSkillInfo[];
-	sendMessage(
-		message: { customType: string; content: string; display: boolean },
-		options?: { triggerTurn?: boolean },
-	): void;
-}
+};
 
-interface ChappieSessionManager {
-	getSessionId(): string;
-	getCwd(): string;
-	getLeafId(): string | null;
-	getLeafEntry(): SessionEntry | undefined;
-	getEntry(id: string): SessionEntry | undefined;
-	getBranch(): SessionEntry[];
-}
-
-interface ChappieContext {
-	ui: {
-		notify(message: string, type?: "info" | "warning" | "error"): void;
-	};
+type ChappieContext = Pick<
+	OmpExtensionContext,
+	"ui" | "sessionManager" | "isIdle" | "abort"
+> & {
 	readonly cwd: string;
-	readonly model: { provider: string } | undefined;
-	sessionManager: ChappieSessionManager;
-	isIdle(): boolean;
-	abort(): void;
-}
+	readonly model:
+		| Pick<NonNullable<OmpExtensionContext["model"]>, "provider">
+		| undefined;
+};
 
 type OmpWireSchema = (tool: OmpToolInfo) => Record<string, unknown>;
-
-export function createPiHostApi(pi: PiExtensionAPI): ChappieHostAPI {
-	return {
-		appendEntry: (customType, data) => pi.appendEntry(customType, data),
-		getSessionName: () => pi.getSessionName(),
-		getActiveTools: () => pi.getActiveTools(),
-		getAllTools: () => pi.getAllTools(),
-		getCommands: () => pi.getCommands(),
-		sendMessage: (message, options) => pi.sendMessage(message, options),
-	};
-}
 
 export function createOmpHostApi(
 	pi: OmpExtensionAPI,
 	wireSchema: OmpWireSchema,
-): ChappieHostAPI {
+): OmpHostApi {
 	return {
 		appendEntry: (customType, data) => pi.appendEntry(customType, data),
 		getSessionName: () => pi.getSessionName(),
@@ -139,22 +106,6 @@ export function createOmpHostApi(
 	};
 }
 
-function adaptPiContext(context: PiExtensionContext): ChappieContext {
-	const sessionManager = context.sessionManager;
-	return {
-		ui: context.ui,
-		get cwd() {
-			return sessionManager.getCwd();
-		},
-		get model() {
-			return context.model ? { provider: context.model.provider } : undefined;
-		},
-		sessionManager,
-		isIdle: () => context.isIdle(),
-		abort: () => context.abort(),
-	};
-}
-
 function adaptOmpContext(context: OmpExtensionContext): ChappieContext {
 	const sessionManager = context.sessionManager;
 	return {
@@ -165,17 +116,7 @@ function adaptOmpContext(context: OmpExtensionContext): ChappieContext {
 		get model() {
 			return context.model ? { provider: context.model.provider } : undefined;
 		},
-		sessionManager: {
-			getSessionId: () => sessionManager.getSessionId(),
-			getCwd: () => sessionManager.getCwd(),
-			getLeafId: () => sessionManager.getLeafId(),
-			// SAFETY: Chappie only consumes the shared persisted entry fields
-			// (type/id/parent/message/custom payloads) that Pi and OMP keep compatible.
-			getLeafEntry: () =>
-				sessionManager.getLeafEntry() as SessionEntry | undefined,
-			getEntry: (id) => sessionManager.getEntry(id) as SessionEntry | undefined,
-			getBranch: () => sessionManager.getBranch() as SessionEntry[],
-		},
+		sessionManager,
 		isIdle: () => context.isIdle(),
 		abort: () => context.abort(),
 	};
@@ -221,10 +162,9 @@ interface GenerationRequest {
 }
 
 export class LocalSession {
-	readonly #api: ChappieHostAPI;
+	readonly #api: OmpHostApi;
 	readonly #agentDir: string;
 	readonly #connect: string | undefined;
-	readonly #host: SessionHost;
 	readonly #tls: NetworkTlsConfig | undefined;
 	readonly #localTools: boolean;
 	readonly #syncs = new Map<number, SyncRequest>();
@@ -258,85 +198,21 @@ export class LocalSession {
 	#latestOmpContext: OmpExtensionContext | undefined;
 
 	constructor(
-		api: ChappieHostAPI,
+		api: OmpHostApi,
 		agentDir: string,
 		connect?: string,
-		host: SessionHost = "pi",
 		tls?: NetworkTlsConfig,
 		localTools = false,
 	) {
 		this.#api = api;
 		this.#agentDir = agentDir;
 		this.#connect = connect;
-		this.#host = host;
 		this.#tls = tls;
 		this.#localTools = localTools;
 	}
 
 	get localTools(): boolean {
 		return this.#localTools;
-	}
-
-	installPi(pi: PiExtensionAPI): void {
-		pi.registerEntryRenderer<Notice>(
-			"chappie.notice",
-			({ data }, _options, theme) => {
-				if (!data) return;
-				return new Text(
-					theme.fg(data.type === "info" ? "dim" : data.type, data.message),
-					1,
-					0,
-				);
-			},
-		);
-		pi.on("session_start", (_event, context) =>
-			this.#update(adaptPiContext(context)),
-		);
-		pi.on("model_select", (event, context) =>
-			this.#update(adaptPiContext(context), event.model.provider === "chappie"),
-		);
-		pi.on("session_info_changed", (_event, context) => {
-			this.#context = adaptPiContext(context);
-			void this.#sync().catch(() => {});
-		});
-		pi.on("session_tree", (event, context) => {
-			const shared = adaptPiContext(context);
-			this.#context = shared;
-			if (shared.model?.provider === "chappie") {
-				this.#resetInputs(shared, event.newLeafId);
-			}
-			this.#historyChanged();
-		});
-		// Pi persists messages after message_end handlers finish.
-		pi.on("message_start", (_event, context) => {
-			this.#context = adaptPiContext(context);
-			this.#historyChanged();
-		});
-		pi.on("tool_call", (_event, context) => {
-			this.#context = adaptPiContext(context);
-			this.#historyChanged();
-		});
-		pi.on("session_compact", (_event, context) => {
-			this.#context = adaptPiContext(context);
-			this.#historyChanged();
-		});
-		pi.on("context", (event, context) => ({
-			messages:
-				context.model?.provider === "chappie"
-					? []
-					: event.messages.filter(
-							(message) =>
-								message.role !== "custom" ||
-								message.customType !== "chappie.request",
-						),
-		}));
-		pi.on("turn_end", (event, context) =>
-			this.#turnEnd(event.message, event.toolResults, adaptPiContext(context)),
-		);
-		pi.on("agent_settled", (_event, context) =>
-			this.#settled(adaptPiContext(context)),
-		);
-		pi.on("session_shutdown", () => this.close());
 	}
 
 	installOmp(pi: OmpExtensionAPI): void {
@@ -476,15 +352,26 @@ export class LocalSession {
 	#observeOmpSession(context: OmpExtensionContext): void {
 		const manager = context.sessionManager;
 		if (manager === this.#ompSessionManager) return;
-		this.#ompSessionNameUnsubscribe?.();
-		this.#ompSessionManager = manager;
-		const observable = manager as typeof manager & {
-			onSessionNameChanged?: (callback: () => void) => () => void;
-		};
-		this.#ompSessionNameUnsubscribe = observable.onSessionNameChanged?.(() => {
+		// OMP exposes the native observer at runtime but omits it from its
+		// read-only type view. Require the contract; do not silently fall back.
+		if (
+			!("onSessionNameChanged" in manager) ||
+			typeof manager.onSessionNameChanged !== "function"
+		)
+			throw new Error(
+				"OMP session manager must support name-change subscriptions",
+			);
+		const unsubscribe: unknown = manager.onSessionNameChanged(() => {
 			const current = this.#latestOmpContext;
 			if (current?.sessionManager === manager) this.#refreshOmpContext(current);
 		});
+		if (typeof unsubscribe !== "function")
+			throw new Error(
+				"OMP name-change subscription must return an unsubscribe function",
+			);
+		this.#ompSessionNameUnsubscribe?.();
+		this.#ompSessionManager = manager;
+		this.#ompSessionNameUnsubscribe = () => unsubscribe();
 	}
 
 	#stopOmpSessionObservers(): void {
@@ -525,7 +412,7 @@ export class LocalSession {
 				type,
 				...activity,
 			});
-			if (this.#host === "omp") this.#context.ui.notify(message, type);
+			this.#context.ui.notify(message, type);
 		}
 		if (activity.event !== "history") this.#historyChanged();
 	}
@@ -972,7 +859,7 @@ export class LocalSession {
 			id: context.sessionManager.getSessionId(),
 			cwd: context.cwd,
 			device: hostname(),
-			host: this.#host,
+			host: "omp",
 			agentDir: this.#agentDir,
 			status: this.#status,
 			...(name ? { name } : {}),
@@ -1176,7 +1063,7 @@ export class LocalSession {
 				) {
 					await this.#sendError(
 						message.id,
-						"The requested Pi session is no longer active",
+						"The requested OMP session is no longer active",
 					);
 					break;
 				}
@@ -1215,29 +1102,7 @@ export class LocalSession {
 					});
 					break;
 				}
-				if (message.type === "call" && message.direct) {
-					try {
-						this.#queue.push({
-							...message,
-							calls: message.calls.map((call) => ({
-								...call,
-								arguments: directHostCall(
-									this.#host,
-									call,
-									this.#api
-										.getAllTools()
-										.find((tool) => tool.name === call.name),
-								).arguments,
-							})),
-						});
-					} catch (error) {
-						await this.#sendError(
-							message.id,
-							error instanceof Error ? error.message : String(error),
-						);
-						break;
-					}
-				} else this.#queue.push(message);
+				this.#queue.push(message);
 				this.#dispatch();
 				break;
 		}
@@ -1284,7 +1149,7 @@ export class LocalSession {
 				signal,
 			);
 			if (!("resource" in result))
-				throw new Error("Pi session returned no resource");
+				throw new Error("OMP session returned no resource");
 			const data = Buffer.from(result.resource.blob, "base64");
 			if (data.length === 0)
 				throw new Error(
@@ -1310,7 +1175,7 @@ export class LocalSession {
 		try {
 			const context = this.#context;
 			if (context?.sessionManager.getSessionId() !== request.sessionId)
-				throw new Error("The requested Pi session is no longer active");
+				throw new Error("The requested OMP session is no longer active");
 			const history = historyResult(
 				context.sessionManager.getBranch(),
 				request.sessionId,
@@ -1484,8 +1349,7 @@ export class LocalSession {
 		if (
 			failure === undefined &&
 			message !== active.message &&
-			(this.#host !== "omp" ||
-				!sameSource(responseSource, active.message.chappie))
+			!sameSource(responseSource, active.message.chappie)
 		)
 			return;
 		if (failure === undefined && active.request.type === "call") {
@@ -1515,16 +1379,13 @@ export class LocalSession {
 			);
 			if (missing.length)
 				active.error ??= `No results for calls ${missing.join(", ")}`;
-			active.toolResults =
-				this.#host === "omp" && active.request.direct
-					? directHostResults(active.request.calls, ordered)
-					: ordered;
+			active.toolResults = ordered;
 		} else {
 			active.toolResults = toolResults;
 		}
 		active.completed = true;
 		if (this.#retired.delete(active.id)) this.#retainResult(active);
-		else if (this.#host === "omp") {
+		else {
 			// A completed tool batch belongs to its caller even when OMP continues
 			// for a TODO reminder or background work. Do not wait for another stream.
 			await this.#completeActive();
@@ -1703,7 +1564,7 @@ export class LocalSession {
 		this.#operations.set(id, operation);
 		try {
 			if (sessionId !== this.#sessionId)
-				throw new Error("The requested Pi session is no longer active");
+				throw new Error("The requested OMP session is no longer active");
 			operation.controller.signal.throwIfAborted();
 			const result = await response(operation.controller.signal);
 			operation.controller.signal.throwIfAborted();

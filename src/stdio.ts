@@ -1,11 +1,22 @@
 import { Writable } from "node:stream";
 import {
+	type ServeStdioOptions,
 	StdioServerTransport,
 	serveStdio,
 } from "@modelcontextprotocol/server/stdio";
 import { Broker } from "./broker.ts";
 import { createServer } from "./server.ts";
 
+/** All callers, including protocol tests, use the same modern-only boundary. */
+export function serveMcp(
+	broker: Broker,
+	options: Pick<ServeStdioOptions, "transport" | "onerror"> = {},
+) {
+	return serveStdio(() => createServer(broker), {
+		...options,
+		legacy: "reject",
+	});
+}
 const terminationSignals =
 	process.platform === "win32"
 		? ["SIGINT", "SIGTERM"]
@@ -20,11 +31,8 @@ export async function serveChappie(agentDir: string): Promise<never> {
 		},
 	});
 	const transport = new StdioServerTransport(process.stdin, output);
-	let stop: (() => void) | undefined;
-	const stopped = new Promise<void>((resolve) => {
-		stop = resolve;
-	});
-	const requestStop = (): void => stop?.();
+	const { promise: stopped, resolve: requestStop } =
+		Promise.withResolvers<void>();
 
 	output.once("error", requestStop);
 	process.stdin.once("end", requestStop);
@@ -33,7 +41,7 @@ export async function serveChappie(agentDir: string): Promise<never> {
 		process.once(signal, requestStop);
 	}
 
-	const handle = serveStdio(() => createServer(broker), {
+	const handle = serveMcp(broker, {
 		transport,
 		onerror(error) {
 			console.error(error);

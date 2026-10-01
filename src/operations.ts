@@ -7,14 +7,25 @@ export interface OperationResource extends ResourceDescriptor {
 	sourceReadAt?: number | undefined;
 }
 
+export type OperationStatus =
+	| "running"
+	| "completed"
+	| "failed"
+	| "cancelled"
+	| "uncertain";
+
 export interface OperationReceipt {
 	key: string;
+	/** Stable caller-visible identifier for detached operations. */
+	operationId?: string | undefined;
 	signature: string;
 	chatId: string;
 	sessionId: string;
 	cwd: string;
-	status: "running" | "completed" | "uncertain";
+	createdAt?: number | undefined;
+	status: OperationStatus;
 	updatedAt: number;
+	error?: string | undefined;
 	resources?: OperationResource[] | undefined;
 }
 
@@ -23,6 +34,25 @@ export interface ReplayReceipt {
 	status: OperationReceipt["status"];
 	replayed: true;
 	delivery?: { hostReceipt: "unconfirmed"; resources: OperationResource[] };
+}
+
+export interface OperationView {
+	operationId: string;
+	status: OperationStatus;
+	sessionId: string;
+	cwd: string;
+	updatedAt: number;
+	error?: string | undefined;
+	resources?: OperationResource[] | undefined;
+}
+
+export function validateOperationId(value: unknown): string {
+	if (typeof value !== "string" || !value.trim() || value.length > 128) {
+		throw new Error(
+			"operationId must be a nonempty identifier of at most 128 characters",
+		);
+	}
+	return value;
 }
 
 /** Canonical JSON allows equivalent object key ordering without widening intent. */
@@ -44,29 +74,27 @@ export function operationIdentity(
 	kind: "call" | "chat",
 	requestId: unknown,
 	payload: ToolInput[] | string,
-): { key: string; signature: string } | undefined {
+	explicitOperationId?: unknown,
+): { key: string; signature: string; operationId?: string } | undefined {
+	const operationId =
+		explicitOperationId === undefined
+			? undefined
+			: validateOperationId(explicitOperationId);
 	let id =
-		typeof requestId === "string" && requestId.length > 0
+		operationId ??
+		(typeof requestId === "string" && requestId.length > 0
 			? requestId
-			: undefined;
-	let scope = "request";
+			: undefined);
+	let scope = operationId ? "operation" : "request";
 	let content: unknown = payload;
 	if (Array.isArray(payload)) {
 		const single = payload.length === 1 ? payload[0] : undefined;
 		if (
+			!operationId &&
 			single?.name === "transfer" &&
 			single.arguments.operationId !== undefined
 		) {
-			const requested = single.arguments.operationId;
-			if (
-				typeof requested !== "string" ||
-				!requested.trim() ||
-				requested.length > 128
-			) {
-				throw new Error(
-					"transfer.operationId must be a nonempty identifier of at most 128 characters",
-				);
-			}
+			const requested = validateOperationId(single.arguments.operationId);
 			id = requested;
 			scope = "operation";
 		}
@@ -94,6 +122,7 @@ export function operationIdentity(
 			};
 		});
 	}
+
 	if (!id) return undefined;
 	return {
 		key: createHash("sha256")
@@ -102,6 +131,23 @@ export function operationIdentity(
 		signature: createHash("sha256")
 			.update(JSON.stringify(canonical(content)))
 			.digest("hex"),
+		...(operationId ? { operationId } : {}),
+	};
+}
+
+export function operationView(receipt: OperationReceipt): OperationView {
+	if (!receipt.operationId)
+		throw new Error("Operation has no caller-visible identifier");
+	return {
+		operationId: receipt.operationId,
+		status: receipt.status,
+		sessionId: receipt.sessionId,
+		cwd: receipt.cwd,
+		updatedAt: receipt.updatedAt,
+		...(receipt.error ? { error: receipt.error } : {}),
+		...(receipt.resources?.length
+			? { resources: structuredClone(receipt.resources) }
+			: {}),
 	};
 }
 

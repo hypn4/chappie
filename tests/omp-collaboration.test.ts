@@ -25,6 +25,7 @@ function fixtureSession() {
 						id: "REMOTE",
 						cwd: "/remote",
 						device: "fixture",
+						host: "omp",
 						status: "idle",
 						bindingCount: 0,
 					},
@@ -38,6 +39,7 @@ function fixtureSession() {
 					id: sessionId,
 					cwd: "/remote",
 					device: "fixture",
+					host: "omp",
 					status: "idle",
 				},
 				tools: [

@@ -1,9 +1,24 @@
 import { readFileSync } from "node:fs";
-import { McpServer, ResourceTemplate } from "@modelcontextprotocol/server";
+import {
+	McpServer,
+	ProtocolError,
+	ProtocolErrorCode,
+	ResourceTemplate,
+} from "@modelcontextprotocol/server";
 import * as z from "zod";
 import packageJson from "../package.json" with { type: "json" };
 import type { Broker } from "./broker.ts";
 import { deliveryContent } from "./delivery.ts";
+import {
+	EVENT_DEFINITION,
+	eventsListParamsSchema,
+	eventsListResultSchema,
+	eventsSubscribeParamsSchema,
+	eventsSubscribeResultSchema,
+	eventsUnsubscribeParamsSchema,
+	eventsUnsubscribeResultSchema,
+	OPERATION_FINISHED_EVENT,
+} from "./event-types.ts";
 import { historyInput } from "./history.ts";
 import {
 	answerContent,
@@ -13,7 +28,6 @@ import {
 	questionOutput,
 } from "./questions.ts";
 import {
-	decodeBase64ToolCalls,
 	directTools,
 	inputContent,
 	type ToolInput,
@@ -29,7 +43,7 @@ const outputSchema = z.object({
 	text: z
 		.string()
 		.describe(
-			"Complete text output, including Pi user input, submitted webpage answers, and deferred results. Images and file resources accompany it as native content blocks.",
+			"Complete text output, including OMP user input, submitted webpage answers, and deferred results. Images and file resources accompany it as native content blocks.",
 		),
 });
 
@@ -42,14 +56,31 @@ const nativeCallsSchema = z.array(nativeCallSchema).min(1).max(128);
 const questionTemplate = "ui://chappie/question.html";
 const questionSchema = outputSchema.extend({ question: questionOutput });
 function toolAnnotations(name: string) {
-	const readOnly = ["tools", "read", "history", "sessions"].includes(name);
-	const dangerous = ["call", "bash", "write", "edit", "transfer"].includes(
-		name,
-	);
+	const readOnly = [
+		"tools",
+		"read",
+		"history",
+		"sessions",
+		"get_operation",
+	].includes(name);
+	const dangerous = [
+		"call",
+		"start_call",
+		"cancel_operation",
+		"bash",
+		"write",
+		"edit",
+		"transfer",
+	].includes(name);
 	return {
 		readOnlyHint: readOnly,
 		destructiveHint: dangerous,
-		idempotentHint: readOnly || name === "init" || name === "transfer",
+		idempotentHint:
+			readOnly ||
+			name === "init" ||
+			name === "transfer" ||
+			name === "start_call" ||
+			name === "cancel_operation",
 		openWorldHint: dangerous || name === "read",
 	};
 }
@@ -61,7 +92,22 @@ interface RequestContext {
 	};
 }
 
+function callbackEndpointError(error: unknown): ProtocolError {
+	const message = error instanceof Error ? error.message : String(error);
+	const lower = message.toLowerCase();
+	const reason = lower.includes("timeout")
+		? "timeout"
+		: lower.includes("challenge")
+			? "challenge_failed"
+			: lower.includes("https") || lower.includes("public")
+				? "invalid_url"
+				: "verification_failed";
+	return new ProtocolError(-32015, "Callback endpoint verification failed", {
+		reason,
+	});
+}
 export function createServer(broker: Broker): McpServer {
+	const capabilities = { tools: {}, events: {} };
 	const server = new McpServer(
 		{
 			name: "chappie",
@@ -72,6 +118,7 @@ export function createServer(broker: Broker): McpServer {
 				instructions,
 				...(broker.askEnabled ? [questionInstructions] : []),
 			].join("\n\n"),
+			capabilities,
 		},
 	);
 
@@ -88,15 +135,15 @@ export function createServer(broker: Broker): McpServer {
 	server.registerTool(
 		"init",
 		{
-			title: "Connect to Pi",
+			title: "Connect to OMP",
 			description:
-				"Select this chat's default Pi session and return its environment, tool catalog, and participation instructions. Use the task's sessionId to resume, or find it by cwd/name with sessions. For a task without a specified target, omit sessionId to reuse the default or select the first online, unbound session. Read recent history when resuming work.",
+				"Select this chat's default OMP session and return its environment, tool catalog, and participation instructions. Use the task's sessionId to resume, or find it by cwd/name with sessions. For a task without a specified target, omit sessionId to reuse the default or select the first online, unbound session. Read recent history when resuming work.",
 			outputSchema,
 			inputSchema: z.object({
 				sessionId: z
 					.string()
 					.optional()
-					.describe("Default Pi session ID; may be shared with other chats"),
+					.describe("Default OMP session ID; may be shared with other chats"),
 			}),
 			annotations: toolAnnotations("init"),
 		},
@@ -120,9 +167,9 @@ export function createServer(broker: Broker): McpServer {
 	server.registerTool(
 		"chat",
 		{
-			title: "Reply in Pi",
+			title: "Reply in OMP",
 			description:
-				"Send a Markdown assistant message to Pi. When modelRequest is returned by a prior Chappie result, set replyTo to that modelRequest ID.",
+				"Send a Markdown assistant message to OMP. When modelRequest is returned by a prior Chappie result, set replyTo to that modelRequest ID.",
 			outputSchema,
 			inputSchema: z.object({
 				text: z.string().min(1).describe("Assistant message in Markdown"),
@@ -130,13 +177,15 @@ export function createServer(broker: Broker): McpServer {
 					.string()
 					.optional()
 					.describe(
-						"Pi session for this operation; becomes the default if none is set",
+						"OMP session for this operation; becomes the default if none is set",
 					),
 				replyTo: z
 					.string()
 					.min(1)
 					.optional()
-					.describe("Model request ID to answer instead of starting a Pi turn"),
+					.describe(
+						"Model request ID to answer instead of starting a OMP turn",
+					),
 			}),
 			annotations: toolAnnotations("chat"),
 		},
@@ -179,7 +228,7 @@ export function createServer(broker: Broker): McpServer {
 						.string()
 						.optional()
 						.describe(
-							"Pi session for this question; defaults to this chat's session",
+							"OMP session for this question; defaults to this chat's session",
 						),
 				}),
 				outputSchema: questionSchema,
@@ -215,7 +264,7 @@ export function createServer(broker: Broker): McpServer {
 			{
 				title: "Assert question display",
 				description:
-					"Confirm that an ask widget loaded in ChatGPT. Call immediately after ask with question.id. Fails after 10 seconds without loading and records the question as skipped. Use a Pi interactive tool if an answer is needed. User answers arrive separately as webAnswer.",
+					"Confirm that an ask widget loaded in ChatGPT. Call immediately after ask with question.id. Fails after 10 seconds without loading and records the question as skipped. Use a OMP interactive tool if an answer is needed. User answers arrive separately as webAnswer.",
 				inputSchema: z.object({
 					questionId: z.string().describe("question.id returned by ask"),
 				}),
@@ -307,9 +356,9 @@ export function createServer(broker: Broker): McpServer {
 	server.registerTool(
 		"tools",
 		{
-			title: "Pi tools",
+			title: "OMP tools",
 			description:
-				"Get full definitions of Pi tools for call. Filter by names, or omit names to list all active tools.",
+				"Get full definitions of OMP tools for call. Filter by names, or omit names to list all active tools.",
 			outputSchema,
 			inputSchema: z.object({
 				names: z
@@ -321,7 +370,7 @@ export function createServer(broker: Broker): McpServer {
 					.string()
 					.optional()
 					.describe(
-						"Pi session for this operation; becomes the default if none is set",
+						"OMP session for this operation; becomes the default if none is set",
 					),
 			}),
 			annotations: toolAnnotations("tools"),
@@ -354,43 +403,21 @@ export function createServer(broker: Broker): McpServer {
 	server.registerTool(
 		"call",
 		{
-			title: "Call Pi tools",
+			title: "Call OMP tools",
 			description:
-				"Execute Pi tools using the definitions returned by tools. Each calls array is one native Pi batch.",
+				"Execute OMP tools using the definitions returned by tools. Each calls array is one native OMP batch.",
 			outputSchema,
-			inputSchema: z
-				.object({
-					calls: nativeCallsSchema.optional(),
-					base64: z
-						.string()
-						.optional()
-						.describe("Optional Base64-encoded UTF-8 JSON calls array"),
-					sessionId: z
-						.string()
-						.optional()
-						.describe(
-							"Pi session for this operation; becomes the default if none is set",
-						),
-				})
-				.refine(
-					(value) =>
-						(value.calls === undefined) !== (value.base64 === undefined),
-					{ message: "Supply exactly one of calls or base64" },
-				),
+			inputSchema: z.strictObject({
+				calls: nativeCallsSchema,
+				sessionId: z.string().optional().describe("OMP session for this batch"),
+			}),
 			annotations: toolAnnotations("call"),
 		},
 		handle(async (args, context) => {
-			let calls: ToolInput[];
-			if (args.calls) calls = args.calls;
-			else {
-				if (!args.base64)
-					throw new Error("Supply exactly one of calls or base64");
-				calls = nativeCallsSchema.parse(decodeBase64ToolCalls(args.base64));
-			}
 			const result = await broker.call(
 				requireChatId(context),
 				args.sessionId,
-				calls,
+				args.calls,
 				context.mcpReq._meta?.["otunnel/requestId"],
 				context.mcpReq.signal,
 			);
@@ -405,6 +432,189 @@ export function createServer(broker: Broker): McpServer {
 					result.initialization,
 					result.replay,
 				),
+			);
+		}),
+	);
+
+	server.registerTool(
+		"start_call",
+		{
+			title: "Start long OMP tool batch",
+			description:
+				"Start a native OMP tool batch independently of this ChatGPT MCP request. Returns durable operation status, not an MCP Tasks handle. Subscribe to operation.finished for completion, or use get_operation to recover the result. Reuse the same operationId for transport retries; never change its arguments.",
+			outputSchema,
+			inputSchema: z.strictObject({
+				operationId: z
+					.string()
+					.trim()
+					.min(1)
+					.max(128)
+					.describe("Stable identifier; reuse only for the same operation."),
+				calls: nativeCallsSchema,
+				sessionId: z
+					.string()
+					.optional()
+					.describe("OMP session for this operation"),
+			}),
+			annotations: toolAnnotations("start_call"),
+		},
+		handle(async (args, context) => {
+			const result = await broker.startCall(
+				requireChatId(context),
+				args.sessionId,
+				args.calls,
+				args.operationId,
+				context.mcpReq._meta?.["otunnel/requestId"],
+				context.mcpReq.signal,
+			);
+			return finishResult(
+				broker,
+				context,
+				textResult({
+					operation: result.operation,
+					...(result.initialization
+						? { initialization: result.initialization }
+						: {}),
+				}),
+			);
+		}),
+	);
+
+	server.server.setRequestHandler(
+		"events/list",
+		{
+			params: eventsListParamsSchema,
+			result: eventsListResultSchema,
+		},
+		async (_params, context) => {
+			requireChatId(context);
+			return eventsListResultSchema.parse({
+				events: [EVENT_DEFINITION],
+			});
+		},
+	);
+	server.server.setRequestHandler(
+		"events/subscribe",
+		{
+			params: eventsSubscribeParamsSchema,
+			result: eventsSubscribeResultSchema,
+		},
+		async (params, context) => {
+			const chatId = requireChatId(context);
+			try {
+				broker.operation(chatId, params.arguments.operation_id);
+			} catch {
+				throw new ProtocolError(
+					ProtocolErrorCode.InvalidParams,
+					"Unknown operation_id for this conversation",
+				);
+			}
+			let subscription: Awaited<ReturnType<Broker["subscribeOperationEvent"]>>;
+			try {
+				subscription = await broker.subscribeOperationEvent(
+					chatId,
+					params.arguments.operation_id,
+					params.delivery.url,
+					params.delivery.secret,
+					params.ttlMs,
+					context.mcpReq.signal,
+				);
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				if (message.toLowerCase().includes("signing secret"))
+					throw new ProtocolError(ProtocolErrorCode.InvalidParams, message);
+				throw callbackEndpointError(error);
+			}
+			return eventsSubscribeResultSchema.parse({
+				id: subscription.id,
+				refreshBefore:
+					subscription.expiresAt === null
+						? null
+						: new Date(subscription.expiresAt).toISOString(),
+				cursor: null,
+				truncated: false,
+			});
+		},
+	);
+	server.server.setRequestHandler(
+		"events/unsubscribe",
+		{
+			params: eventsUnsubscribeParamsSchema,
+			result: eventsUnsubscribeResultSchema,
+		},
+		async (params, context) => {
+			const chatId = requireChatId(context);
+			if (params.name !== OPERATION_FINISHED_EVENT)
+				throw new ProtocolError(
+					ProtocolErrorCode.InvalidParams,
+					"Unknown event name",
+				);
+			await broker.unsubscribeOperationEvent(
+				chatId,
+				params.arguments.operation_id,
+				params.delivery.url,
+			);
+			return eventsUnsubscribeResultSchema.parse({});
+		},
+	);
+
+	server.registerTool(
+		"get_operation",
+		{
+			title: "Get long operation status",
+			description:
+				"Read the durable status and retained native result of a start_call operation. Completion refers to the native batch, not child jobs it may have started. Result retrieval is repeatable; it never re-executes the work.",
+			outputSchema,
+			inputSchema: z.object({
+				operationId: z.string().trim().min(1).max(128),
+			}),
+			annotations: toolAnnotations("get_operation"),
+		},
+		handle(async ({ operationId }, context) => {
+			const result = broker.operation(requireChatId(context), operationId);
+			const formatted = await finishResult(
+				broker,
+				context,
+				{
+					content: [
+						...textResult({ operation: result.operation }).content,
+						...(result.result
+							? toolResult(
+									result.result.toolResults,
+									result.result.sessionId,
+									result.result.cwd,
+								).content
+							: deliveryContent(result.deliveries)),
+					],
+				},
+				false,
+			);
+			await broker.acknowledge(result.deliveries, [], context.mcpReq.signal);
+			return formatted;
+		}),
+	);
+
+	server.registerTool(
+		"cancel_operation",
+		{
+			title: "Cancel long operation",
+			description:
+				"Cancel a running operation started with start_call. Cancellation is explicit and independent of the originating ChatGPT MCP request. Repeating cancellation is safe and returns the current durable state.",
+			outputSchema,
+			inputSchema: z.object({
+				operationId: z.string().trim().min(1).max(128),
+			}),
+			annotations: toolAnnotations("cancel_operation"),
+		},
+		handle(async ({ operationId }, context) => {
+			const result = await broker.cancelOperation(
+				requireChatId(context),
+				operationId,
+			);
+			return finishResult(
+				broker,
+				context,
+				textResult({ operation: result.operation }),
 			);
 		}),
 	);
@@ -460,12 +670,12 @@ export function createServer(broker: Broker): McpServer {
 		{
 			title: "Session history",
 			description:
-				"Read Pi history with entry IDs and timestamps. Use before/after to page the current branch, and wait to follow new progress when caught up. Set observer when reading as an observer. An explicit sessionId applies only to this read.",
+				"Read OMP history with entry IDs and timestamps. Use before/after to page the current branch, and wait to follow new progress when caught up. Set observer when reading as an observer. An explicit sessionId applies only to this read.",
 			inputSchema: historyInput.extend({
 				sessionId: z
 					.string()
 					.optional()
-					.describe("Pi session to read; defaults to this chat's session"),
+					.describe("OMP session to read; defaults to this chat's session"),
 			}),
 			outputSchema,
 			annotations: toolAnnotations("history"),
@@ -496,13 +706,13 @@ export function createServer(broker: Broker): McpServer {
 		{
 			title: "Local sessions",
 			description:
-				"List online Pi sessions with their IDs, devices, cwd, names, execution status, and saved binding counts. Also returns this chat's default.",
+				"List online OMP sessions with their IDs, devices, cwd, names, execution status, and saved binding counts. Also returns this chat's default.",
 			outputSchema,
 			inputSchema: z.object({
 				sessionId: z
 					.string()
 					.optional()
-					.describe("Filter the online list to this Pi session"),
+					.describe("Filter the online list to this OMP session"),
 			}),
 			annotations: toolAnnotations("sessions"),
 		},
@@ -517,14 +727,14 @@ export function createServer(broker: Broker): McpServer {
 	);
 
 	server.registerResource(
-		"Pi resource",
+		"OMP resource",
 		new ResourceTemplate(
 			"chappie://session/{sessionId}/{kind}/{id}/{name}{?chatId}",
 			{
 				list: undefined,
 			},
 		),
-		{ title: "Pi resource" },
+		{ title: "OMP resource" },
 		async (uri, _variables, context) => {
 			const resource = await broker.readResource(
 				uri.href,

@@ -1,11 +1,4 @@
-/**
- * Host-neutral compatibility copy of Pi's per-file mutation queue.
- *
- * OMP does not expose upstream Pi's withFileMutationQueue helper through its
- * legacy extension surface. Keep this small implementation synchronized with
- * the upstream helper semantics: canonicalize existing paths, serialize only
- * matching files, and always release the next waiter after errors.
- */
+/** Serialize Chappie file commits by canonical destination path. */
 import { realpath } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 
@@ -52,10 +45,8 @@ export async function withFileMutationQueue<T>(
 	const registration = registrationQueue.then(async () => {
 		const key = await getMutationQueueKey(filePath);
 		const currentQueue = fileMutationQueues.get(key) ?? Promise.resolve();
-		let releaseNext: () => void = () => {};
-		const nextQueue = new Promise<void>((resolveQueue) => {
-			releaseNext = resolveQueue;
-		});
+		const { promise: nextQueue, resolve: releaseNext } =
+			Promise.withResolvers<void>();
 		const chainedQueue = currentQueue.then(() => nextQueue);
 		fileMutationQueues.set(key, chainedQueue);
 		return { key, currentQueue, chainedQueue, releaseNext };

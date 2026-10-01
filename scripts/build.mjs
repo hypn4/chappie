@@ -1,19 +1,18 @@
 import { spawnSync } from "node:child_process";
-import { chmod, copyFile, mkdir, rm } from "node:fs/promises";
-import { createRequire } from "node:module";
+import { chmod, copyFile, mkdir, readFile, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
-const require = createRequire(import.meta.url);
+const compilerPackageUrl = import.meta.resolve("typescript/package.json");
+const compilerPackage = JSON.parse(
+	await readFile(new URL(compilerPackageUrl), "utf8"),
+);
 await rm(join(root, "dist"), { recursive: true, force: true });
 const result = spawnSync(
 	process.execPath,
 	[
-		join(
-			dirname(require.resolve("typescript/package.json")),
-			require("typescript/package.json").bin.tsc,
-		),
+		join(dirname(fileURLToPath(compilerPackageUrl)), compilerPackage.bin.tsc),
 		"-p",
 		"tsconfig.build.json",
 	],

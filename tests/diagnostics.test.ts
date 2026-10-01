@@ -111,7 +111,13 @@ async function diagnosticFixture(t: TestContext) {
 			await peer.send({
 				type: "sync",
 				id: 1,
-				session: { id: "stalled", cwd: root, device: "test", status: "idle" },
+				session: {
+					id: "stalled",
+					cwd: root,
+					device: "test",
+					host: "omp",
+					status: "idle",
+				},
 			});
 			await registered.promise;
 			return {
@@ -256,6 +262,7 @@ describe("session diagnostic deadlines", { timeout: 10000 }, () => {
 						id: "stalled",
 						cwd: process.cwd(),
 						device: "test",
+						host: "omp",
 						status: "idle",
 					},
 					tools: [],

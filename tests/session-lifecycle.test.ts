@@ -170,6 +170,7 @@ test("session switch cancels copies still waiting for a destination lock", async
 					id: "source",
 					cwd: f.root,
 					device: "fixture",
+					host: "omp",
 					status: "idle",
 				},
 			}),

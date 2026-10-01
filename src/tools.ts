@@ -1,63 +1,89 @@
-import type { JsonObject } from "@earendil-works/pi-ai";
-import {
-	createBashToolDefinition,
-	createEditToolDefinition,
-	createReadToolDefinition,
-	createWriteToolDefinition,
-} from "@earendil-works/pi-coding-agent";
-import { fromJsonSchema } from "@modelcontextprotocol/server";
+import type { ToolCall } from "@oh-my-pi/pi-ai";
+import * as z from "zod";
 import type { Initialization } from "./broker.ts";
 import { toolResultsContent } from "./delivery.ts";
 import type { SessionInput, SessionToolResult } from "./ipc.ts";
 import type { ReplayReceipt } from "./operations.ts";
 import { contentWithImageReferences } from "./resources.ts";
-import { transfer } from "./transfer.ts";
+import { operationIdSchema, transferSchema } from "./transfer.ts";
 
 export interface ToolInput {
 	name: string;
-	arguments: JsonObject;
+	arguments: ToolCall["arguments"];
 }
 
-export function decodeBase64ToolCalls(value: string): unknown {
-	if (
-		value.length === 0 ||
-		value.length % 4 !== 0 ||
-		!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(
-			value,
-		)
-	)
-		throw new Error("call.base64 must be canonical Base64");
-	const bytes = Buffer.from(value, "base64");
-	const text = bytes.toString("utf8");
-	if (!Buffer.from(text, "utf8").equals(bytes))
-		throw new Error("call.base64 must contain valid UTF-8");
-	try {
-		return JSON.parse(text);
-	} catch {
-		throw new Error("call.base64 must contain UTF-8 JSON");
-	}
-}
+const session = {
+	sessionId: z
+		.string()
+		.min(1)
+		.optional()
+		.describe("OMP session for this operation"),
+};
 
-const definitions = [
-	createReadToolDefinition("."),
-	createBashToolDefinition("."),
-	createEditToolDefinition("."),
-	createWriteToolDefinition("."),
-	transfer,
+// Direct MCP tools use native OMP argument names. Other tools are discovered
+// from the running session; the broker does not instantiate a second tool host.
+const definitions: {
+	name: string;
+	description: string;
+	inputSchema: z.ZodType<Record<string, unknown>, Record<string, unknown>>;
+}[] = [
+	{
+		name: "read",
+		description:
+			"Read through native OMP. Use path selectors such as file.ts:20-40 or image.svg:img; returned snapshot anchors are authoritative.",
+		inputSchema: z.strictObject({ path: z.string().min(1), ...session }),
+	},
+	{
+		name: "bash",
+		description:
+			"Execute a native OMP shell command. For commands that exceed a ChatGPT request, use start_call instead.",
+		inputSchema: z.strictObject({
+			command: z.string().min(1),
+			timeout: z.number().nonnegative().optional(),
+			cwd: z.string().optional(),
+			pty: z.boolean().optional(),
+			async: z.boolean().optional(),
+			name: z.string().max(48).optional(),
+			ready: z
+				.strictObject({
+					log: z.string().optional(),
+					port: z.int().min(1).max(65535).optional(),
+					host: z.string().optional(),
+					timeout: z.number().nonnegative().optional(),
+				})
+				.optional(),
+			...session,
+		}),
+	},
+	{
+		name: "edit",
+		description:
+			"Apply a native OMP hashline patch in input. Copy exact file hashes and line anchors from the latest read; no path/edits or patch alias is accepted.",
+		inputSchema: z.strictObject({ input: z.string().min(1), ...session }),
+	},
+	{
+		name: "write",
+		description:
+			"Write a new text file using native OMP. Use edit for changes to existing files.",
+		inputSchema: z.strictObject({
+			path: z.string().min(1),
+			content: z.string(),
+			...session,
+		}),
+	},
+	{
+		name: "transfer",
+		description:
+			"Import host-injected ChatGPT files, copy between OMP sessions, or export local files and images.",
+		inputSchema: transferSchema.extend({
+			operationId: operationIdSchema,
+			...session,
+		}),
+	},
 ];
 
 export const directTools = definitions.map((definition) => ({
-	name: definition.name,
-	description:
-		definition.name === "edit"
-			? "Pi: use path and exact-text edits. OMP: use patch with native anchors from the latest read. These formats are not interchangeable."
-			: definition.description,
-	inputSchema: fromJsonSchema<Record<string, unknown>>(
-		withSessionId(
-			definition.parameters as unknown as Record<string, unknown>,
-			definition.name,
-		),
-	),
+	...definition,
 	fileParams: definition.name === "transfer" ? ["files"] : undefined,
 }));
 
@@ -120,53 +146,11 @@ export function inputContent(inputs: SessionInput[]) {
 		return [
 			{
 				type: "text" as const,
-				text: JSON.stringify({ piInput: id, sessionId }),
+				text: JSON.stringify({ ompInput: id, sessionId }),
 			},
 			...(typeof message.content === "string"
 				? [{ type: "text" as const, text: message.content }]
 				: contentWithImageReferences(sessionId, message.content)),
 		];
 	});
-}
-
-function withSessionId(
-	schema: Record<string, unknown>,
-	name: string,
-): Record<string, unknown> {
-	const copy = structuredClone(schema) as {
-		properties?: Record<string, unknown>;
-		required?: string[];
-	};
-	if (name === "edit") {
-		copy.properties = {
-			...copy.properties,
-			patch: {
-				type: "string",
-				description:
-					"OMP native patch copied from the latest read snapshot; retain its hash and line anchors.",
-			},
-		};
-		delete copy.required;
-		return {
-			...copy,
-			properties: { ...copy.properties, sessionId: { type: "string" } },
-			oneOf: [{ required: ["path", "edits"] }, { required: ["patch"] }],
-			additionalProperties: false,
-		};
-	}
-	return {
-		...copy,
-		...(name === "transfer"
-			? { required: [...(copy.required ?? []), "operationId"] }
-			: {}),
-		properties: {
-			...copy.properties,
-			sessionId: {
-				type: "string",
-				description:
-					"Pi session for this operation; becomes the default if none is set",
-			},
-		},
-		additionalProperties: false,
-	};
 }

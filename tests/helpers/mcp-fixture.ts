@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import type { TestContext } from "node:test";
 import type { JSONRPCMessage, Transport } from "@modelcontextprotocol/server";
 import type { Broker } from "../../src/broker.ts";
-import { createServer } from "../../src/server.ts";
+import { serveMcp } from "../../src/stdio.ts";
 
 export async function mcpFixture(
 	t: TestContext,
@@ -23,7 +23,6 @@ export async function mcpFixture(
 		},
 		...overrides,
 	} as unknown as Broker;
-	const server = createServer(broker);
 	const pending = new Map<number, (message: JSONRPCMessage) => void>();
 	const transport: Transport = {
 		async start() {},
@@ -35,8 +34,8 @@ export async function mcpFixture(
 				pending.get(message.id)?.(message);
 		},
 	};
-	await server.connect(transport);
-	t.after(() => server.close());
+	const handle = serveMcp(broker, { transport });
+	t.after(() => handle.close());
 	let id = 0;
 	async function request(
 		method: string,
@@ -50,7 +49,19 @@ export async function mcpFixture(
 			() => completion.reject(new Error(`MCP ${method} timed out`)),
 			timeout,
 		);
-		transport.onmessage?.({ jsonrpc: "2.0", id: next, method, params });
+		transport.onmessage?.({
+			jsonrpc: "2.0",
+			id: next,
+			method,
+			params: {
+				...params,
+				_meta: {
+					"io.modelcontextprotocol/protocolVersion": "2026-07-28",
+					"io.modelcontextprotocol/clientCapabilities": {},
+					...(params._meta as Record<string, unknown> | undefined),
+				},
+			},
+		});
 		try {
 			const response = await completion.promise;
 			assert.ok("result" in response, JSON.stringify(response));
@@ -60,15 +71,7 @@ export async function mcpFixture(
 			pending.delete(next);
 		}
 	}
-	await request("initialize", {
-		protocolVersion: "2025-11-25",
-		capabilities: {},
-		clientInfo: { name: "test", version: "1" },
-	});
-	transport.onmessage?.({
-		jsonrpc: "2.0",
-		method: "notifications/initialized",
-	});
+	await request("server/discover", {});
 	return {
 		request,
 		get acknowledgements() {

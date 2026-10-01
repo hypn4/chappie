@@ -2,6 +2,13 @@ import { readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import * as z from "zod";
 import type { DeliveryRecord } from "./delivery.ts";
+import {
+	type EventRecord,
+	type EventSubscription,
+	eventRecordSchema,
+	eventSubscriptionSchema,
+	operationEvent,
+} from "./event-types.ts";
 import { deliverySchema } from "./ipc-schema.ts";
 import type { OperationReceipt } from "./operations.ts";
 import type { QuestionAnswer, QuestionRecord } from "./questions.ts";
@@ -36,11 +43,19 @@ export interface BindingMutation {
 	previous?: z.infer<typeof bindingRecordSchema>;
 }
 const MAX_STATE_BYTES = 32 * 1024 * 1024;
+const RESULT_RETENTION_MS = 24 * 60 * 60 * 1000;
 const stateSchema = z.strictObject({
-	bindings: z
-		.record(z.string(), z.union([z.string(), bindingRecordSchema]))
-		.optional(),
+	bindings: z.record(z.string(), bindingRecordSchema).optional(),
 	deliveries: z.array(deliverySchema).max(2048).optional(),
+	operationResults: z
+		.array(
+			z.strictObject({
+				operationKey: z.string(),
+				delivery: deliverySchema,
+			}),
+		)
+		.max(2048)
+		.optional(),
 	questions: z
 		.array(
 			questionOutput.extend({ chatId: z.string(), delivered: z.boolean() }),
@@ -51,12 +66,24 @@ const stateSchema = z.strictObject({
 		.array(
 			z.strictObject({
 				key: z.string(),
+				operationId: z.string().min(1).max(128).optional(),
 				signature: z.string(),
 				chatId: z.string(),
 				sessionId: z.string(),
 				cwd: z.string(),
-				status: z.enum(["running", "completed", "uncertain"]),
+				createdAt: z.number().nonnegative().optional(),
+				status: z.enum([
+					"running",
+					"completed",
+					"failed",
+					"cancelled",
+					"uncertain",
+				]),
 				updatedAt: z.number().nonnegative(),
+				error: z
+					.string()
+					.max(64 * 1024)
+					.optional(),
 				resources: z.array(operationResourceSchema).max(16384).optional(),
 			}),
 		)
@@ -66,6 +93,8 @@ const stateSchema = z.strictObject({
 		.array(z.tuple([z.string(), z.number().nonnegative()]))
 		.max(4096)
 		.optional(),
+	eventSubscriptions: z.array(eventSubscriptionSchema).max(2048).optional(),
+	eventOutbox: z.array(eventRecordSchema).max(8192).optional(),
 });
 
 export class State {
@@ -77,13 +106,24 @@ export class State {
 	readonly #operations = new Map<string, OperationReceipt>();
 	readonly #deliveredIds = new Map<string, number>();
 	#writes = Promise.resolve();
+	readonly #operationResults = new Map<string, DeliveryRecord>();
 	readonly #pendingBindings = new Map<string, number>();
+	readonly #eventSubscriptions = new Map<string, EventSubscription>();
+	readonly #eventOutbox = new Map<string, EventRecord>();
 	#acknowledgements = Promise.resolve();
 	#nextBindingRevision = 1;
+	readonly #eventListeners = new Set<() => void>();
+	#writeError: unknown;
+	#writeRevision = 0;
 
 	constructor(agentDir: string) {
 		this.#path = join(agentDir, "chappie.state.json");
 		this.#temporaryPath = `${this.#path}.tmp`;
+	}
+
+	onEventsPending(listener: () => void): () => void {
+		this.#eventListeners.add(listener);
+		return () => this.#eventListeners.delete(listener);
 	}
 
 	async load(): Promise<void> {
@@ -98,25 +138,25 @@ export class State {
 			throw new Error("Chappie state exceeds the 32 MiB limit");
 		const state = stateSchema.parse(JSON.parse(contents));
 		const loadedAt = Date.now();
-		let bindingsChanged = false;
-		for (const [chatId, value] of Object.entries(state.bindings ?? {})) {
-			if (typeof value === "string") bindingsChanged = true;
-			const persisted =
-				typeof value === "string"
-					? { sessionId: value, lastUsedAt: loadedAt }
-					: value;
+		for (const [chatId, persisted] of Object.entries(state.bindings ?? {})) {
 			this.#bindings.set(chatId, {
 				...persisted,
 				revision: this.#nextBindingRevision++,
 			});
 		}
-		bindingsChanged = this.#pruneBindings(loadedAt) || bindingsChanged;
+		const bindingsChanged = this.#pruneBindings(loadedAt);
 		if (this.#bindings.size > MAX_BINDINGS)
 			throw new Error("Binding limit reached");
 		for (const delivery of state.deliveries ?? []) {
 			// The wire validator checks the persisted native result envelope before restoration.
 			if (delivery?.id)
 				this.#deliveries.set(delivery.id, delivery as DeliveryRecord);
+		}
+		for (const saved of state.operationResults ?? []) {
+			this.#operationResults.set(
+				saved.operationKey,
+				saved.delivery as DeliveryRecord,
+			);
 		}
 		for (const question of state.questions ?? [])
 			this.#questions.set(question.id, question);
@@ -126,6 +166,12 @@ export class State {
 		}
 		for (const [id, time] of state.deliveredIds ?? [])
 			this.#deliveredIds.set(id, time);
+		for (const subscription of state.eventSubscriptions ?? []) {
+			this.#eventSubscriptions.set(subscription.id, subscription);
+		}
+		for (const event of state.eventOutbox ?? []) {
+			this.#eventOutbox.set(event.eventId, event);
+		}
 		if (bindingsChanged) await this.#save();
 	}
 
@@ -141,16 +187,34 @@ export class State {
 	async reserveOperation(
 		receipt: OperationReceipt,
 	): Promise<OperationReceipt | undefined> {
+		if (receipt.operationId) {
+			const conflict = [...this.#operations.values()].find(
+				(value) =>
+					value.chatId === receipt.chatId &&
+					value.operationId === receipt.operationId &&
+					value.key !== receipt.key,
+			);
+			if (conflict)
+				throw new Error(
+					"Operation identifier already belongs to another session or operation",
+				);
+		}
 		const existing = this.#operations.get(receipt.key);
 		if (existing) {
 			if (existing.signature !== receipt.signature)
 				throw new Error("Operation identifier reused with different arguments");
-			await this.#writes;
+			await this.flush();
 			return existing;
 		}
 		const cutoff = Date.now() - 24 * 60 * 60 * 1000;
 		for (const [key, value] of this.#operations) {
-			if (value.status === "completed" && value.updatedAt < cutoff)
+			if (
+				!value.operationId &&
+				(value.status === "completed" ||
+					value.status === "failed" ||
+					value.status === "cancelled") &&
+				value.updatedAt < cutoff
+			)
 				this.#operations.delete(key);
 		}
 		if (this.#operations.size >= 16384)
@@ -172,6 +236,7 @@ export class State {
 		key: string | undefined,
 		status: OperationReceipt["status"],
 		resources: ResourceDescriptor[] = [],
+		error?: string,
 	): Promise<void> {
 		if (!key) return;
 		const receipt = this.#operations.get(key);
@@ -201,8 +266,17 @@ export class State {
 					original.map((resource) => [resource.uri, resource]),
 				).values(),
 			];
-		if (receipt.status !== "completed") receipt.status = status;
-		receipt.updatedAt = Date.now();
+		const terminal = ["completed", "failed", "cancelled"].includes(
+			receipt.status,
+		);
+		if (!terminal) {
+			receipt.status = status;
+			receipt.updatedAt = Date.now();
+			if (error) receipt.error = error.slice(0, 64 * 1024);
+			else if (status === "completed") delete receipt.error;
+		}
+		// The terminal transition and all matching outbox entries share one snapshot.
+		this.#queueOperationEvents(receipt);
 		await this.#save();
 	}
 
@@ -220,6 +294,164 @@ export class State {
 			}
 		}
 		if (changed) await this.#save();
+	}
+
+	findOperation(
+		chatId: string,
+		operationId: string,
+	): OperationReceipt | undefined {
+		const receipt = [...this.#operations.values()].find(
+			(value) => value.chatId === chatId && value.operationId === operationId,
+		);
+		return receipt ? structuredClone(receipt) : undefined;
+	}
+
+	operation(chatId: string, operationId: string): OperationReceipt {
+		const receipt = this.findOperation(chatId, operationId);
+		if (!receipt)
+			throw new Error("Operation not found in this ChatGPT conversation");
+		return receipt;
+	}
+
+	deliveriesForOperation(chatId: string, key: string): DeliveryRecord[] {
+		return [...this.#deliveries.values()].filter(
+			(delivery) => delivery.chatId === chatId && delivery.operationKey === key,
+		);
+	}
+
+	resultForOperation(
+		chatId: string,
+		operationId: string,
+	): DeliveryRecord | undefined {
+		const receipt = this.operation(chatId, operationId);
+		const retained = this.#operationResults.get(receipt.key);
+		return retained ? structuredClone(retained) : undefined;
+	}
+
+	eventSubscription(id: string): EventSubscription | undefined {
+		const value = this.#eventSubscriptions.get(id);
+		return value ? structuredClone(value) : undefined;
+	}
+
+	async upsertEventSubscription(
+		subscription: EventSubscription,
+	): Promise<void> {
+		const previous = this.#eventSubscriptions.get(subscription.id);
+		if (!previous && this.#eventSubscriptions.size >= 2048)
+			throw new Error("Event subscription limit reached");
+		if (previous && previous.chatId !== subscription.chatId)
+			throw new Error("Event subscription belongs to another conversation");
+		const next = eventSubscriptionSchema.parse({
+			...subscription,
+			...(previous?.eventId
+				? {
+						eventId: previous.eventId,
+						deliveryStatus: previous.deliveryStatus,
+						deliveryError: previous.deliveryError,
+					}
+				: {}),
+		});
+		this.#eventSubscriptions.set(next.id, next);
+		const receipt = [...this.#operations.values()].find(
+			(value) =>
+				value.chatId === next.chatId && value.operationId === next.operationId,
+		);
+		const event = receipt ? operationEvent(next, receipt) : undefined;
+		if (event) this.#queueSubscriptionEvent(next, event);
+		try {
+			await this.#save();
+		} catch (error) {
+			if (this.#eventSubscriptions.get(next.id) === next) {
+				if (previous) this.#eventSubscriptions.set(next.id, previous);
+				else this.#eventSubscriptions.delete(next.id);
+				if (event) this.#eventOutbox.delete(event.eventId);
+			}
+			throw error;
+		}
+	}
+
+	async removeEventSubscription(id: string, chatId: string): Promise<void> {
+		const subscription = this.#eventSubscriptions.get(id);
+		if (subscription && subscription.chatId !== chatId)
+			throw new Error("Event subscription belongs to another conversation");
+		this.#eventSubscriptions.delete(id);
+		for (const [eventId, event] of this.#eventOutbox) {
+			if (event.subscriptionId === id) this.#eventOutbox.delete(eventId);
+		}
+		await this.#save();
+	}
+
+	#queueSubscriptionEvent(
+		subscription: EventSubscription,
+		event: EventRecord,
+	): void {
+		if (subscription.eventId) return;
+		if (this.#eventOutbox.size >= 8192)
+			throw new Error("Event outbox limit reached");
+		subscription.eventId = event.eventId;
+		subscription.deliveryStatus = "pending";
+		this.#eventOutbox.set(event.eventId, event);
+	}
+
+	#queueOperationEvents(receipt: OperationReceipt): void {
+		for (const subscription of this.#eventSubscriptions.values()) {
+			const event = operationEvent(subscription, receipt);
+			if (event) this.#queueSubscriptionEvent(subscription, event);
+		}
+	}
+
+	nextEvent(now: number): EventRecord | undefined {
+		let selected: EventRecord | undefined;
+		for (const event of this.#eventOutbox.values()) {
+			if (event.nextAttemptAt > now) continue;
+			if (
+				!selected ||
+				event.nextAttemptAt < selected.nextAttemptAt ||
+				(event.nextAttemptAt === selected.nextAttemptAt &&
+					event.eventId < selected.eventId)
+			)
+				selected = event;
+		}
+		return selected ? structuredClone(selected) : undefined;
+	}
+
+	nextEventTime(): number | undefined {
+		let next: number | undefined;
+		for (const event of this.#eventOutbox.values()) {
+			if (next === undefined || event.nextAttemptAt < next)
+				next = event.nextAttemptAt;
+		}
+		return next;
+	}
+
+	async rescheduleEvent(
+		eventId: string,
+		attempts: number,
+		nextAttemptAt: number,
+	): Promise<void> {
+		const existing = this.#eventOutbox.get(eventId);
+		if (!existing) return;
+		this.#eventOutbox.set(
+			eventId,
+			eventRecordSchema.parse({
+				...existing,
+				attempts,
+				nextAttemptAt,
+			}),
+		);
+		await this.#save();
+	}
+
+	async removeEvent(eventId: string, failure?: string): Promise<void> {
+		const event = this.#eventOutbox.get(eventId);
+		if (!event) return;
+		const subscription = this.#eventSubscriptions.get(event.subscriptionId);
+		if (subscription?.eventId === eventId) {
+			subscription.deliveryStatus = failure ? "failed" : "delivered";
+			if (failure) subscription.deliveryError = failure.slice(0, 256);
+		}
+		this.#eventOutbox.delete(eventId);
+		await this.#save();
 	}
 
 	binding(chatId: string): string | undefined {
@@ -339,6 +571,25 @@ export class State {
 		if (this.#deliveredIds.has(delivery.id)) return;
 		if (!this.#deliveries.has(delivery.id) && this.#deliveries.size >= 2048)
 			throw new Error("Pending delivery limit reached");
+		const receipt = delivery.operationKey
+			? this.#operations.get(delivery.operationKey)
+			: undefined;
+		if (
+			receipt &&
+			(receipt.chatId !== delivery.chatId ||
+				receipt.sessionId !== delivery.sessionId)
+		)
+			throw new Error(
+				"Operation result belongs to another conversation or session",
+			);
+		if (receipt?.operationId && delivery.complete) {
+			if (
+				!this.#operationResults.has(receipt.key) &&
+				this.#operationResults.size >= 2048
+			)
+				throw new Error("Retained operation result limit reached");
+			this.#operationResults.set(receipt.key, delivery);
+		}
 		this.#deliveries.set(delivery.id, delivery);
 		await this.finishOperation(
 			delivery.operationKey,
@@ -460,16 +711,29 @@ export class State {
 	async flush(): Promise<void> {
 		await this.#acknowledgements;
 		await this.#writes;
+		if (this.#writeError) throw this.#writeError;
 	}
 
 	#save(): Promise<void> {
-		const contents = this.#snapshot();
+		const revision = ++this.#writeRevision;
+		let contents: string;
+		try {
+			contents = this.#snapshot();
+		} catch (error) {
+			this.#writeError = error;
+			return Promise.reject(error);
+		}
 		const saved = this.#writes.then(async () => {
 			await writeFile(this.#temporaryPath, contents, { mode: 0o600 });
 			await rename(this.#temporaryPath, this.#path);
+			if (revision === this.#writeRevision) this.#writeError = undefined;
 		});
-		this.#writes = saved.catch(() => {});
-		return saved;
+		this.#writes = saved.catch((error) => {
+			if (revision === this.#writeRevision) this.#writeError = error;
+		});
+		return saved.then(() => {
+			for (const listener of this.#eventListeners) listener();
+		});
 	}
 
 	#snapshot(): string {
@@ -486,12 +750,55 @@ export class State {
 				},
 			]),
 		);
+		for (const [key] of this.#operationResults) {
+			const receipt = this.#operations.get(key);
+			if (
+				receipt &&
+				(receipt.status === "running" ||
+					receipt.status === "uncertain" ||
+					receipt.updatedAt >= now - RESULT_RETENTION_MS)
+			)
+				continue;
+			if (
+				receipt &&
+				[...this.#eventSubscriptions.values()].some(
+					(subscription) =>
+						subscription.chatId === receipt.chatId &&
+						subscription.operationId === receipt.operationId,
+				)
+			)
+				continue;
+			this.#operationResults.delete(key);
+		}
 		for (const [id, time] of this.#deliveredIds) {
 			if (time < now - 24 * 60 * 60 * 1000) this.#deliveredIds.delete(id);
 		}
 		if (this.#deliveredIds.size > 4096)
 			throw new Error("Delivery receipt limit reached");
-		const contents = `${JSON.stringify({ bindings, deliveries: [...this.#deliveries.values()], questions: [...this.#questions.values()], operations: [...this.#operations.values()], deliveredIds: [...this.#deliveredIds] }, null, 2)}\n`;
+		for (const [id, subscription] of this.#eventSubscriptions) {
+			if (subscription.expiresAt !== null && subscription.expiresAt <= now) {
+				this.#eventSubscriptions.delete(id);
+				for (const [eventId, event] of this.#eventOutbox) {
+					if (event.subscriptionId === id) this.#eventOutbox.delete(eventId);
+				}
+			}
+		}
+		const contents = `${JSON.stringify(
+			{
+				bindings,
+				deliveries: [...this.#deliveries.values()],
+				operationResults: [...this.#operationResults].map(
+					([operationKey, delivery]) => ({ operationKey, delivery }),
+				),
+				questions: [...this.#questions.values()],
+				operations: [...this.#operations.values()],
+				deliveredIds: [...this.#deliveredIds],
+				eventSubscriptions: [...this.#eventSubscriptions.values()],
+				eventOutbox: [...this.#eventOutbox.values()],
+			},
+			null,
+			2,
+		)}\n`;
 		if (Buffer.byteLength(contents) > MAX_STATE_BYTES)
 			throw new Error(
 				"Chappie state exceeds the 32 MiB limit; pending results were not persisted",

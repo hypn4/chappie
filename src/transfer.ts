@@ -11,16 +11,11 @@ import {
 } from "node:fs/promises";
 import { BlockList, isIP } from "node:net";
 import { homedir, hostname } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import type { ReadableStream as NodeReadableStream } from "node:stream/web";
-import {
-	formatSize,
-	type ToolDefinition,
-} from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
-import { type Static, Type } from "typebox";
+import * as z from "zod";
 import { withFileMutationQueue } from "./file-mutation-queue.ts";
 import {
 	describeResource,
@@ -99,58 +94,38 @@ export interface TransferResult {
 	isError?: boolean;
 }
 
-export const transferFile = Type.Object({
-	file_id: Type.String({ description: "Host file identifier" }),
-	download_url: Type.String({ description: "Host-provided download URL" }),
-	file_name: Type.Optional(Type.String()),
-	mime_type: Type.Optional(Type.String()),
+export const operationIdSchema = z.string().trim().min(1).max(128);
+export const transferFile = z.strictObject({
+	file_id: z.string(),
+	download_url: z.url(),
+	file_name: z.string().optional(),
+	mime_type: z.string().optional(),
 });
-
-const parameters = Type.Object({
-	operationId: Type.Optional(
-		Type.String({
-			minLength: 1,
-			maxLength: 128,
-			description:
-				"Stable ID for this user-requested transfer. Reuse after approval or transport retries; choose a new ID only for a new user request.",
-		}),
-	),
-	paths: Type.Array(Type.String(), {
-		minItems: 1,
-		description:
-			"Pi destinations for import; Pi source paths or chappie:// image references for export or session copies",
-	}),
-	files: Type.Optional(
-		Type.Array(transferFile, {
-			minItems: 1,
-			description:
-				"Host-injected ChatGPT files paired with paths in order; unavailable to generic/native calls",
-		}),
-	),
-	from: Type.Optional(
-		Type.Object({
-			sessionId: Type.String({ description: "Source agent session" }),
-			paths: Type.Array(Type.String(), {
-				minItems: 1,
-				description: "Source paths paired with local destinations",
-			}),
-		}),
-	),
-	to: Type.Optional(
-		Type.Object({
-			sessionId: Type.String({ description: "Destination Pi session" }),
-			paths: Type.Array(Type.String(), {
-				minItems: 1,
-				description: "Destinations paired with source paths in order",
-			}),
-		}),
-	),
-	overwrite: Type.Optional(
-		Type.Boolean({ description: "Overwrite existing target files" }),
-	),
+const sessionPathsSchema = z.strictObject({
+	sessionId: z.string().min(1),
+	paths: z.array(z.string()).min(1).max(128),
 });
-
-export type TransferArgs = Static<typeof parameters>;
+/** One schema is used for both native OMP execution and the MCP boundary. */
+export const transferSchema = z.strictObject({
+	operationId: operationIdSchema
+		.optional()
+		.describe("Stable transfer ID; reuse for the same intent only."),
+	paths: z
+		.array(z.string())
+		.min(1)
+		.max(128)
+		.describe("Source or destination paths paired in order"),
+	files: z
+		.array(transferFile)
+		.min(1)
+		.max(128)
+		.optional()
+		.describe("Host-injected files; not model-authored download URLs"),
+	from: sessionPathsSchema.optional(),
+	to: sessionPathsSchema.optional(),
+	overwrite: z.boolean().optional(),
+});
+export type TransferArgs = z.infer<typeof transferSchema>;
 
 export interface TransferExecutionContext {
 	sessionId: string;
@@ -217,108 +192,6 @@ export async function executeTransfer(
 		}
 	}
 	return transferResult({ device, files, resources: [] });
-}
-
-export const transfer = {
-	name: "transfer",
-	label: "transfer",
-	description:
-		"Import ChatGPT files with files, send local paths to a session with to, retrieve session files with from, or export local paths and images.",
-	parameters,
-	async execute(_id, args, signal, update, context) {
-		return executeTransfer(args, signal, update, {
-			sessionId: context.sessionManager.getSessionId(),
-			cwd: context.cwd,
-		});
-	},
-	renderCall(args, theme, context) {
-		const device = context.state.device ?? hostname();
-		const from = args.files
-			? "ChatGPT"
-			: args.from
-				? (context.state.from ?? "Agent")
-				: device;
-		const to = args.files
-			? device
-			: args.from
-				? device
-				: (context.state.to ?? (args.to ? "Agent" : "ChatGPT"));
-		const header =
-			context.lastComponent instanceof Text
-				? context.lastComponent
-				: new Text("", 0, 0);
-		header.setText(theme.fg("toolTitle", theme.bold(`${from} → ${to}`)));
-		context.state.header = header;
-		return header;
-	},
-	renderResult(result, _options, theme, context) {
-		const details = result.details;
-		if (!details) {
-			const text = result.content
-				.flatMap((block) => (block.type === "text" ? [block.text] : []))
-				.join("\n");
-			return new Text(
-				theme.fg(context.isError ? "error" : "toolOutput", text),
-				0,
-				0,
-			);
-		}
-		const args = context.args;
-		context.state.device = details.device;
-		context.state.to = details.to?.device ?? "ChatGPT";
-		if (details.from) context.state.from = details.from.device;
-		else delete context.state.from;
-		const from = args.files
-			? "ChatGPT"
-			: args.from
-				? (details.from?.device ?? "Agent")
-				: details.device;
-		const to = args.files
-			? details.device
-			: args.from
-				? details.device
-				: (details.to?.device ?? "ChatGPT");
-		context.state.header?.setText(
-			theme.fg("toolTitle", theme.bold(`${from} → ${to}`)),
-		);
-		const lines =
-			details.resources.length > 0
-				? details.resources.map((resource, index) => {
-						const source = displayPath(args.paths?.[index] ?? resource.name);
-						const destination = args.to?.paths[index];
-						return `${destination ? `${source} → ${destination}` : source}  ${theme.fg("dim", formatSize(resource.size))}`;
-					})
-				: details.files.length > 0
-					? details.files.map((file, index) => {
-							const source = args.to
-								? args.paths?.[index]
-								: args.from
-									? args.from.paths[index]
-									: args.files?.[index]?.file_name;
-							const path = source
-								? `${displayPath(source)} → ${file.path}`
-								: file.path;
-							return "error" in file
-								? theme.fg("error", `${path}\n${file.error}`)
-								: `${path}  ${theme.fg("dim", formatSize(file.bytes))}`;
-						})
-					: (args.paths ?? []).map((path, index) =>
-							args.to?.paths[index]
-								? `${displayPath(path)} → ${args.to.paths[index]}`
-								: displayPath(path),
-						);
-		return new Text(lines.join("\n"), 0, 0);
-	},
-} satisfies ToolDefinition<
-	typeof parameters,
-	TransferDetails,
-	{ header?: Text; device?: string; to?: string; from?: string }
->;
-
-function displayPath(path: string): string {
-	return path.startsWith("chappie://")
-		? decodeURIComponent(basename(new URL(path).pathname))
-		: path;
 }
 
 export function transferResult(details: TransferDetails): TransferResult {

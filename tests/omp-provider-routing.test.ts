@@ -1,12 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import type {
-	Api,
-	AssistantMessageEventStream,
-	Context,
-	Model,
-	SimpleStreamOptions,
-} from "@oh-my-pi/pi-ai";
+import type { Api, Context, Model, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
 import type {
 	ExtensionAPI as OmpExtensionAPI,
 	ExtensionContext as OmpExtensionContext,
@@ -114,9 +108,7 @@ async function result(
 	};
 	const stream = config.streamSimple?.(model, requestContext, options);
 	assert.ok(stream);
-	// The adapter returns the shared Pi/OMP event stream implementation.
-	const events = stream as unknown as AssistantMessageEventStream;
-	return await events.result();
+	return await stream.result();
 }
 
 test("the latest provider registration routes each request through its owning session hook", async () => {
