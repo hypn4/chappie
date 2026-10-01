@@ -49,7 +49,7 @@ function toolAnnotations(name: string) {
 	return {
 		readOnlyHint: readOnly,
 		destructiveHint: dangerous,
-		idempotentHint: readOnly || name === "init",
+		idempotentHint: readOnly || name === "init" || name === "transfer",
 		openWorldHint: dangerous || name === "read",
 	};
 }
@@ -163,7 +163,6 @@ export function createServer(broker: Broker): McpServer {
 					},
 					inputs,
 				),
-				!replay,
 			);
 		}),
 	);
@@ -406,7 +405,6 @@ export function createServer(broker: Broker): McpServer {
 					result.initialization,
 					result.replay,
 				),
-				!result.replay,
 			);
 		}),
 	);
@@ -452,7 +450,6 @@ export function createServer(broker: Broker): McpServer {
 						result.initialization,
 						result.replay,
 					),
-					!result.replay,
 				);
 			}),
 		);

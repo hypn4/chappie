@@ -100,6 +100,13 @@ export interface CallResult extends ChatResult {
 	toolResults: SessionToolResult[];
 }
 
+interface InFlightOperation {
+	signature: string;
+	promise: Promise<ChatResult | CallResult>;
+	controller: AbortController;
+	waiters: number;
+}
+
 export interface BrokerOptions {
 	sessionWaitMs?: number;
 	inspectionTimeoutMs?: number;
@@ -121,6 +128,7 @@ export class Broker {
 		JsonLinePeer<SessionMessage, BrokerMessage>,
 		Map<number, AbortController>
 	>();
+	readonly #inFlightOperations = new Map<string, InFlightOperation>();
 	#ask = true;
 	#cooldownMs = 10_000;
 	#localTools = false;
@@ -255,57 +263,63 @@ export class Broker {
 			requestId,
 			replyTo ? JSON.stringify({ text, replyTo }) : text,
 		);
-		if (identity) {
-			const session = this.#sessions.get(target);
-			if (!session) throw new Error("Target session disconnected");
-			const replay = await this.#state.reserveOperation({
-				...identity,
-				chatId,
-				sessionId: target,
-				cwd: session.description.cwd,
-				status: "running",
-				updatedAt: Date.now(),
-			});
-			if (replay) {
-				await this.#confirmBindingUse(chatId, sessionId, target);
-				return {
-					sessionId: target,
-					cwd: replay.cwd,
-					inputs: [],
-					replay: replayReceipt(replay),
-				};
-			}
-		}
-
-		const result = await this.#request(
-			target,
-			(id) => ({
-				type: "chat",
-				id,
-				...source(chatId, requestId),
-				...(identity ? { operationKey: identity.key } : {}),
-				sessionId: target,
-				text,
-				...(replyTo ? { replyTo } : {}),
-			}),
+		return this.#coalesceOperation(
+			identity,
 			signal,
-		).catch(async (error: unknown) => {
-			await this.#state.finishOperation(identity?.key, "uncertain");
-			throw error;
-		});
-		await this.#state.finishOperation(identity?.key, "completed");
-		if ("message" in result) {
-			const inputs = result.inputs;
-			await this.#ackInputs(target, inputs, signal);
-			await this.#confirmBindingUse(chatId, sessionId, target);
-			return {
-				sessionId: target,
-				cwd: result.cwd,
-				inputs,
-				...(initialization ? { initialization } : {}),
-			};
-		}
-		throw new Error("Pi session returned no assistant message");
+			async (operationSignal) => {
+				if (identity) {
+					const session = this.#sessions.get(target);
+					if (!session) throw new Error("Target session disconnected");
+					const replay = await this.#state.reserveOperation({
+						...identity,
+						chatId,
+						sessionId: target,
+						cwd: session.description.cwd,
+						status: "running",
+						updatedAt: Date.now(),
+					});
+					if (replay) {
+						await this.#confirmBindingUse(chatId, sessionId, target);
+						return {
+							sessionId: target,
+							cwd: replay.cwd,
+							inputs: [],
+							replay: replayReceipt(replay),
+						};
+					}
+				}
+
+				const result = await this.#request(
+					target,
+					(id) => ({
+						type: "chat",
+						id,
+						...source(chatId, requestId),
+						...(identity ? { operationKey: identity.key } : {}),
+						sessionId: target,
+						text,
+						...(replyTo ? { replyTo } : {}),
+					}),
+					operationSignal,
+				).catch(async (error: unknown) => {
+					await this.#state.finishOperation(identity?.key, "uncertain");
+					throw error;
+				});
+				await this.#state.finishOperation(identity?.key, "completed");
+				if ("message" in result) {
+					const inputs = result.inputs;
+					await this.#ackInputs(target, inputs, operationSignal);
+					await this.#confirmBindingUse(chatId, sessionId, target);
+					return {
+						sessionId: target,
+						cwd: result.cwd,
+						inputs,
+						...(initialization ? { initialization } : {}),
+					};
+				}
+				throw new Error("Pi session returned no assistant message");
+			},
+		);
 	}
 
 	async tools(
@@ -360,73 +374,78 @@ export class Broker {
 			requestId,
 			calls,
 		);
-		if (identity) {
-			const session = this.#sessions.get(target);
-			if (!session) throw new Error("Target session disconnected");
-			const replay = await this.#state.reserveOperation({
-				...identity,
-				chatId,
-				sessionId: target,
-				cwd: session.description.cwd,
-				status: "running",
-				updatedAt: Date.now(),
-			});
-			if (replay) {
-				await this.#confirmBindingUse(chatId, sessionId, target);
-				return {
-					sessionId: target,
-					cwd: replay.cwd,
-					inputs: [],
-					toolResults: [],
-					replay: replayReceipt(replay),
-				};
-			}
-		}
-
-		const toolCalls: ToolCall[] = calls.map((call) => ({
-			type: "toolCall",
-			id: `chappie-${randomUUID()}`,
-			name: call.name,
-			arguments: call.arguments,
-		}));
-		const result = await this.#request(
-			target,
-			(id) => ({
-				type: "call",
-				id,
-				...source(chatId, requestId),
-				...(identity ? { operationKey: identity.key } : {}),
-				sessionId: target,
-				calls: toolCalls,
-				...(direct ? { direct: true } : {}),
-			}),
+		return this.#coalesceOperation(
+			identity,
 			signal,
-		).catch(async (error: unknown) => {
-			await this.#state.finishOperation(identity?.key, "uncertain");
-			throw error;
-		});
-		if ("toolResults" in result) {
-			await this.#state.finishOperation(
-				identity?.key,
-				"completed",
-				result.toolResults.flatMap((result) =>
-					resourceDescriptors(result.details),
-				),
-			);
-			await this.#ackInputs(target, result.inputs, signal);
-			await this.#confirmBindingUse(chatId, sessionId, target);
-			return {
-				sessionId: target,
-				...(initialization ? { initialization } : {}),
-				cwd: result.cwd,
-				toolResults: result.toolResults,
-				inputs: result.inputs,
-			};
-		}
-		await this.#state.finishOperation(identity?.key, "uncertain");
-		throw new Error("Pi session returned no tool results");
-	}
+			async (operationSignal) => {
+				if (identity) {
+					const session = this.#sessions.get(target);
+					if (!session) throw new Error("Target session disconnected");
+					const replay = await this.#state.reserveOperation({
+						...identity,
+						chatId,
+						sessionId: target,
+						cwd: session.description.cwd,
+						status: "running",
+						updatedAt: Date.now(),
+					});
+					if (replay) {
+						await this.#confirmBindingUse(chatId, sessionId, target);
+						return {
+							sessionId: target,
+							cwd: replay.cwd,
+							inputs: [],
+							toolResults: [],
+							replay: replayReceipt(replay),
+						};
+					}
+				}
 
+				const toolCalls: ToolCall[] = calls.map((call) => ({
+					type: "toolCall",
+					id: `chappie-${randomUUID()}`,
+					name: call.name,
+					arguments: call.arguments,
+				}));
+				const result = await this.#request(
+					target,
+					(id) => ({
+						type: "call",
+						id,
+						...source(chatId, requestId),
+						...(identity ? { operationKey: identity.key } : {}),
+						sessionId: target,
+						calls: toolCalls,
+						...(direct ? { direct: true } : {}),
+					}),
+					operationSignal,
+				).catch(async (error: unknown) => {
+					await this.#state.finishOperation(identity?.key, "uncertain");
+					throw error;
+				});
+				if ("toolResults" in result) {
+					await this.#state.finishOperation(
+						identity?.key,
+						"completed",
+						result.toolResults.flatMap((result) =>
+							resourceDescriptors(result.details),
+						),
+					);
+					await this.#ackInputs(target, result.inputs, operationSignal);
+					await this.#confirmBindingUse(chatId, sessionId, target);
+					return {
+						sessionId: target,
+						...(initialization ? { initialization } : {}),
+						cwd: result.cwd,
+						toolResults: result.toolResults,
+						inputs: result.inputs,
+					};
+				}
+				await this.#state.finishOperation(identity?.key, "uncertain");
+				throw new Error("Pi session returned no tool results");
+			},
+		);
+	}
 	async history(
 		chatId: string,
 		sessionId: string | undefined,
@@ -778,6 +797,75 @@ export class Broker {
 		}
 	}
 
+	async #coalesceOperation<T extends ChatResult | CallResult>(
+		identity: { key: string; signature: string } | undefined,
+		signal: AbortSignal,
+		execute: (signal: AbortSignal) => Promise<T>,
+	): Promise<T> {
+		if (!identity) return execute(signal);
+		const existing = this.#inFlightOperations.get(identity.key);
+		if (existing) {
+			if (existing.signature !== identity.signature)
+				throw new Error("Operation identifier reused with different arguments");
+			return this.#waitForOperation<T>(existing, signal);
+		}
+		const controller = new AbortController();
+		const task = execute(controller.signal);
+		const tracked: InFlightOperation = {
+			signature: identity.signature,
+			promise: task,
+			controller,
+			waiters: 0,
+		};
+		this.#inFlightOperations.set(identity.key, tracked);
+		void task
+			.finally(() => {
+				if (this.#inFlightOperations.get(identity.key) === tracked)
+					this.#inFlightOperations.delete(identity.key);
+			})
+			.catch(() => {});
+		return this.#waitForOperation<T>(tracked, signal);
+	}
+
+	#waitForOperation<T>(
+		operation: InFlightOperation,
+		signal: AbortSignal,
+	): Promise<T> {
+		if (signal.aborted) {
+			const error = abortError(signal);
+			if (operation.waiters === 0) operation.controller.abort(error);
+			return Promise.reject(error);
+		}
+		operation.waiters++;
+		const completion = Promise.withResolvers<T>();
+		let released = false;
+		const release = () => {
+			if (released) return;
+			released = true;
+			signal.removeEventListener("abort", onAbort);
+			operation.waiters--;
+		};
+		const onAbort = () => {
+			const error = abortError(signal);
+			release();
+			completion.reject(error);
+			if (operation.waiters === 0) operation.controller.abort(error);
+		};
+		signal.addEventListener("abort", onAbort, { once: true });
+		if (signal.aborted) onAbort();
+		void (operation.promise as Promise<T>).then(
+			(value) => {
+				release();
+				completion.resolve(value);
+			},
+			(error) => {
+				release();
+				completion.reject(error);
+			},
+		);
+		return completion.promise;
+	}
+
 	async #confirmBindingUse(
 		chatId: string,
 		requestedId: string | undefined,
@@ -1027,7 +1115,7 @@ export class Broker {
 			if (existing) {
 				const replay = replayReceipt(existing);
 				throw new Error(
-					`Already accepted remote operation (${replay.status}). ${replay.instructions}`,
+					`Already accepted remote operation (${replay.status}); native execution was not repeated`,
 				);
 			}
 		}

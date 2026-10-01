@@ -159,11 +159,16 @@ Questions remain available after the assistant response and across broker restar
 
 Supply a stable `operationId` when calling `transfer` from ChatGPT. Keep it
 unchanged when the same operation resumes after approval or a connection retry;
-use a new ID for a new user request. Replays return a receipt without repeating
-execution or attaching files again. An uncertain receipt requires checking the
-original work, not automatically retrying it. Completed receipts are retained for
-24 hours; unresolved receipts are not evicted automatically. ChatGPT still owns
-approval prompts and final response rendering. The broker does not suppress or bypass host approvals. Each state file retains at most 16,384 operation receipts and fails closed when unresolved work fills that limit.
+use a new ID for a new user request. Retries never repeat an already accepted
+native operation. Concurrent retries in the same broker process share the
+in-flight result; later completed retries return a machine-readable replay
+receipt and normal conversation may continue. An uncertain receipt requires
+checking the original work instead of automatically retrying it. Completed
+receipts are retained for 24 hours; unresolved receipts are not evicted
+automatically. ChatGPT still owns approval prompts and final response rendering.
+Each state file retains at most 16,384 operation receipts and fails closed when
+unresolved work fills that limit.
+
 ChatGPT file download URLs are accepted only through the direct host-provided
 `transfer.files` boundary. Generic `call` and session-to-session relay paths
 cannot inject arbitrary download URLs; remote collaboration uses broker-owned
@@ -171,11 +176,14 @@ session identity and stable operation receipts instead.
 
 `transfer.paths` always names paths or image references on the Pi side. Relative paths resolve from the selected Pi session's working directory; absolute paths and `~/` are accepted.
 
-A completed replay receipt confirms native execution, not attachment receipt.
-Its `delivery.resources` preserves the original references without attaching them
-again. `sourceReadAt`, when present, records a successful broker-side source read;
-`hostReceipt` remains `unconfirmed` because that does not prove ChatGPT saved it.
-Older receipts may lack references; inspect history instead of recreating work.
+A completed replay confirms native execution, not attachment receipt. Its
+`delivery.resources` preserves the original resource descriptors. If the host
+has not read an exported resource yet, Chappie may expose the same original
+resource link again on replay without rerunning the export. `sourceReadAt`, when
+present, records a successful broker-side source read; after that point Chappie
+stops automatic replay attachment. `hostReceipt` remains `unconfirmed` because
+a source read does not prove ChatGPT saved or displayed the file. Older receipts
+may lack references; inspect history instead of recreating work.
 
 For an explicitly requested missing-file recovery, pass the original resource URI
 to `transfer.paths`, with a stable `operationId` for that separate delivery request.

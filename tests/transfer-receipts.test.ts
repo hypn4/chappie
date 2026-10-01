@@ -71,30 +71,33 @@ async function exportedFixture(t: TestContext) {
 	};
 }
 
-test("completed export replay retains its original URI without attaching or re-executing", async (t) => {
+test("completed export replay re-exposes the unread original resource without re-executing", async (t) => {
 	const f = await exportedFixture(t);
 	const repeated = await f.replay();
 	assert.equal(repeated.replay?.status, "completed");
 	assert.deepEqual(repeated.toolResults, []);
 	assert.deepEqual(repeated.replay?.delivery?.resources, [f.resource]);
-	assert.equal(repeated.replay?.delivery?.hostReceipt, "unconfirmed");
 	const wire = toolResult([], "A", f.root, [], undefined, repeated.replay);
-	assert.equal(
-		wire.content.some((block) => block.type === "resource_link"),
-		false,
-	);
-	assert.match(JSON.stringify(wire), /export.txt/);
+	const links = wire.content.filter((block) => block.type === "resource_link");
+	assert.equal(links.length, 1);
+	assert.equal(links[0]?.uri, f.resource.uri);
+	assert.equal(repeated.replay?.replayed, true);
 });
 
-test("saved export references survive a broker restart without replaying their output", async (t) => {
+test("unread export resources survive a broker restart and replay the same link", async (t) => {
 	const f = await exportedFixture(t);
 	await f.reconnect();
 	const repeated = await f.replay();
 	assert.deepEqual(repeated.replay?.delivery?.resources, [f.resource]);
 	assert.equal(repeated.toolResults.length, 0);
+	const wire = toolResult([], "A", f.root, [], undefined, repeated.replay);
+	const links = wire.content.filter((block) => block.type === "resource_link");
+	assert.equal(links.length, 1);
+	assert.equal(links[0]?.uri, f.resource.uri);
+	assert.equal("instructions" in (repeated.replay ?? {}), false);
 });
 
-test("resource reads are observable but never asserted to be ChatGPT file receipt", async (t) => {
+test("resource reads stop automatic replay attachment without suppressing completion", async (t) => {
 	const f = await exportedFixture(t);
 	const before = Date.now();
 	const bytes = await f.broker.readResource(
@@ -108,11 +111,29 @@ test("resource reads are observable but never asserted to be ChatGPT file receip
 	assert.ok(
 		resource?.sourceReadAt !== undefined && resource.sourceReadAt >= before,
 	);
-	assert.equal(repeated.replay?.delivery?.hostReceipt, "unconfirmed");
-	await f.reconnect();
+	const wire = toolResult([], "A", f.root, [], undefined, repeated.replay);
 	assert.equal(
-		(await f.replay()).replay?.delivery?.resources[0]?.sourceReadAt,
+		wire.content.filter((block) => block.type === "resource_link").length,
+		0,
+	);
+	assert.equal(repeated.replay?.replayed, true);
+	await f.reconnect();
+	const afterRestart = await f.replay();
+	assert.equal(
+		afterRestart.replay?.delivery?.resources[0]?.sourceReadAt,
 		resource.sourceReadAt,
+	);
+	const replayWire = toolResult(
+		[],
+		"A",
+		f.root,
+		[],
+		undefined,
+		afterRestart.replay,
+	);
+	assert.equal(
+		replayWire.content.filter((block) => block.type === "resource_link").length,
+		0,
 	);
 });
 

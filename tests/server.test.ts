@@ -39,11 +39,15 @@ test("MCP tool annotations describe mutation and external access accurately", as
 		name: string;
 		annotations: Record<string, boolean>;
 	}[];
-	for (const name of ["write", "edit", "bash", "call", "transfer"]) {
+	for (const name of ["write", "edit", "bash", "call"]) {
 		const info = tools.find((tool) => tool.name === name);
 		assert.equal(info?.annotations.readOnlyHint, false, name);
 		assert.equal(info?.annotations.idempotentHint, false, name);
 	}
+	assert.equal(
+		tools.find((tool) => tool.name === "transfer")?.annotations.idempotentHint,
+		true,
+	);
 	assert.equal(
 		tools.find((tool) => tool.name === "history")?.annotations.readOnlyHint,
 		true,
@@ -79,7 +83,7 @@ test("format failures do not consume pending results", async (t) => {
 	assert.equal(f.acknowledgements, 0);
 });
 
-test("duplicate receipts do not consume or duplicate another completion", async (t) => {
+test("completed replay still delivers and acknowledges other pending results", async (t) => {
 	const f = await mcpFixture(t, {
 		deliveries: () => [delivery],
 		call: async () => ({
@@ -90,7 +94,7 @@ test("duplicate receipts do not consume or duplicate another completion", async 
 			replay: {
 				id: "operation-1",
 				status: "completed",
-				instructions: "Do not repeat",
+				replayed: true,
 			},
 		}),
 	});
@@ -98,8 +102,62 @@ test("duplicate receipts do not consume or duplicate another completion", async 
 		paths: ["file"],
 		operationId: "one",
 	});
-	assert.doesNotMatch(JSON.stringify(result), /PENDING_RESULT/);
-	assert.equal(f.acknowledgements, 0);
+	assert.match(JSON.stringify(result), /PENDING_RESULT/);
+	assert.equal(f.acknowledgements, 1);
+});
+
+test("completed chat replay still delivers and acknowledges other pending results", async (t) => {
+	const f = await mcpFixture(t, {
+		deliveries: () => [delivery],
+		chat: async () => ({
+			sessionId: "A",
+			cwd: "/fixture",
+			inputs: [],
+			replay: {
+				id: "operation-chat",
+				status: "completed",
+				replayed: true,
+			},
+		}),
+	});
+	const result = await f.call("chat", { text: "hello" });
+	assert.match(JSON.stringify(result), /PENDING_RESULT/);
+	assert.equal(f.acknowledgements, 1);
+});
+
+test("completed transfer replay re-exposes unread resources to the same ChatGPT session", async (t) => {
+	const replayResource = {
+		uri: "chappie://session/A/file/replay/file.txt",
+		name: "file.txt",
+		mimeType: "text/plain",
+		size: 1,
+	};
+	const f = await mcpFixture(t, {
+		call: async () => ({
+			sessionId: "A",
+			cwd: "/fixture",
+			inputs: [],
+			toolResults: [],
+			replay: {
+				id: "operation-resource",
+				status: "completed",
+				replayed: true,
+				delivery: {
+					hostReceipt: "unconfirmed",
+					resources: [replayResource],
+				},
+			},
+		}),
+	});
+	const result = await f.call("transfer", {
+		paths: ["file.txt"],
+		operationId: "resource-replay",
+	});
+	const links = (result.content as Array<Record<string, unknown>>).filter(
+		(block) => block.type === "resource_link",
+	);
+	assert.equal(links.length, 1);
+	assert.match(String(links[0]?.uri), /chatId=server-test/);
 });
 
 test("new sessions expose their host and agent directory", async (t) => {

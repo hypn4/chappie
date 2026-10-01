@@ -76,7 +76,7 @@ test("deferred results are references, not a new attachment approval", () => {
 	assert.match(JSON.stringify(blocks), /file.txt/);
 });
 
-test("duplicate request IDs execute once and return a receipt instead of the result again", async (t) => {
+test("concurrent retries share one native execution and the completed result", async (t) => {
 	const f = await sessionFixture(t);
 	const first = await f.queue("same-request");
 	const repeated = f.broker.call(
@@ -88,10 +88,11 @@ test("duplicate request IDs execute once and return a receipt instead of the res
 	);
 	const output = await f.dispatch();
 	await f.complete(output);
-	assert.ok("result" in (await first.pending));
+	const original = await first.pending;
+	assert.ok("result" in original);
 	const duplicate = await repeated;
-	assert.equal(duplicate.toolResults.length, 0);
-	assert.ok("replay" in duplicate);
+	assert.equal(duplicate.toolResults.length, 1);
+	assert.equal(duplicate.replay, undefined);
 	const later = await f.broker.call(
 		"test-chat",
 		"A",
@@ -99,7 +100,44 @@ test("duplicate request IDs execute once and return a receipt instead of the res
 		"same-request",
 		f.controller.signal,
 	);
-	assert.ok("replay" in later);
+	assert.equal(later.toolResults.length, 0);
+	assert.equal(later.replay?.status, "completed");
+});
+
+test("cancelling one concurrent retry keeps the shared native execution alive", async (t) => {
+	const f = await sessionFixture(t);
+	const firstController = new AbortController();
+	const secondController = new AbortController();
+	const calls = [{ name: "read", arguments: { path: "test.txt" } }];
+	const first = f.broker.call(
+		"test-chat",
+		"A",
+		calls,
+		"shared-cancel",
+		firstController.signal,
+	);
+	const second = f.broker.call(
+		"test-chat",
+		"A",
+		calls,
+		"shared-cancel",
+		secondController.signal,
+	);
+	const output = await f.dispatch();
+	const reason = new Error("first transport cancelled");
+	firstController.abort(reason);
+	await assert.rejects(first, (error) => error === reason);
+	await f.complete(output);
+	const completed = await second;
+	assert.equal(completed.toolResults.length, 1);
+	const replay = await f.broker.call(
+		"test-chat",
+		"A",
+		calls,
+		"shared-cancel",
+		f.controller.signal,
+	);
+	assert.equal(replay.replay?.status, "completed");
 });
 
 test("completed request receipts survive a broker restart", async (t) => {

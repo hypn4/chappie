@@ -81,6 +81,14 @@ export function toolResult(
 				}),
 			},
 			...toolResultsContent(toolResults, sessionId),
+			...(replay?.status === "completed"
+				? (replay.delivery?.resources ?? [])
+						.filter((resource) => resource.sourceReadAt === undefined)
+						.map(({ sourceReadAt: _read, ...resource }) => ({
+							type: "resource_link" as const,
+							...resource,
+						}))
+				: []),
 			...inputContent(inputs),
 		],
 		isError: toolResults.some(

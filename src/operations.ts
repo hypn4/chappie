@@ -21,7 +21,7 @@ export interface OperationReceipt {
 export interface ReplayReceipt {
 	id: string;
 	status: OperationReceipt["status"];
-	instructions: string;
+	replayed: true;
 	delivery?: { hostReceipt: "unconfirmed"; resources: OperationResource[] };
 }
 
@@ -109,6 +109,7 @@ export function replayReceipt(receipt: OperationReceipt): ReplayReceipt {
 	return {
 		id: receipt.key,
 		status: receipt.status,
+		replayed: true,
 		...(receipt.resources?.length
 			? {
 					delivery: {
@@ -117,7 +118,5 @@ export function replayReceipt(receipt: OperationReceipt): ReplayReceipt {
 					},
 				}
 			: {}),
-		instructions:
-			"Already accepted: do not rerun, reattach, or publish another completion automatically. Status covers native execution, not ChatGPT file receipt. delivery.resources are inert references; sourceReadAt means only a broker-side read. Explicit missing-file recovery may transfer the original URI with a stable ID for that separate user request, subject to approval. Never retry a denied approval. Reconcile uncertain executions; inspect history when references are absent.",
 	};
 }
