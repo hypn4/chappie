@@ -40,6 +40,7 @@ import {
 	type SessionToolInfo,
 	type SessionToolResult,
 } from "./ipc.ts";
+import { markOmpPrimaryContext } from "./omp-primary-context.ts";
 import { ProviderOutput } from "./provider-core.ts";
 import {
 	type ResourceDescriptor,
@@ -351,7 +352,11 @@ export class LocalSession {
 			this.#historyChanged();
 		});
 		pi.on("before_agent_start", (_event, context) => {
-			this.#refreshOmpContext(context);
+			// During a remote wake, OMP can briefly expose no model while restoring
+			// a resumed session. Preserve that accepted request only for the unknown
+			// state; an explicit provider value remains authoritative.
+			if (!this.#starting || context.model !== undefined)
+				this.#refreshOmpContext(context);
 		});
 		pi.on("session_before_tree", async (event, context) => {
 			const shared = this.#refreshOmpContext(context);
@@ -400,16 +405,21 @@ export class LocalSession {
 			this.#historyChanged();
 		});
 		pi.on("context", (event, context) => {
-			this.#refreshOmpContext(context);
+			const messages = event.messages.filter(
+				(message) =>
+					message.role !== "custom" || message.customType !== "chappie.request",
+			);
+			const primaryCandidate =
+				this.#starting ||
+				this.#ompProviderActive ||
+				context.model?.provider === "chappie";
 			return {
-				messages:
-					context.model?.provider === "chappie"
-						? []
-						: event.messages.filter(
-								(message) =>
-									message.role !== "custom" ||
-									message.customType !== "chappie.request",
-							),
+				messages: primaryCandidate
+					? markOmpPrimaryContext(
+							messages,
+							context.sessionManager.getSessionId(),
+						)
+					: messages,
 			};
 		});
 		pi.on("turn_end", (event, context) => {
@@ -425,6 +435,13 @@ export class LocalSession {
 			this.#stopOmpSessionObservers();
 			this.close();
 		});
+	}
+
+	observeOmpProviderRequest(context: OmpExtensionContext): void {
+		// before_provider_request is scoped to the model OMP will actually call.
+		// It is therefore authoritative when resume-time ExtensionContext.model
+		// briefly disagrees with the provider dispatch.
+		this.#refreshOmpContext(context);
 	}
 
 	#refreshOmpContext(context: OmpExtensionContext): ChappieContext {

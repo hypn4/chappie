@@ -1,9 +1,11 @@
 import type { AssistantMessageEventStream as OmpAssistantMessageEventStream } from "@oh-my-pi/pi-ai";
 import type {
 	ExtensionAPI as OmpExtensionAPI,
+	ExtensionContext as OmpExtensionContext,
 	ProviderConfig as OmpProviderConfig,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import type { ModelRequest } from "./ipc.ts";
+import { hasOmpPrimaryContext } from "./omp-primary-context.ts";
 import { createChappieStream, type ProviderOutput } from "./provider-core.ts";
 
 const CHAPPIE_API = "chappie";
@@ -20,6 +22,7 @@ type Generate = (
 	request: ModelRequest,
 	sessionId: string,
 ) => Promise<void>;
+type ObserveProviderRequest = (context: OmpExtensionContext) => void;
 interface OmpRequest {
 	[requestTag]: true;
 	sessionId: string;
@@ -63,14 +66,7 @@ const streamSimple: OmpStreamSimple = (model, context, options) => {
 		const generation: ModelRequest | undefined = options.codexCompaction
 			? { kind: "compaction", input: context }
 			: undefined;
-		if (
-			!generation &&
-			(typeof context !== "object" ||
-				context === null ||
-				!("messages" in context) ||
-				!Array.isArray(context.messages) ||
-				context.messages.length !== 0)
-		) {
+		if (!generation && !hasOmpPrimaryContext(context, sessionId)) {
 			throw new Error(
 				"Chappie cannot answer auxiliary model prompts; use the ChatGPT-controlled session instead.",
 			);
@@ -102,6 +98,7 @@ export function createOmpChappieProvider(
 	start: Start,
 	generate: Generate,
 	api: Pick<OmpExtensionAPI, "on">,
+	observeProviderRequest?: ObserveProviderRequest,
 ): OmpProviderConfig {
 	let disposed = false;
 	api.on("session_shutdown", () => {
@@ -110,6 +107,7 @@ export function createOmpChappieProvider(
 	api.on("before_provider_request", (event, context) => {
 		const request = event.payload;
 		if (!isRequest(request)) return;
+		observeProviderRequest?.(context);
 		const ownsRequest = () =>
 			!disposed &&
 			context.model?.provider === CHAPPIE_API &&

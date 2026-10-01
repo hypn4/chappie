@@ -12,6 +12,10 @@ import type {
 	ExtensionContext as OmpExtensionContext,
 	ProviderConfig as OmpProviderConfig,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+import {
+	createOmpPrimaryContextMessage,
+	hasOmpPrimaryContext,
+} from "../src/omp-primary-context.ts";
 import { createOmpChappieProvider } from "../src/provider.omp.ts";
 import type { ProviderOutput } from "../src/provider-core.ts";
 
@@ -52,6 +56,7 @@ function owner(
 		},
 	} as unknown as OmpExtensionAPI;
 	const starts: string[] = [];
+	const observedProviders: Array<string | undefined> = [];
 	const config = createOmpChappieProvider(
 		async (output) => {
 			starts.push(currentId);
@@ -64,6 +69,7 @@ function owner(
 			throw new Error("unexpected generation");
 		},
 		api,
+		(ctx) => observedProviders.push(ctx.model?.provider),
 	);
 	async function emit(name: string, event: unknown) {
 		for (const handler of handlers.get(name) ?? [])
@@ -83,6 +89,7 @@ function owner(
 	return {
 		config,
 		starts,
+		observedProviders,
 		emit,
 		onPayload,
 		options: () => ({ sessionId: currentId, onPayload }),
@@ -98,9 +105,14 @@ function owner(
 async function result(
 	config: OmpProviderConfig,
 	options?: SimpleStreamOptions,
-	context: Context = { messages: [] },
+	context?: Context,
 ) {
-	const stream = config.streamSimple?.(model, context, options);
+	const primarySessionId =
+		typeof options?.sessionId === "string" ? options.sessionId : "";
+	const requestContext = context ?? {
+		messages: [createOmpPrimaryContextMessage(primarySessionId)],
+	};
+	const stream = config.streamSimple?.(model, requestContext, options);
 	assert.ok(stream);
 	// The adapter returns the shared Pi/OMP event stream implementation.
 	const events = stream as unknown as AssistantMessageEventStream;
@@ -269,6 +281,47 @@ test("auxiliary prompts sharing a session hook cannot be mistaken for a native t
 	assert.equal(reply.stopReason, "error");
 	assert.match(reply.errorMessage ?? "", /auxiliary/i);
 	assert.deepEqual(a.starts, []);
+	assert.deepEqual(a.observedProviders, []);
+});
+
+test("primary provenance survives extra OMP context while auxiliary prompts remain rejected", async () => {
+	const a = owner("A");
+	const primary = {
+		messages: [
+			createOmpPrimaryContextMessage("A"),
+			{
+				role: "developer" as const,
+				content: "OMP injected context",
+				attribution: "agent" as const,
+				timestamp: Date.now(),
+			},
+		],
+	};
+	assert.equal(hasOmpPrimaryContext(primary, "A"), true);
+	assert.equal(
+		(await result(a.config, a.options(), primary)).stopReason,
+		"stop",
+	);
+	assert.deepEqual(a.starts, ["A"]);
+	assert.deepEqual(a.observedProviders, ["chappie"]);
+
+	const wrongSession = await result(a.config, a.options(), {
+		messages: [createOmpPrimaryContextMessage("B")],
+	});
+	assert.equal(wrongSession.stopReason, "error");
+	assert.match(wrongSession.errorMessage ?? "", /auxiliary/i);
+	assert.deepEqual(a.starts, ["A"]);
+	assert.deepEqual(a.observedProviders, ["chappie"]);
+
+	const auxiliary = await result(a.config, a.options(), {
+		messages: [
+			{ role: "user", content: "Summarize a label", timestamp: Date.now() },
+		],
+	});
+	assert.equal(auxiliary.stopReason, "error");
+	assert.match(auxiliary.errorMessage ?? "", /auxiliary/i);
+	assert.deepEqual(a.starts, ["A"]);
+	assert.deepEqual(a.observedProviders, ["chappie"]);
 });
 
 test("separately loaded provider modules still use the caller's hook", async () => {
@@ -297,6 +350,7 @@ test("unrelated provider payloads are not modified by the Chappie hook", async (
 	};
 	assert.equal(await a.onPayload(payload), payload);
 	assert.deepEqual(a.starts, []);
+	assert.deepEqual(a.observedProviders, []);
 });
 
 test("recognized compaction requests use a separate generation route", async () => {

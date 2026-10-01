@@ -1,8 +1,13 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { IpcClient, type SessionMessage } from "../src/ipc.ts";
+import { hasOmpPrimaryContext } from "../src/omp-primary-context.ts";
 import { ProviderOutput } from "../src/provider-core.ts";
-import { sessionFixture, until } from "./helpers/session-fixture.ts";
+import {
+	multiSessionFixture,
+	sessionFixture,
+	until,
+} from "./helpers/session-fixture.ts";
 
 const model = { api: "chappie", provider: "chappie", id: "chatgpt" };
 
@@ -14,6 +19,109 @@ test("a mismatched provider identity cannot acquire a local session", async (t) 
 		output.done();
 		return pending;
 	}, /session.*identity|identity.*session/i);
+});
+
+test("OMP remote wake survives transient resume context until the actual provider request", async (t) => {
+	const f = await multiSessionFixture(t, ["A"]);
+	const s = f.session("A");
+	void f.broker
+		.call(
+			"test-chat",
+			"A",
+			[{ name: "read", arguments: { path: "test.txt" } }],
+			"resume-first-call",
+			f.controller.signal,
+		)
+		.catch(() => {});
+	await until(() => s.wakes() === 1);
+	const transientContext = {
+		...s.context,
+		model: undefined,
+	} as typeof s.context;
+	await s.emit("before_agent_start", {}, transientContext);
+	const user = {
+		role: "user" as const,
+		content: "preserve native context",
+		timestamp: Date.now(),
+	};
+	const transformed = (await s.emit(
+		"context",
+		{
+			messages: [
+				user,
+				{
+					role: "custom",
+					customType: "chappie.request",
+					content: "",
+					display: false,
+					attribution: "agent",
+					timestamp: Date.now(),
+				},
+			],
+		},
+		transientContext,
+	)) as { messages: unknown[] };
+	assert.equal(JSON.stringify(transformed.messages), JSON.stringify([user]));
+	assert.equal(hasOmpPrimaryContext(transformed, "A"), true);
+
+	// before_provider_request is scoped to the model OMP will actually dispatch.
+	s.local.observeOmpProviderRequest(s.context);
+	const output = new ProviderOutput(model, f.controller.signal);
+	await s.local.start(output, "A");
+	assert.equal(output.message.stopReason, "toolUse");
+});
+
+test("an actual provider switch wins over a pending Chappie wake and stale controls", async (t) => {
+	const f = await multiSessionFixture(t, ["A"]);
+	const s = f.session("A");
+	const pending = f.broker
+		.call(
+			"test-chat",
+			"A",
+			[{ name: "read", arguments: { path: "test.txt" } }],
+			"switch-during-wake",
+			f.controller.signal,
+		)
+		.then(
+			(result) => ({ result }),
+			(error) => ({ error: String(error) }),
+		);
+	await until(() => s.wakes() === 1);
+	const otherContext = {
+		...s.context,
+		model: { provider: "other" },
+	} as typeof s.context;
+	const user = {
+		role: "user" as const,
+		content: "keep this for the other provider",
+		timestamp: Date.now(),
+	};
+	const control = {
+		role: "custom" as const,
+		customType: "chappie.request",
+		content: "",
+		display: false,
+		attribution: "agent" as const,
+		timestamp: Date.now(),
+	};
+	const duringRace = (await s.emit(
+		"context",
+		{ messages: [user, control] },
+		otherContext,
+	)) as { messages: unknown[] };
+	assert.equal(JSON.stringify(duringRace.messages), JSON.stringify([user]));
+
+	await s.emit("before_agent_start", {}, otherContext);
+	await until(() => f.broker.listSessions("A").length === 0);
+	assert.ok("error" in (await pending));
+
+	const staleControl = (await s.emit(
+		"context",
+		{ messages: [user, control] },
+		otherContext,
+	)) as { messages: unknown[] };
+	assert.equal(JSON.stringify(staleControl.messages), JSON.stringify([user]));
+	assert.equal(hasOmpPrimaryContext(staleControl, "A"), false);
 });
 
 test("auxiliary generation replies without replacing the open primary provider", async (t) => {

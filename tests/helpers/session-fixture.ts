@@ -60,7 +60,11 @@ export async function multiSessionFixture(
 			local: LocalSession;
 			context: OmpExtensionContext;
 			branch: unknown[];
-			emit(name: string, event: unknown): Promise<unknown>;
+			emit(
+				name: string,
+				event: unknown,
+				context?: OmpExtensionContext,
+			): Promise<unknown>;
 			wakes(): number;
 		}
 	>();
@@ -138,8 +142,11 @@ export async function multiSessionFixture(
 		);
 		locals.push(local);
 		local.installOmp(api);
-		const emit = async (name: string, event: unknown) =>
-			await handlers.get(name)?.(event, context);
+		const emit = async (
+			name: string,
+			event: unknown,
+			ctx: OmpExtensionContext = context,
+		) => await handlers.get(name)?.(event, ctx);
 		await emit("session_start", {});
 		await until(() => broker.listSessions(id).length === 1);
 		sessions.set(id, {

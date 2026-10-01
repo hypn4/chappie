@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { spawn, spawnSync } from "node:child_process";
 import {
 	mkdir,
 	mkdtemp,
@@ -14,6 +13,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { Broker } from "../src/broker.ts";
 import { toolResultsContent } from "../src/delivery.ts";
+import { createOmpProcessHarness } from "./omp-process-harness.mjs";
 
 // These are synthetic tool requests, not a second model/agent doing inference.
 const checkout = fileURLToPath(new URL("../", import.meta.url));
@@ -107,92 +107,47 @@ export default async function probe(api) {
 }
 `,
 );
-const broker = new Broker(agent);
+let broker = new Broker(agent);
 const controller = new AbortController();
 const timer = setTimeout(
 	() => controller.abort(new Error("OMP integration test timed out")),
 	25000,
 );
-let child;
-let logs = "";
-let processError;
 const signal = controller.signal;
+const commonArgs = [
+	"--mode",
+	"rpc",
+	"--no-extensions",
+	"--no-skills",
+	"--no-rules",
+	"--no-lsp",
+	"--no-title",
+	"--no-prewalk",
+	"--approval-mode",
+	"yolo",
+	"--config",
+	settingsFile,
+	"-e",
+	probeExtension,
+	"--model",
+	"chappie/chatgpt",
+];
+const env = {
+	...process.env,
+	PI_CODING_AGENT_DIR: agent,
+	PI_CONFIG_DIR: ".chappie-integration",
+	OMP_PROFILE: "",
+	PI_PROFILE: "",
+};
+const omp = createOmpProcessHarness({
+	work,
+	env,
+	baseArgs: commonArgs,
+});
 try {
 	await broker.start();
-	const args = [
-		"--mode",
-		"rpc",
-		"--no-session",
-		"--no-extensions",
-		"--no-skills",
-		"--no-rules",
-		"--no-lsp",
-		"--no-title",
-		"--no-prewalk",
-		"--approval-mode",
-		"yolo",
-		"--config",
-		settingsFile,
-		"-e",
-		probeExtension,
-		"--model",
-		"chappie/chatgpt",
-	];
-	const ompEntry = process.env.OMP_ENTRY;
-	const command = ompEntry ? process.execPath : process.env.OMP_BINARY || "omp";
-	const commandArgs = ompEntry ? [ompEntry] : [];
-	const env = {
-		...process.env,
-		PI_CODING_AGENT_DIR: agent,
-		PI_CONFIG_DIR: ".chappie-integration",
-		OMP_PROFILE: "",
-		PI_PROFILE: "",
-	};
-	// Windows command shims require cmd.exe. Quote every fixed/test-generated
-	// argument and reject expansion characters rather than interpolating shell text.
-	if (process.platform === "win32" && !ompEntry) {
-		const quote = (value) => {
-			if (/["%\r\n]/.test(value))
-				throw new Error("Unsafe Windows launcher argument");
-			return `"${value}"`;
-		};
-		child = spawn(
-			process.env.ComSpec || "cmd.exe",
-			[
-				"/d",
-				"/s",
-				"/v:off",
-				"/c",
-				`"${[command, ...commandArgs, ...args].map(quote).join(" ")}"`,
-			],
-			{
-				cwd: work,
-				env,
-				windowsVerbatimArguments: true,
-				stdio: ["pipe", "pipe", "pipe"],
-			},
-		);
-	} else {
-		child = spawn(command, [...commandArgs, ...args], {
-			cwd: work,
-			env,
-			stdio: ["pipe", "pipe", "pipe"],
-		});
-	}
-	child.on("error", (error) => {
-		processError = error;
-	});
-	for (const stream of [child.stdout, child.stderr])
-		stream.on("data", (bytes) => {
-			logs = (logs + bytes.toString()).slice(-10000);
-		});
-	while (broker.listSessions().length === 0) {
-		signal.throwIfAborted();
-		if (processError) throw processError;
-		if (child.exitCode !== null)
-			throw new Error(`OMP exited with status ${child.exitCode}`);
-		await delay(20);
-	}
+	omp.launch(["--no-session"]);
+	await omp.waitForSession(() => broker.listSessions(), signal);
 	while (true) {
 		signal.throwIfAborted();
 		try {
@@ -407,39 +362,92 @@ try {
 		signal,
 	);
 	assert.ok(completedTodo.toolResults.every((item) => !item.isError));
-	await broker.chat(
+	// Keep OMP alive while restarting only the broker. The first remote request
+	// after the session reconnects must take the normal Chappie provider path;
+	// this is the lifecycle that previously misclassified the primary turn as
+	// auxiliary because OMP's live model context was transient during resume.
+	await broker.close();
+	await delay(30);
+	broker = new Broker(agent);
+	await broker.start();
+	while (broker.listSessions().length === 0) {
+		signal.throwIfAborted();
+		omp.assertHealthy();
+		await delay(20);
+	}
+	const reconnected = broker.listSessions()[0];
+	assert.equal(reconnected.id, session.id);
+	const firstAfterReconnect = await broker.call(
 		"integration-chat",
-		session.id,
+		reconnected.id,
+		[{ name: "read", arguments: { path: "fixture.txt" } }],
+		"first-after-broker-reconnect",
+		signal,
+	);
+	assert.ok(
+		firstAfterReconnect.toolResults.every((item) => !item.isError),
+		"first Chappie request after broker reconnect must complete normally",
+	);
+	// Reproduce the real failure mode: stop OMP itself, restore the same saved
+	// session, then make the first Chappie provider call after plugin startup.
+	await omp.stop();
+	await omp.waitForNoSessions(() => broker.listSessions(), signal);
+	const resumeDir = join(root, "resume-sessions");
+	await mkdir(resumeDir);
+	omp.launch(["--session-dir", resumeDir]);
+	const persisted = await omp.waitForSession(
+		() => broker.listSessions(),
+		signal,
+	);
+	const primed = await broker.call(
+		"resume-integration-chat",
+		persisted.id,
+		[{ name: "read", arguments: { path: "fixture.txt" } }],
+		"prime-resumable-session",
+		signal,
+	);
+	assert.ok(primed.toolResults.every((item) => !item.isError));
+	await omp.stop();
+	await omp.waitForNoSessions(() => broker.listSessions(), signal);
+
+	omp.launch(["--session-dir", resumeDir, "--resume", persisted.id]);
+	const restored = await omp.waitForSession(
+		() => broker.listSessions(),
+		signal,
+		persisted.id,
+	);
+	const firstAfterSessionResume = await broker.call(
+		"resume-integration-chat",
+		restored.id,
+		[{ name: "read", arguments: { path: "fixture.txt" } }],
+		"first-after-omp-session-resume",
+		signal,
+	);
+	assert.ok(
+		firstAfterSessionResume.toolResults.every((item) => !item.isError),
+		"first Chappie request after OMP session resume must complete normally",
+	);
+	await broker.chat(
+		"resume-integration-chat",
+		restored.id,
 		"Integration test complete.",
 		"done",
 		signal,
 	);
 	console.log(
-		"OMP integration passed: provider ownership after replacement/disposal, auxiliary rejection, local collaboration registration, TODO continuation, exact read, native edit, resource bytes, replay and original-URI recovery.",
+		"OMP integration passed: provider ownership after replacement/disposal, auxiliary rejection, broker reconnect first-turn routing, saved-session resume first-turn routing, local collaboration registration, TODO continuation, exact read, native edit, resource bytes, replay and original-URI recovery.",
 	);
 	console.log(
 		"No subagents, external model inference or live broker changes were used. ChatGPT approval UI and final response rendering are not covered.",
 	);
 } catch (error) {
 	console.error(error);
-	console.error(logs);
+	console.error(omp.logs);
 	process.exitCode = 1;
 } finally {
 	clearTimeout(timer);
 	controller.abort(new Error("Integration cleanup"));
-	if (child && child.exitCode === null && !processError) {
-		if (process.platform === "win32" && child.pid) {
-			spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
-				stdio: "ignore",
-				timeout: 5000,
-			});
-		} else child.kill("SIGTERM");
-		await Promise.race([
-			new Promise((resolve) => child.once("exit", resolve)),
-			delay(1000),
-		]);
-		if (child.exitCode === null) child.kill("SIGKILL");
-	}
+	await omp.stop();
 	await broker.close();
 	await rm(root, { recursive: true, force: true });
 }
