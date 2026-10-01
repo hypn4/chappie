@@ -1,3 +1,4 @@
+import { lookup } from "node:dns/promises";
 import { createWriteStream } from "node:fs";
 import {
 	chmod,
@@ -8,6 +9,7 @@ import {
 	rename,
 	stat,
 } from "node:fs/promises";
+import { BlockList, isIP } from "node:net";
 import { homedir, hostname } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { Readable } from "node:stream";
@@ -25,6 +27,62 @@ import {
 	type ResourceDescriptor,
 	registerFile,
 } from "./resources.ts";
+
+const MAX_HOST_DOWNLOAD_BYTES = 512 * 1024 * 1024;
+const MAX_TRANSFER_BATCH_BYTES = 2 * 1024 * 1024 * 1024;
+const blockedHostAddressesV4 = new BlockList();
+const blockedHostAddressesV6 = new BlockList();
+for (const [network, prefix] of [
+	["0.0.0.0", 8],
+	["10.0.0.0", 8],
+	["100.64.0.0", 10],
+	["127.0.0.0", 8],
+	["169.254.0.0", 16],
+	["172.16.0.0", 12],
+	["192.168.0.0", 16],
+	["198.18.0.0", 15],
+	["224.0.0.0", 4],
+	["240.0.0.0", 4],
+] as const)
+	blockedHostAddressesV4.addSubnet(network, prefix, "ipv4");
+for (const [network, prefix] of [
+	["::", 128],
+	["::1", 128],
+	["::ffff:0:0", 96],
+	["fc00::", 7],
+	["fe80::", 10],
+	["ff00::", 8],
+] as const)
+	blockedHostAddressesV6.addSubnet(network, prefix, "ipv6");
+
+async function assertSafeHostDownload(url: URL): Promise<void> {
+	if (url.protocol !== "https:")
+		throw new Error("Host file downloads require HTTPS");
+	if (url.username || url.password)
+		throw new Error("Host file download URLs cannot contain credentials");
+	const hostname = url.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+	if (
+		hostname === "localhost" ||
+		hostname.endsWith(".localhost") ||
+		hostname.endsWith(".local") ||
+		hostname.endsWith(".internal") ||
+		hostname.endsWith(".home.arpa")
+	)
+		throw new Error("Host file download URL cannot target a local address");
+	const literalFamily = isIP(hostname);
+	const addresses = literalFamily
+		? [{ address: hostname, family: literalFamily }]
+		: await lookup(hostname, { all: true, verbatim: true });
+	if (
+		addresses.length === 0 ||
+		addresses.some(({ address, family }) =>
+			family === 6
+				? blockedHostAddressesV6.check(address, "ipv6")
+				: blockedHostAddressesV4.check(address, "ipv4"),
+		)
+	)
+		throw new Error("Host file download URL cannot target a local address");
+}
 
 export interface TransferDetails {
 	failed?: boolean;
@@ -66,7 +124,7 @@ const parameters = Type.Object({
 		Type.Array(transferFile, {
 			minItems: 1,
 			description:
-				"ChatGPT files paired with paths in order; omit for Pi sources",
+				"Host-injected ChatGPT files paired with paths in order; unavailable to generic/native calls",
 		}),
 	),
 	from: Type.Optional(
@@ -132,27 +190,32 @@ export async function executeTransfer(
 	if (args.files.length !== args.paths.length) {
 		throw new Error("files and paths must contain the same number of entries");
 	}
-	const files = await Promise.all(
-		args.paths.map(async (requested, index) => {
-			const path = localPath(requested, cwd);
-			const source = args.files?.[index];
-			if (!source) throw new Error("files and paths must correspond by index");
-			try {
-				const bytes = await importFile(
-					path,
-					source.download_url,
-					args.overwrite === true,
-					signal,
-				);
-				return { path, bytes };
-			} catch (error) {
-				return {
-					path: requested,
-					error: error instanceof Error ? error.message : String(error),
-				};
-			}
-		}),
-	);
+	const files: TransferDetails["files"] = [];
+	const budget = { remaining: MAX_TRANSFER_BATCH_BYTES };
+	for (const [index, requested] of args.paths.entries()) {
+		const path = localPath(requested, cwd);
+		const source = args.files[index];
+		if (!source) throw new Error("files and paths must correspond by index");
+		try {
+			if (budget.remaining <= 0)
+				throw new Error("Host file batch exceeds the 2 GiB size limit");
+			const bytes = await importFile(
+				path,
+				source.download_url,
+				args.overwrite === true,
+				signal,
+				undefined,
+				Math.min(MAX_HOST_DOWNLOAD_BYTES, budget.remaining),
+				budget,
+			);
+			files.push({ path, bytes });
+		} catch (error) {
+			files.push({
+				path: requested,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
 	return transferResult({ device, files, resources: [] });
 }
 
@@ -278,28 +341,37 @@ export async function copyFiles(
 ): Promise<TransferDetails["files"]> {
 	if (paths.length !== resources.length)
 		throw new Error("Source and destination counts must match");
-	return Promise.all(
-		paths.map(async (requested, index) => {
-			const path = localPath(requested, cwd);
-			try {
-				const resource = resources[index];
-				if (!resource) throw new Error("Missing source resource");
-				const bytes = await importFile(
-					path,
-					read(resource),
-					overwrite,
-					signal,
-					resource.size,
-				);
-				return { path, bytes };
-			} catch (error) {
-				return {
-					path: requested,
-					error: error instanceof Error ? error.message : String(error),
-				};
-			}
-		}),
+	const totalBytes = resources.reduce(
+		(total, resource) => total + resource.size,
+		0,
 	);
+	if (
+		!Number.isSafeInteger(totalBytes) ||
+		totalBytes > MAX_TRANSFER_BATCH_BYTES
+	)
+		throw new Error("Session copy exceeds the 2 GiB size limit");
+	const files: TransferDetails["files"] = [];
+	for (const [index, requested] of paths.entries()) {
+		const path = localPath(requested, cwd);
+		try {
+			const resource = resources[index];
+			if (!resource) throw new Error("Missing source resource");
+			const bytes = await importFile(
+				path,
+				read(resource),
+				overwrite,
+				signal,
+				resource.size,
+			);
+			files.push({ path, bytes });
+		} catch (error) {
+			files.push({
+				path: requested,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+	return files;
 }
 
 function localPath(path: string, cwd: string): string {
@@ -316,6 +388,8 @@ async function importFile(
 	overwrite: boolean,
 	signal?: AbortSignal,
 	expectedBytes?: number,
+	maxHostBytes = MAX_HOST_DOWNLOAD_BYTES,
+	budget?: { remaining: number },
 ): Promise<number> {
 	return withFileMutationQueue(path, async () => {
 		signal?.throwIfAborted();
@@ -333,17 +407,42 @@ async function importFile(
 		let readable: Readable;
 		if (typeof source === "string") {
 			const url = new URL(source);
-			if (url.protocol !== "https:" && url.protocol !== "http:") {
-				throw new Error("File downloads require an HTTP(S) URL from the host");
-			}
-			const response = await fetch(url, signal ? { signal } : {});
+			await assertSafeHostDownload(url);
+			const response = await fetch(url, {
+				...(signal ? { signal } : {}),
+				redirect: "error",
+			});
 			if (!response.ok || !response.body) {
 				await response.body?.cancel();
 				throw new Error(`Download failed with HTTP ${response.status}`);
 			}
-			// Node fetch uses a native web stream; DOM and Node declarations differ.
-			readable = Readable.fromWeb(
+			const declared = Number(response.headers.get("content-length"));
+			if (Number.isFinite(declared) && declared > maxHostBytes) {
+				await response.body.cancel();
+				throw new Error("Host file exceeds the transfer size limit");
+			}
+			const sourceStream = Readable.fromWeb(
 				response.body as unknown as NodeReadableStream<Uint8Array>,
+			);
+			readable = Readable.from(
+				(async function* () {
+					let received = 0;
+					for await (const chunk of sourceStream) {
+						const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+						received += bytes.length;
+						if (budget) {
+							if (bytes.length > budget.remaining) {
+								budget.remaining = 0;
+								throw new Error("Host file batch exceeds the 2 GiB size limit");
+							}
+							budget.remaining -= bytes.length;
+						}
+						if (received > maxHostBytes)
+							throw new Error("Host file exceeds the transfer size limit");
+						yield bytes;
+					}
+				})(),
+				{ objectMode: false },
 			);
 		} else {
 			readable = Readable.from(source, { objectMode: false });

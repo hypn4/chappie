@@ -2,7 +2,8 @@ import { randomUUID } from "node:crypto";
 import { access } from "node:fs/promises";
 import { hostname } from "node:os";
 import { resolve } from "node:path";
-import type { ToolResultMessage, UserMessage } from "@earendil-works/pi-ai";
+import { isDeepStrictEqual } from "node:util";
+import type { UserMessage } from "@earendil-works/pi-ai";
 import type {
 	ExtensionAPI as PiExtensionAPI,
 	ExtensionContext as PiExtensionContext,
@@ -37,6 +38,7 @@ import {
 	type SessionSkillInfo,
 	type SessionStatus,
 	type SessionToolInfo,
+	type SessionToolResult,
 } from "./ipc.ts";
 import { ProviderOutput } from "./provider-core.ts";
 import {
@@ -207,7 +209,7 @@ interface ActiveRequest {
 	completed: boolean;
 	error?: string;
 	cancelled: string | undefined;
-	toolResults: ToolResultMessage[];
+	toolResults: SessionToolResult[];
 }
 
 interface GenerationRequest {
@@ -651,6 +653,7 @@ export class LocalSession {
 
 	async remoteCall(
 		sessionId: string,
+		operationId: string,
 		calls: ToolInput[],
 		signal?: AbortSignal,
 	) {
@@ -663,7 +666,7 @@ export class LocalSession {
 				type: "call",
 				sessionId,
 				chatId: self,
-				requestId: randomUUID(),
+				requestId: operationId,
 				calls: calls.map((call) => ({
 					type: "toolCall",
 					id: `chappie-${randomUUID()}`,
@@ -680,6 +683,7 @@ export class LocalSession {
 
 	async remoteChat(
 		sessionId: string,
+		operationId: string,
 		text: string,
 		replyTo?: string,
 		signal?: AbortSignal,
@@ -691,7 +695,7 @@ export class LocalSession {
 				type: "chat",
 				sessionId,
 				chatId: self,
-				requestId: randomUUID(),
+				requestId: operationId,
 				text,
 				...(replyTo ? { replyTo } : {}),
 			},
@@ -737,6 +741,8 @@ export class LocalSession {
 			throw new Error("Transfers require between 1 and 128 paths");
 		if ([args.files, args.from, args.to].filter(Boolean).length > 1)
 			throw new Error("Supply one of files, from, or to");
+		if (args.files && !this.#allowsHostFileImport(args))
+			throw new Error("Host file imports require the direct transfer tool");
 		if (args.from) {
 			const exported = await this.#request(
 				{
@@ -805,6 +811,18 @@ export class LocalSession {
 		if (!("transfer" in result))
 			throw new Error("Agent session returned no transfer result");
 		return transferResult({ ...result.transfer, device: hostname() });
+	}
+
+	#allowsHostFileImport(args: TransferArgs): boolean {
+		const active = this.#active;
+		if (active?.request.type !== "call" || !active.request.direct) return false;
+		return active.request.calls.some(
+			(call) =>
+				call.name === "transfer" &&
+				call.arguments.operationId === args.operationId &&
+				isDeepStrictEqual(call.arguments.paths, args.paths) &&
+				isDeepStrictEqual(call.arguments.files, args.files),
+		);
 	}
 
 	close(permanent = true): void {
@@ -1424,7 +1442,7 @@ export class LocalSession {
 
 	async #turnEnd(
 		message: unknown,
-		toolResults: ToolResultMessage[],
+		toolResults: SessionToolResult[],
 		context: ChappieContext,
 	): Promise<void> {
 		if (context.sessionManager.getSessionId() === this.#sessionId) {

@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { TestContext } from "node:test";
@@ -35,10 +35,19 @@ function fixtureWireSchema(tool: OmpToolInfo): Record<string, unknown> {
 	return Object.fromEntries(Object.entries(parameters));
 }
 
-export async function multiSessionFixture(t: TestContext, ids = ["A", "B"]) {
+export async function multiSessionFixture(
+	t: TestContext,
+	ids = ["A", "B"],
+	localTools = false,
+) {
 	const root = await mkdtemp(
 		join(process.platform === "win32" ? tmpdir() : "/tmp", "chmulti-"),
 	);
+	if (localTools)
+		await writeFile(
+			join(root, "chappie.json"),
+			JSON.stringify({ localTools: true }),
+		);
 	const broker = new Broker(root);
 	const controller = new AbortController();
 	const timers: NodeJS.Timeout[] = [];
@@ -124,6 +133,8 @@ export async function multiSessionFixture(t: TestContext, ids = ["A", "B"]) {
 			root,
 			undefined,
 			"omp",
+			undefined,
+			localTools,
 		);
 		locals.push(local);
 		local.installOmp(api);

@@ -1,6 +1,6 @@
-import type { ToolCall, ToolResultMessage } from "@earendil-works/pi-ai";
+import type { ToolCall } from "@earendil-works/pi-ai";
 import * as z from "zod";
-import type { SessionToolInfo } from "./ipc.ts";
+import type { SessionToolInfo, SessionToolResult } from "./ipc.ts";
 import type { ToolInput } from "./tools.ts";
 
 /** Normalize native schema objects before JSON.stringify can erase callable types. */
@@ -69,8 +69,11 @@ export function directHostCall(
 			const properties = (
 				schema.parameters as { properties?: Record<string, unknown> }
 			).properties;
-			if (properties?.input && !properties.patch)
+			if (properties?.input && !properties.patch) {
+				if (typeof args.patch !== "string")
+					throw new Error("OMP edit requires its native patch input");
 				return { ...call, arguments: { input: args.patch } };
+			}
 			if (!properties?.patch)
 				throw new Error(
 					"This OMP edit mode requires native arguments; use tools and call",
@@ -110,8 +113,8 @@ export function directHostCall(
 /** OMP may expand small-file previews; keep the direct read range exact. */
 export function directHostResults(
 	calls: ToolCall[],
-	results: ToolResultMessage[],
-): ToolResultMessage[] {
+	results: SessionToolResult[],
+): SessionToolResult[] {
 	return results.map((result) => {
 		const call = calls.find(
 			(call) => call.id === result.toolCallId && call.name === "read",

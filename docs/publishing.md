@@ -18,8 +18,12 @@ The repository pins Bun in `.bun-version`, declares the same version in
 `packageManager`, and commits the text `bun.lock`. Use `bun ci` for
 reproducible CI installs; it fails when `package.json` and the lockfile differ.
 `bunfig.toml` uses Bun Shell for cross-platform package scripts and applies a
-three-day minimum-release-age policy to newly resolved packages. Frozen
-`bun.lock` installs remain reproducible without weakening that gate for future OMP releases.
+three-day minimum-release-age policy to routine dependency resolution.
+Maintained direct dependencies are exact-pinned. A deliberate same-day release
+train update can bypass the age filter only for that lockfile refresh, for
+example `bun update '@oh-my-pi/*' --minimum-release-age=0`; review the lock
+diff, run `bun audit` and the full suite, and commit the resulting
+`bun.lock`. CI always uses the frozen lockfile.
 
 Bun's default-secure lifecycle policy is retained. Only dependencies whose
 installation scripts are required by this dependency graph are listed in
@@ -27,25 +31,22 @@ installation scripts are required by this dependency graph are listed in
 
 ## Verification pipeline
 
-`check.yml` is reused by pull requests, releases, and npm publishing:
+`check.yml` keeps only distinct verification paths:
 
-1. Install from `bun.lock` with `bun ci` on Linux, macOS, and Windows.
-2. Run source checks, the Bun test suite, native OMP integration, and the
-   otunnel protocol compatibility suite on all three operating systems.
-3. Verify the declared OMP 18.3 compatibility floor in a separate Linux job.
-4. Build one tarball on Linux with `bun run build` followed by
-   `bun pm pack --ignore-scripts`, then upload it as `npm-package`.
-5. Download those exact bytes on all three operating systems, install them in a
-   clean consumer with `bun add --ignore-scripts`, add the pinned OMP runtime
-   used by the checkout integration suite, start the installed broker, and run
-   the packaged OMP integration suite. Each consumer verifies the archive's
-   SHA-512 integrity.
+1. Run `bun ci` and source checks on Linux and Windows. Windows also runs
+   the current native OMP integration to cover platform-specific process and
+   path behavior.
+2. On Linux, run `bun audit --audit-level=high`, verify the declared OMP 18.3
+   compatibility floor, and exercise the real otunnel 0.2.0 release binary.
+3. Build one tarball on Linux, verify its contents and SHA-512 integrity, then
+   install those same bytes once in a clean Bun consumer with the current OMP
+   runtime.
+4. Upload that verified tarball as `npm-package` for the release workflow.
 
-The maintained tunnel compatibility baseline is `otunnel 0.2.x`. Run
-`bun run test:otunnel` to verify an installed 0.2 runtime and Chappie's
-`openai/session`, `otunnel/requestId`, and duplicate-request contracts. The
-runtime check is skipped when `otunnel` is not installed, while protocol
-regressions still run.
+The maintained tunnel compatibility baseline is `otunnel 0.2.x`. Local
+`bun run test:otunnel` still skips only the binary check when otunnel is not
+installed; CI downloads the pinned 0.2.0 release and therefore never skips the
+runtime contract.
 
 For a local package check, choose a new, empty directory outside the checkout:
 
@@ -59,13 +60,13 @@ bun pm pack --ignore-scripts --filename package.tgz
 bun scripts/verify-package.mjs package.tgz --prepare /path/to/empty-consumer
 cd /path/to/empty-consumer
 bun add --ignore-scripts /path/to/chappie/package.tgz
-bun add --ignore-scripts @oh-my-pi/pi-coding-agent@18.4.4
+bun add --ignore-scripts @oh-my-pi/pi-coding-agent@18.4.6
 cd /path/to/chappie
 bun scripts/verify-package.mjs package.tgz --installed /path/to/empty-consumer --omp
 ```
 
-Git checkout tests and package checks serve different purposes; never replace
-the package install with a link to source dependencies.
+Source tests and package checks serve different purposes; the package consumer
+uses the packed artifact rather than a checkout link.
 
 After publishing, verify the README's `bun x` command with MCP stdin kept
 open, then confirm `omp plugin install @hypn4/chappie` and the explicit
@@ -84,9 +85,10 @@ intentionally narrow.
 This fork is configured for `hypn4/chappie`, workflow `publish.yml`,
 environment `release`, and repository variable
 `NPM_TRUSTED_PUBLISHING=true`. The publish job verifies npm 11.5.1 or newer,
-the minimum client version for Trusted Publishing. Only this final job has
-`id-token: write`; it receives the already-tested tarball and does not rebuild
-or install source dependencies.
+recovers the immutable `npm-package` Actions artifact from the successful
+release workflow, compares it byte-for-byte with the GitHub Release asset, and
+publishes the verified artifact. It does not rebuild or rerun the source test
+matrix. Only this final job has `id-token: write`.
 
 For a new package or repository, follow npm's Trusted Publishers setup guide.
 Do not add a bypass-2FA token or automate browser/account approvals.
@@ -96,8 +98,11 @@ Do not add a bypass-2FA token or automate browser/account approvals.
 Commit the new version and intended `publishConfig.tag` to `main`, then push
 its exact `v<version>` tag. `release.yml` reuses the verification pipeline
 and creates a draft GitHub Release. Publishing that draft triggers
-`publish.yml`. Alternatively, run `publish.yml` with an existing,
-unpublished tag and `dry_run=false`.
+`publish.yml`. Manual `publish.yml` runs require that same tag to already
+have the draft/release artifact created by a successful `release.yml` run.
+The verified Actions artifact is retained for 30 days. Publish a draft release
+within that window; after expiry, rerun the release verification instead of
+bypassing the artifact identity check.
 
 The workflow requires the tagged commit to belong to `main` and validates its
 committed channel. The release environment publishes the exact verified

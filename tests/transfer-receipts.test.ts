@@ -189,6 +189,40 @@ test("late export results retain references even after their delivery record is 
 	assert.deepEqual(loaded.deliveries("chat"), []);
 });
 
+test("a failed acknowledgement cannot revive a delivery consumed by another response", async (t) => {
+	const root = await mkdtemp(join(tmpdir(), "ch-ack-race-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const delivery = {
+		id: "delivery-race",
+		chatId: "chat",
+		sessionId: "A",
+		cwd: root,
+		complete: true,
+		toolResults: [],
+	};
+	await writeFile(
+		join(root, "chappie.state.json"),
+		JSON.stringify({ deliveries: [delivery] }),
+	);
+	const state = new State(root);
+	await state.load();
+	const cancelled = new AbortController();
+	const first = state.acknowledge([delivery], [], cancelled.signal);
+	const second = state.acknowledge(
+		[delivery],
+		[],
+		new AbortController().signal,
+	);
+	queueMicrotask(() => cancelled.abort(new Error("first response cancelled")));
+	const [firstResult, secondResult] = await Promise.allSettled([first, second]);
+	assert.equal(firstResult.status, "rejected");
+	assert.equal(secondResult.status, "fulfilled");
+	assert.deepEqual(state.deliveries("chat"), []);
+	const restored = new State(root);
+	await restored.load();
+	assert.deepEqual(restored.deliveries("chat"), []);
+});
+
 test("legacy completion receipts never claim host delivery or fabricate resource references", async (t) => {
 	const root = await mkdtemp(join(tmpdir(), "ch-recovery-"));
 	t.after(() => rm(root, { recursive: true, force: true }));
@@ -376,6 +410,85 @@ test("transfer.from cancellation does not create a destination", async (t) => {
 		readFile(join(destination.cwd, "cancelled.txt"), "utf8"),
 		/ENOENT/,
 	);
+});
+
+test("native transfer rejects host file URLs outside a direct Chappie request", async (t) => {
+	const f = await multiSessionFixture(t);
+	const destination = f.session("B");
+	await assert.rejects(
+		destination.local.transfer(
+			{
+				operationId: "untrusted-host-file",
+				paths: ["blocked.txt"],
+				files: [
+					{
+						file_id: "file",
+						download_url: "https://93.184.216.34/file",
+					},
+				],
+			},
+			f.controller.signal,
+			undefined,
+			{ sessionId: "B", cwd: destination.cwd },
+		),
+		/direct transfer tool/i,
+	);
+});
+
+test("direct Chappie transfer may import the host files it requested", async (t) => {
+	const f = await sessionFixture(t);
+	t.mock.method(globalThis, "fetch", async () => new Response("HOST"));
+	const calls = [
+		{
+			name: "transfer",
+			arguments: {
+				operationId: "trusted-host-file",
+				paths: ["host.txt"],
+				files: [
+					{
+						file_id: "file",
+						download_url: "https://93.184.216.34/file",
+					},
+				],
+			},
+		},
+	];
+	const pending = f.broker.call(
+		"test-chat",
+		"A",
+		calls,
+		"trusted-host-file",
+		f.controller.signal,
+		true,
+	);
+	const output = await f.dispatch();
+	const call = output.message.content.find(
+		(block) => block.type === "toolCall",
+	);
+	assert.ok(call?.type === "toolCall");
+	const transfer = await f.local.transfer(
+		call.arguments as (typeof calls)[0]["arguments"],
+		f.controller.signal,
+		undefined,
+		{ sessionId: "A", cwd: join(f.root, "A") },
+	);
+	await f.emit("turn_end", {
+		message: structuredClone(output.message),
+		toolResults: [
+			{
+				role: "toolResult",
+				toolCallId: call.id,
+				toolName: call.name,
+				content: transfer.content,
+				details: transfer.details,
+				isError: transfer.isError === true,
+				timestamp: Date.now(),
+			},
+		],
+	});
+	await f.emit("agent_end", { willContinue: false });
+	await pending;
+	assert.equal(await readFile(join(f.root, "A", "host.txt"), "utf8"), "HOST");
 });
 
 test("transfer direction selectors are mutually exclusive", async (t) => {

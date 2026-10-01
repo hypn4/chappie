@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -8,6 +8,7 @@ import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import { deliveryContent, toolResultsContent } from "../src/delivery.ts";
 import { historyResult } from "../src/history.ts";
 import { operationIdentity } from "../src/operations.ts";
+import { questionInput } from "../src/questions.ts";
 import { State } from "../src/state.ts";
 import { createOmpTransferTool } from "../src/transfer.omp.ts";
 import { transfer } from "../src/transfer.ts";
@@ -248,4 +249,118 @@ test("acknowledged deferred results are not resurrected by delivery retries", as
 	await resumed.load();
 	await resumed.addDelivery(delivery);
 	assert.deepEqual(resumed.deliveries("chat"), []);
+});
+
+test("failed persistence rolls back bindings and saved questions", async (t) => {
+	const root = await mkdtemp(join(tmpdir(), "chappie-state-failure-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const parent = join(root, "not-a-directory");
+	await writeFile(parent, "fixture");
+	const state = new State(join(parent, "agent"));
+
+	await assert.rejects(state.bind("chat", "A"));
+	assert.equal(state.binding("chat"), undefined);
+	await assert.rejects(
+		state.addQuestion({
+			id: "q",
+			sessionId: "A",
+			cwd: root,
+			chatId: "chat",
+			question: "Question?",
+			options: [],
+			allowMultiple: false,
+			delivered: false,
+		}),
+	);
+	assert.throws(() => state.question("chat", "q"), /not found/i);
+});
+
+test("question input is bounded and old delivered questions are pruned", async (t) => {
+	assert.throws(
+		() => questionInput.parse({ question: "x".repeat(4097) }),
+		/too big|4096/i,
+	);
+	const root = await mkdtemp(join(tmpdir(), "chappie-question-retention-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const questions = Array.from({ length: 1024 }, (_, i) => ({
+		id: `q-${i}`,
+		sessionId: "A",
+		cwd: root,
+		chatId: "chat",
+		question: "Question?",
+		options: [],
+		allowMultiple: false,
+		delivered: true,
+	}));
+	await writeFile(
+		join(root, "chappie.state.json"),
+		JSON.stringify({ questions }),
+	);
+	const state = new State(root);
+	await state.load();
+	await state.addQuestion({
+		id: "new-question",
+		sessionId: "A",
+		cwd: root,
+		chatId: "chat",
+		question: "New question?",
+		options: [],
+		allowMultiple: false,
+		delivered: false,
+	});
+	assert.equal(state.question("chat", "new-question").id, "new-question");
+});
+
+test("bindings migrate, persist active touches, and prune after 30 idle days", async (t) => {
+	const root = await mkdtemp(join(tmpdir(), "chappie-binding-retention-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const day = 24 * 60 * 60 * 1000;
+	let now = 2_000_000_000_000;
+	t.mock.method(Date, "now", () => now);
+	await writeFile(
+		join(root, "chappie.state.json"),
+		JSON.stringify({
+			bindings: {
+				legacy: "legacy-session",
+				stale: {
+					sessionId: "stale-session",
+					lastUsedAt: now - 31 * day,
+				},
+				fresh: {
+					sessionId: "fresh-session",
+					lastUsedAt: now - 29 * day,
+				},
+			},
+		}),
+	);
+	const state = new State(root);
+	await state.load();
+	let saved = JSON.parse(
+		await readFile(join(root, "chappie.state.json"), "utf8"),
+	);
+	assert.equal(saved.bindings.stale, undefined);
+	assert.equal(saved.bindings.legacy.sessionId, "legacy-session");
+
+	assert.equal(state.binding("fresh"), "fresh-session");
+	await state.confirmBindingUse("fresh", "fresh-session");
+	saved = JSON.parse(await readFile(join(root, "chappie.state.json"), "utf8"));
+	assert.equal(saved.bindings.fresh.lastUsedAt, now);
+
+	now += 2 * day;
+	const restarted = new State(root);
+	await restarted.load();
+	assert.equal(restarted.binding("fresh"), "fresh-session");
+	await restarted.bind("new", "new-session");
+	saved = JSON.parse(await readFile(join(root, "chappie.state.json"), "utf8"));
+	assert.equal(saved.bindings.new.sessionId, "new-session");
+});
+
+test("using a binding prevents an older initialization rollback from clearing it", async (t) => {
+	const root = await mkdtemp(join(tmpdir(), "chappie-binding-adoption-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const state = new State(root);
+	const mutation = await state.bind("chat", "A");
+	await state.confirmBindingUse("chat", "A");
+	await state.restoreBinding("chat", mutation);
+	assert.equal(state.binding("chat"), "A");
 });

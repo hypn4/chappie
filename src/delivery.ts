@@ -1,5 +1,5 @@
-import type { ToolResultMessage } from "@earendil-works/pi-ai";
 import type { Source } from "./activity.ts";
+import type { SessionToolResult } from "./ipc.ts";
 import {
 	contentWithImageReferences,
 	resourceDescriptors,
@@ -9,13 +9,13 @@ export interface DeliveryRecord extends Source {
 	id: string;
 	sessionId: string;
 	cwd: string;
-	toolResults: ToolResultMessage[];
+	toolResults: SessionToolResult[];
 	error?: string;
 	complete?: boolean;
 }
 
 export function toolResultsContent(
-	toolResults: ToolResultMessage[],
+	toolResults: SessionToolResult[],
 	sessionId: string,
 	resources: "links" | "references" = "links",
 ) {

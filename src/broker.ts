@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { ToolCall, ToolResultMessage } from "@earendil-works/pi-ai";
+import type { ToolCall } from "@earendil-works/pi-ai";
 import { type Activity, chatLabel, source } from "./activity.ts";
 import { readConfig } from "./config.ts";
 import type { DeliveryRecord } from "./delivery.ts";
@@ -13,7 +13,9 @@ import {
 	type SessionInspection,
 	type SessionListItem,
 	type SessionMessage,
+	type SessionRequest,
 	type SessionResult,
+	type SessionToolResult,
 } from "./ipc.ts";
 import {
 	operationIdentity,
@@ -32,11 +34,19 @@ import {
 	resourceDescriptors,
 	resourceSessionId,
 } from "./resources.ts";
-import { State } from "./state.ts";
+import { type BindingMutation, State } from "./state.ts";
 import type { ToolInput } from "./tools.ts";
 
 const observerInstructions =
 	"This ChatGPT conversation recently initialized or resumed work in this Pi session. A recent initialization may still own this task; do not assume another completion is needed. Participate as an observer for this task: read history with observer: true, follow new entries with after and wait: true, and think independently. Leave execution and Pi communication to the ongoing work. Do not export files, repeat the completed report, or publish a second completion response. Leave the single completion response to the original execution. Continue observing rather than reinitializing to take over.";
+
+function hasHostFileImport(
+	calls: readonly { name: string; arguments: Record<string, unknown> }[],
+): boolean {
+	return calls.some(
+		(call) => call.name === "transfer" && Array.isArray(call.arguments.files),
+	);
+}
 
 interface RegisteredSession {
 	description: SessionDescription;
@@ -87,7 +97,7 @@ export interface ChatResult {
 }
 
 export interface CallResult extends ChatResult {
-	toolResults: ToolResultMessage[];
+	toolResults: SessionToolResult[];
 }
 
 export interface BrokerOptions {
@@ -113,6 +123,7 @@ export class Broker {
 	>();
 	#ask = true;
 	#cooldownMs = 10_000;
+	#localTools = false;
 	#nextRequestId = 1;
 
 	constructor(agentDir: string, options: BrokerOptions = {}) {
@@ -131,6 +142,7 @@ export class Broker {
 		const config = await readConfig(this.#agentDir);
 		this.#ask = config.ask ?? true;
 		this.#cooldownMs = (config.cooldown ?? 10) * 1000;
+		this.#localTools = config.localTools === true;
 		await this.#state.load();
 		await this.#ipc.start(config.listen ?? false, {
 			...(config.tls ? { tls: config.tls } : {}),
@@ -187,24 +199,39 @@ export class Broker {
 			sessionId: target,
 			selection,
 			initialization,
+			bindingMutation,
 		} = await this.#selectSession(chatId, sessionId, requestId, signal, true);
-		const { inspection, inputs, globalAgents } = await this.#inspect(
-			target,
-			signal,
-		);
-		if (initialization?.mode !== "observer")
-			await this.#ackInputs(target, inputs, signal);
-		return {
-			selection,
-			...(initialization ? { initialization } : {}),
-			...inspection,
-			tools: inspection.tools.map(({ name, description }) => ({
-				name,
-				description: description.split("\n", 1)[0] ?? description,
-			})),
-			inputs: initialization?.mode === "observer" ? [] : inputs,
-			...(globalAgents ? { globalAgents } : {}),
-		};
+		try {
+			const { inspection, inputs, globalAgents } = await this.#inspect(
+				target,
+				signal,
+			);
+			if (initialization?.mode !== "observer")
+				await this.#ackInputs(target, inputs, signal);
+			return {
+				selection,
+				...(initialization ? { initialization } : {}),
+				...inspection,
+				tools: inspection.tools.map(({ name, description }) => ({
+					name,
+					description: description.split("\n", 1)[0] ?? description,
+				})),
+				inputs: initialization?.mode === "observer" ? [] : inputs,
+				...(globalAgents ? { globalAgents } : {}),
+			};
+		} catch (error) {
+			if (bindingMutation) {
+				try {
+					await this.#state.restoreBinding(chatId, bindingMutation);
+				} catch (rollbackError) {
+					throw new AggregateError(
+						[error, rollbackError],
+						"Session initialization failed and its binding could not be restored",
+					);
+				}
+			}
+			throw error;
+		}
 	}
 
 	async chat(
@@ -239,13 +266,15 @@ export class Broker {
 				status: "running",
 				updatedAt: Date.now(),
 			});
-			if (replay)
+			if (replay) {
+				await this.#confirmBindingUse(chatId, sessionId, target);
 				return {
 					sessionId: target,
 					cwd: replay.cwd,
 					inputs: [],
 					replay: replayReceipt(replay),
 				};
+			}
 		}
 
 		const result = await this.#request(
@@ -268,6 +297,7 @@ export class Broker {
 		if ("message" in result) {
 			const inputs = result.inputs;
 			await this.#ackInputs(target, inputs, signal);
+			await this.#confirmBindingUse(chatId, sessionId, target);
 			return {
 				sessionId: target,
 				cwd: result.cwd,
@@ -293,6 +323,7 @@ export class Broker {
 		);
 		const { inspection, inputs } = await this.#inspect(target, signal);
 		await this.#ackInputs(target, inputs, signal);
+		await this.#confirmBindingUse(chatId, sessionId, target);
 		const selected = names ? new Set(names) : undefined;
 		return {
 			...inspection,
@@ -314,6 +345,8 @@ export class Broker {
 	): Promise<CallResult> {
 		if (calls.length < 1 || calls.length > 128)
 			throw new Error("Tool batches must contain between 1 and 128 calls");
+		if (!direct && hasHostFileImport(calls))
+			throw new Error("Host file imports require the direct transfer tool");
 		const { sessionId: target, initialization } = await this.#selectSession(
 			chatId,
 			sessionId,
@@ -338,7 +371,8 @@ export class Broker {
 				status: "running",
 				updatedAt: Date.now(),
 			});
-			if (replay)
+			if (replay) {
+				await this.#confirmBindingUse(chatId, sessionId, target);
 				return {
 					sessionId: target,
 					cwd: replay.cwd,
@@ -346,6 +380,7 @@ export class Broker {
 					toolResults: [],
 					replay: replayReceipt(replay),
 				};
+			}
 		}
 
 		const toolCalls: ToolCall[] = calls.map((call) => ({
@@ -379,6 +414,7 @@ export class Broker {
 				),
 			);
 			await this.#ackInputs(target, result.inputs, signal);
+			await this.#confirmBindingUse(chatId, sessionId, target);
 			return {
 				sessionId: target,
 				...(initialization ? { initialization } : {}),
@@ -398,7 +434,8 @@ export class Broker {
 		requestId: unknown,
 		signal: AbortSignal,
 	) {
-		const target = sessionId ?? this.#state.binding(chatId);
+		const boundId = sessionId ? undefined : this.#state.binding(chatId);
+		const target = sessionId ?? boundId;
 		if (!target) throw new Error("Specify a Pi sessionId to read history");
 		await this.#waitForSession(target, signal);
 		const result = await this.#request(
@@ -412,7 +449,10 @@ export class Broker {
 			}),
 			signal,
 		);
-		if ("history" in result) return { sessionId: target, ...result };
+		if ("history" in result) {
+			await this.#confirmBindingUse(chatId, sessionId, target);
+			return { sessionId: target, ...result };
+		}
 		throw new Error("Pi session returned no history");
 	}
 
@@ -421,7 +461,8 @@ export class Broker {
 		sessionId: string | undefined,
 		signal: AbortSignal,
 	): Promise<SessionInput[]> {
-		const target = sessionId ?? this.#state.binding(chatId);
+		const boundId = sessionId ? undefined : this.#state.binding(chatId);
+		const target = sessionId ?? boundId;
 		if (!target || !this.#sessions.has(target)) return [];
 		const result = await this.#request(
 			target,
@@ -431,6 +472,7 @@ export class Broker {
 		if (!("inputs" in result))
 			throw new Error("Pi session returned no pending inputs");
 		await this.#ackInputs(target, result.inputs, signal);
+		await this.#confirmBindingUse(chatId, sessionId, target);
 		return result.inputs;
 	}
 
@@ -459,6 +501,7 @@ export class Broker {
 			delivered: false,
 		};
 		await this.#state.addQuestion(question);
+		await this.#confirmBindingUse(chatId, sessionId, target);
 		const activity = source(chatId, requestId);
 		void this.#notify(
 			target,
@@ -592,10 +635,45 @@ export class Broker {
 	): Promise<void> {
 		switch (message.type) {
 			case "request": {
-				if (
-					![...this.#sessions.values()].some((session) => session.peer === peer)
-				)
+				const sourceSession = [...this.#sessions.values()].find(
+					(session) => session.peer === peer,
+				);
+				if (!sourceSession)
 					throw new Error("Unregistered IPC peer cannot relay requests");
+				if (
+					message.request.type === "call" ||
+					message.request.type === "chat"
+				) {
+					const validOperationId =
+						typeof message.request.requestId === "string" &&
+						message.request.requestId.length > 0 &&
+						message.request.requestId.length <= 128;
+					if (
+						!this.#localTools ||
+						sourceSession.description.host !== "omp" ||
+						message.request.chatId !== sourceSession.description.id ||
+						!validOperationId ||
+						(message.request.type === "call" && message.request.direct === true)
+					) {
+						await peer.send({
+							type: "response",
+							id: message.id,
+							error: "Remote collaboration is not authorized for this session",
+						});
+						break;
+					}
+				}
+				if (
+					message.request.type === "call" &&
+					hasHostFileImport(message.request.calls)
+				) {
+					await peer.send({
+						type: "response",
+						id: message.id,
+						error: "Host file imports require the direct transfer tool",
+					});
+					break;
+				}
 				if (message.request.type === "sessions") {
 					await peer.send({
 						type: "response",
@@ -613,11 +691,15 @@ export class Broker {
 					throw new Error("Duplicate or excessive relay requests");
 				const controller = new AbortController();
 				relays.set(message.id, controller);
-				void this.#request(
-					message.request.sessionId,
-					(id) => ({ ...message.request, id }),
-					controller.signal,
-				)
+				const relay =
+					message.request.type === "call" || message.request.type === "chat"
+						? this.#relayExecution(message.request, controller.signal)
+						: this.#request(
+								message.request.sessionId,
+								(id) => ({ ...message.request, id }),
+								controller.signal,
+							);
+				void relay
 					.then(
 						(result) =>
 							peer.send({ ...result, type: "response", id: message.id }),
@@ -696,6 +778,15 @@ export class Broker {
 		}
 	}
 
+	async #confirmBindingUse(
+		chatId: string,
+		requestedId: string | undefined,
+		sessionId: string,
+	): Promise<void> {
+		if (requestedId !== undefined) return;
+		await this.#state.confirmBindingUse(chatId, sessionId);
+	}
+
 	async #selectSession(
 		chatId: string,
 		requestedId: string | undefined,
@@ -706,6 +797,7 @@ export class Broker {
 		sessionId: string;
 		selection: InitializedSession["selection"];
 		initialization?: Initialization;
+		bindingMutation?: BindingMutation;
 	}> {
 		const selectionTimeout = AbortSignal.timeout(this.#sessionWaitMs);
 		for (;;) {
@@ -740,8 +832,8 @@ export class Broker {
 			try {
 				await this.#waitForSession(target, signal);
 				signal.throwIfAborted();
-				const initialization =
-					bindRequested || !this.#state.binding(chatId)
+				const joined =
+					bindRequested || !boundId
 						? await this.#join(chatId, target, requestId, signal, bindRequested)
 						: undefined;
 				return {
@@ -751,7 +843,12 @@ export class Broker {
 						: boundId
 							? "existing"
 							: "automatic",
-					...(initialization ? { initialization } : {}),
+					...(joined
+						? {
+								initialization: joined.initialization,
+								bindingMutation: joined.bindingMutation,
+							}
+						: {}),
 				};
 			} finally {
 				if (reserved) {
@@ -768,34 +865,56 @@ export class Broker {
 		requestId: unknown,
 		signal: AbortSignal,
 		explicit = false,
-	): Promise<Initialization> {
+	): Promise<{
+		initialization: Initialization;
+		bindingMutation: BindingMutation;
+	}> {
 		signal.throwIfAborted();
 		const previous = this.#state.binding(chatId);
 		const key = JSON.stringify([chatId, sessionId]);
 		const observer = (this.#cooldowns.get(key) ?? 0) > Date.now();
 		if (!observer) this.#cooldown(chatId, sessionId);
-		await this.#state.bind(chatId, sessionId);
-		signal.throwIfAborted();
-		const activity = source(chatId, requestId);
-		if (previous !== sessionId) {
-			this.#notifyChange();
-			if (previous)
-				await this.#notify(previous, `${chatLabel(activity)} left`, {
-					...activity,
-					event: "left",
-				});
+		let bindingMutation: BindingMutation | undefined;
+		try {
+			bindingMutation = await this.#state.bind(chatId, sessionId);
+			signal.throwIfAborted();
+			const activity = source(chatId, requestId);
+			if (previous !== sessionId) {
+				this.#notifyChange();
+				if (previous)
+					await this.#notify(previous, `${chatLabel(activity)} left`, {
+						...activity,
+						event: "left",
+					});
+			}
+			signal.throwIfAborted();
+			await this.#notify(sessionId, `${chatLabel(activity)} joined`, {
+				...activity,
+				event: "joined",
+				initialization: explicit ? "explicit" : "implicit",
+			});
+			return {
+				initialization: {
+					sessionId,
+					instructions: observer ? observerInstructions : historyInstructions,
+					mode: observer ? "observer" : "executor",
+				},
+				bindingMutation,
+			};
+		} catch (error) {
+			if (!observer) this.#cooldowns.delete(key);
+			if (bindingMutation) {
+				try {
+					await this.#state.restoreBinding(chatId, bindingMutation);
+				} catch (rollbackError) {
+					throw new AggregateError(
+						[error, rollbackError],
+						"Session join failed and its binding could not be restored",
+					);
+				}
+			}
+			throw error;
 		}
-		signal.throwIfAborted();
-		await this.#notify(sessionId, `${chatLabel(activity)} joined`, {
-			...activity,
-			event: "joined",
-			initialization: explicit ? "explicit" : "implicit",
-		});
-		return {
-			sessionId,
-			instructions: observer ? observerInstructions : historyInstructions,
-			mode: observer ? "observer" : "executor",
-		};
 	}
 
 	#cooldown(chatId: string, sessionId: string): void {
@@ -872,6 +991,80 @@ export class Broker {
 		});
 	}
 
+	async #relayExecution(
+		request: Extract<SessionRequest, { type: "chat" | "call" }>,
+		signal: AbortSignal,
+	): Promise<SessionResult> {
+		const payload: ToolInput[] | string =
+			request.type === "call"
+				? request.calls.map(({ name, arguments: input }) => {
+						if (name !== "transfer" || input.operationId === undefined)
+							return { name, arguments: input };
+						const { operationId: _nestedId, ...argumentsWithoutId } = input;
+						return { name, arguments: argumentsWithoutId };
+					})
+				: request.replyTo
+					? JSON.stringify({ text: request.text, replyTo: request.replyTo })
+					: request.text;
+		const identity = operationIdentity(
+			request.chatId,
+			request.sessionId,
+			request.type,
+			request.requestId,
+			payload,
+		);
+		if (identity) {
+			const session = this.#sessions.get(request.sessionId);
+			if (!session) throw new Error("Target session disconnected");
+			const existing = await this.#state.reserveOperation({
+				...identity,
+				chatId: request.chatId,
+				sessionId: request.sessionId,
+				cwd: session.description.cwd,
+				status: "running",
+				updatedAt: Date.now(),
+			});
+			if (existing) {
+				const replay = replayReceipt(existing);
+				throw new Error(
+					`Already accepted remote operation (${replay.status}). ${replay.instructions}`,
+				);
+			}
+		}
+		const result = await this.#request(
+			request.sessionId,
+			(id) => ({
+				...request,
+				id,
+				...(identity ? { operationKey: identity.key } : {}),
+			}),
+			signal,
+		).catch(async (error: unknown) => {
+			await this.#state.finishOperation(identity?.key, "uncertain");
+			throw error;
+		});
+		if (
+			(request.type === "call" && "toolResults" in result) ||
+			(request.type === "chat" && "message" in result)
+		) {
+			await this.#state.finishOperation(
+				identity?.key,
+				"completed",
+				request.type === "call" && "toolResults" in result
+					? result.toolResults.flatMap((item) =>
+							resourceDescriptors(item.details),
+						)
+					: [],
+			);
+			return result;
+		}
+		await this.#state.finishOperation(identity?.key, "uncertain");
+		throw new Error(
+			request.type === "call"
+				? "Agent session returned no tool results"
+				: "Agent session returned no assistant message",
+		);
+	}
 	async #request(
 		sessionId: string,
 		message: (id: number) => BrokerMessage,

@@ -61,7 +61,12 @@ async function diagnosticFixture(t: TestContext) {
 	return {
 		broker,
 		clock,
-		async register() {
+		async register(
+			onInspect?: (
+				message: Extract<BrokerMessage, { type: "inspect" }>,
+				peer: JsonLinePeer<BrokerMessage, SessionMessage>,
+			) => Promise<void>,
+		) {
 			const registered = Promise.withResolvers<void>();
 			const inspecting =
 				Promise.withResolvers<Extract<BrokerMessage, { type: "inspect" }>>();
@@ -75,7 +80,10 @@ async function diagnosticFixture(t: TestContext) {
 				socket,
 				async (message) => {
 					if (message.type === "synced") registered.resolve();
-					if (message.type === "inspect") inspecting.resolve(message);
+					if (message.type === "inspect") {
+						inspecting.resolve(message);
+						await onInspect?.(message, peer);
+					}
 					if (message.type === "inputs") {
 						inputting.resolve(message);
 						await peer.send({
@@ -196,6 +204,75 @@ describe("session diagnostic deadlines", { timeout: 10000 }, () => {
 		f.clock.expire(inspectionTimeoutMs);
 		await pending;
 		assert.equal((await peer.cancelled).id, request.id);
+	});
+
+	test("failed initialization does not keep a new binding", async (t) => {
+		const f = await diagnosticFixture(t);
+		const peer = await f.register();
+		const pending = assert.rejects(
+			f.broker.initialize("chat", "stalled", "init", t.signal),
+			/stalled.*respond|inspection.*stalled/i,
+		);
+		await peer.inspecting;
+		f.clock.expire(inspectionTimeoutMs);
+		await pending;
+		assert.equal(f.broker.binding("chat"), undefined);
+	});
+
+	test("failed concurrent use does not adopt an older initialization binding", async (t) => {
+		const f = await diagnosticFixture(t);
+		let inspections = 0;
+		const secondInspection = Promise.withResolvers<void>();
+		const peer = await f.register(async () => {
+			inspections++;
+			if (inspections === 2) secondInspection.resolve();
+		});
+		const initialization = assert.rejects(
+			f.broker.initialize("chat", "stalled", "init", t.signal),
+			/stalled.*respond|inspection.*stalled/i,
+		);
+		await peer.inspecting;
+		const use = assert.rejects(
+			f.broker.tools("chat", undefined, undefined, "inspect", t.signal),
+			/stalled.*respond|inspection.*stalled/i,
+		);
+		await secondInspection.promise;
+		f.clock.expire(inspectionTimeoutMs);
+		await Promise.all([initialization, use]);
+		assert.equal(f.broker.binding("chat"), undefined);
+	});
+
+	test("a failed older initialization cannot clear a newer successful binding", async (t) => {
+		const f = await diagnosticFixture(t);
+		let inspections = 0;
+		const peer = await f.register(async (message, connection) => {
+			inspections++;
+			if (inspections !== 2) return;
+			await connection.send({
+				type: "result",
+				id: message.id,
+				inspection: {
+					session: {
+						id: "stalled",
+						cwd: process.cwd(),
+						device: "test",
+						status: "idle",
+					},
+					tools: [],
+					skills: [],
+				},
+				inputs: [],
+			});
+		});
+		const first = assert.rejects(
+			f.broker.initialize("chat", "stalled", "first", t.signal),
+			/stalled.*respond|inspection.*stalled/i,
+		);
+		await peer.inspecting;
+		await f.broker.initialize("chat", "stalled", "second", t.signal);
+		f.clock.expire(inspectionTimeoutMs);
+		await first;
+		assert.equal(f.broker.binding("chat"), "stalled");
 	});
 
 	test("caller cancellation during binding is not reported as an inspection failure", async (t) => {

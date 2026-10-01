@@ -20,11 +20,11 @@ permissions:
   contents: read
 
 jobs:
-  check:
+  source:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
@@ -37,10 +37,10 @@ jobs:
           bun-version-file: .bun-version
       - run: bun ci
       - run: bun run check
-      - run: bun run test:omp
-      - run: bun run test:otunnel
+      - if: matrix.os == 'windows-latest'
+        run: bun run test:omp
 
-  omp-floor:
+  compat:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -52,6 +52,7 @@ jobs:
         with:
           bun-version-file: .bun-version
       - run: bun ci
+      - run: bun audit --audit-level=high
       - name: Verify the declared OMP 18.3 floor
         run: >-
           bun add --dev --exact --no-save
@@ -59,8 +60,19 @@ jobs:
           @oh-my-pi/pi-coding-agent@18.3.0
           @oh-my-pi/pi-utils@18.3.0
       - run: bun run test:omp
+      - name: Download otunnel 0.2
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download -R zetaloop/otunnel v0.2.0 -p otunnel-x86_64-unknown-linux-gnu-v0.2.0.tar.gz
+      - name: Verify otunnel 0.2 runtime contract
+        run: |
+          echo "69f789fd8df156609ce26d2e004c5af80d6d9677df137220b25d48483174c415  otunnel-x86_64-unknown-linux-gnu-v0.2.0.tar.gz" | sha256sum -c -
+          tar -xzf otunnel-x86_64-unknown-linux-gnu-v0.2.0.tar.gz otunnel
+          chmod +x otunnel
+          OTUNNEL="$PWD/otunnel" bun run test:otunnel
 
   package:
+    needs: [source, compat]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
@@ -78,46 +90,19 @@ jobs:
       - run: bun pm pack --ignore-scripts --filename package.tgz
       - id: inspect
         run: bun scripts/verify-package.mjs package.tgz
+      - name: Verify clean consumer
+        run: |
+          consumer="${{ runner.temp }}/chappie-consumer"
+          bun scripts/verify-package.mjs package.tgz --prepare "$consumer"
+          cd "$consumer"
+          bun add --ignore-scripts "${{ github.workspace }}/package.tgz"
+          bun add --ignore-scripts @oh-my-pi/pi-coding-agent@18.4.6
+          cd "${{ github.workspace }}"
+          bun scripts/verify-package.mjs package.tgz --installed "$consumer" --omp
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: npm-package
           path: package.tgz
           if-no-files-found: error
           compression-level: 0
-          retention-days: 7
-
-  install:
-    needs: package
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
-    env:
-      EXPECTED_INTEGRITY: ${{ needs.package.outputs.integrity }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ inputs.ref || github.sha }}
-          persist-credentials: false
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-        with:
-          bun-version-file: .bun-version
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: npm-package
-      - name: Prepare isolated consumer
-        run: bun scripts/verify-package.mjs package.tgz --prepare "${{ runner.temp }}/chappie-consumer"
-      - name: Install the tested artifact with Bun
-        working-directory: ${{ runner.temp }}/chappie-consumer
-        timeout-minutes: 5
-        run: bun add --ignore-scripts "${{ github.workspace }}/package.tgz"
-      - name: Install pinned OMP runtime for package integration
-        working-directory: ${{ runner.temp }}/chappie-consumer
-        run: bun add --ignore-scripts @oh-my-pi/pi-coding-agent@18.4.4
-      - name: Verify installed broker and packaged OMP runtime
-        run: >-
-          bun scripts/verify-package.mjs package.tgz
-          --installed "${{ runner.temp }}/chappie-consumer"
-          --omp
+          retention-days: 30

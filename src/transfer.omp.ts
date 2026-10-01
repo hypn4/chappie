@@ -33,7 +33,7 @@ const parameters = {
 			},
 			minItems: 1,
 			description:
-				"ChatGPT files paired with paths in order; omit for agent sources",
+				"Host-injected ChatGPT files paired with paths in order; unavailable to model-authored/native calls",
 		},
 		from: {
 			type: "object",
@@ -70,7 +70,7 @@ export function createOmpTransferTool(session: LocalSession): ToolDefinition {
 		name: "transfer",
 		label: "transfer",
 		description:
-			"Import ChatGPT files with files, send local paths to a session with to, retrieve session files with from, or export local paths and images.",
+			"Import host-injected ChatGPT files, send local paths to a session with to, retrieve session files with from, or export local paths and images.",
 		parameters,
 		async execute(_id, args, signal, update, context) {
 			return session.transfer(

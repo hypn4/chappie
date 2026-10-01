@@ -31,8 +31,100 @@ async function fixture(t: { after(fn: () => Promise<void>): void }) {
 }
 
 const incoming = [
-	{ file_id: "test-file", download_url: "https://example.invalid/file" },
+	{ file_id: "test-file", download_url: "https://93.184.216.34/file" },
 ];
+
+test("host downloads reject local addresses and oversized responses", async (t) => {
+	const cwd = await fixture(t);
+	let fetches = 0;
+	t.mock.method(globalThis, "fetch", async () => {
+		fetches++;
+		return new Response("x", {
+			headers: { "content-length": String(512 * 1024 * 1024 + 1) },
+		});
+	});
+	const local = await executeTransfer(
+		{
+			paths: ["local"],
+			files: [{ file_id: "local", download_url: "https://127.0.0.1/secret" }],
+		},
+		undefined,
+		undefined,
+		{ sessionId: cwd, cwd },
+	);
+	assert.equal(local.isError, true);
+	assert.equal(fetches, 0);
+
+	const oversized = await executeTransfer(
+		{ paths: ["large"], files: incoming },
+		undefined,
+		undefined,
+		{ sessionId: cwd, cwd },
+	);
+	assert.equal(oversized.isError, true);
+	assert.match(
+		JSON.stringify(oversized.details.files),
+		/too large|size limit/i,
+	);
+	assert.equal(fetches, 1);
+});
+
+test("host file imports are bounded instead of starting every download at once", async (t) => {
+	const cwd = await fixture(t);
+	let active = 0;
+	let maximum = 0;
+	t.mock.method(globalThis, "fetch", async () => {
+		active++;
+		maximum = Math.max(maximum, active);
+		await delay(5);
+		active--;
+		return new Response("x");
+	});
+	const count = 8;
+	const result = await executeTransfer(
+		{
+			paths: Array.from({ length: count }, (_, i) => `file-${i}`),
+			files: Array.from({ length: count }, (_, i) => ({
+				file_id: String(i),
+				download_url: `https://93.184.216.34/${i}`,
+			})),
+		},
+		undefined,
+		undefined,
+		{ sessionId: cwd, cwd },
+	);
+	assert.equal(result.isError, false);
+	assert.ok(maximum <= 4, `observed ${maximum} concurrent downloads`);
+});
+
+test("session copies do not fan out every resource at once", async (t) => {
+	const cwd = await fixture(t);
+	let active = 0;
+	let maximum = 0;
+	const count = 8;
+	const resources = Array.from({ length: count }, (_, index) => ({
+		uri: `chappie://session/A/file/${index}/file-${index}`,
+		name: `file-${index}`,
+		mimeType: "text/plain",
+		size: 1,
+	}));
+	const files = await copyFiles(
+		resources.map((_, index) => `copy-${index}`),
+		resources,
+		cwd,
+		false,
+		async function* () {
+			active++;
+			maximum = Math.max(maximum, active);
+			await delay(5);
+			yield new Uint8Array([120]);
+			active--;
+		},
+		new AbortController().signal,
+	);
+	assert.equal(files.length, count);
+	assert.equal(maximum, 1);
+});
 
 test("failed download preserves an existing destination and cleans staging", async (t) => {
 	const cwd = await fixture(t);
@@ -256,8 +348,8 @@ test("partial imports preserve successful files in a structured error result", a
 		{
 			paths: ["good", "bad"],
 			files: [
-				{ file_id: "good", download_url: "https://example.invalid/good" },
-				{ file_id: "bad", download_url: "https://example.invalid/bad" },
+				{ file_id: "good", download_url: "https://93.184.216.34/good" },
+				{ file_id: "bad", download_url: "https://93.184.216.34/bad" },
 			],
 		},
 		undefined,

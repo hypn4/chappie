@@ -22,11 +22,11 @@
 
 ## Sessions
 
-Call `init` at the start of local work. Without `sessionId`, it reuses the conversation's saved default or selects an online Pi session with no saved ChatGPT binding. Pass a Pi session ID to resume a specific task, including from another ChatGPT conversation or branch. Read recent `history` to recover progress before continuing the current task.
+Call `init` at the start of local work. Without `sessionId`, it reuses the conversation's saved default when that binding has been used within the last 30 days, or selects an online Pi session with no saved ChatGPT binding. Pass a Pi session ID to resume a specific task, including from another ChatGPT conversation or branch. Read recent `history` to recover progress before continuing the current task.
 
 When `globalAgents` is present, read and follow the instructions at `globalAgents.path` on the selected Pi session. Follow the participation guidance in `initialization.instructions`.
 
-`sessions` lists connected sessions with their ID, host (`pi` or `omp`), agent directory, device, working directory, name, execution status, and binding count. The list is a broker snapshot and does not wait for a host inspection. The first execution tool call establishes the default using its `sessionId` or an online session with no saved bindings. Once a default exists, another tool's `sessionId` selects only that operation's target; `init({ sessionId })` changes the default.
+`sessions` lists connected sessions with their ID, host (`pi` or `omp`), agent directory, device, working directory, name, execution status, and binding count. The list is a broker snapshot and does not wait for a host inspection. Bindings idle for more than 30 days are ignored and pruned opportunistically; active bindings are refreshed when used. The first execution tool call establishes the default using its `sessionId` or an online session with no saved bindings. Once a default exists, another tool's `sessionId` selects only that operation's target; `init({ sessionId })` changes the default. The timestamped binding format is forward-migrated from legacy string bindings; rolling back to a release that predates this lifecycle format requires restoring a compatible state backup.
 
 Several ChatGPT conversations can use the same Pi session. One conversation can also operate on several Pi sessions explicitly. Requests already assigned to a session continue there even if the conversation later changes its default.
 
@@ -164,6 +164,10 @@ execution or attaching files again. An uncertain receipt requires checking the
 original work, not automatically retrying it. Completed receipts are retained for
 24 hours; unresolved receipts are not evicted automatically. ChatGPT still owns
 approval prompts and final response rendering. The broker does not suppress or bypass host approvals. Each state file retains at most 16,384 operation receipts and fails closed when unresolved work fills that limit.
+ChatGPT file download URLs are accepted only through the direct host-provided
+`transfer.files` boundary. Generic `call` and session-to-session relay paths
+cannot inject arbitrary download URLs; remote collaboration uses broker-owned
+session identity and stable operation receipts instead.
 
 `transfer.paths` always names paths or image references on the Pi side. Relative paths resolve from the selected Pi session's working directory; absolute paths and `~/` are accepted.
 

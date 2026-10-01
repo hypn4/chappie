@@ -99,7 +99,7 @@ test("unregistered peers cannot relay inspect requests", async (t) => {
 	);
 });
 
-test("even registered peers cannot relay arbitrary tool calls", async (t) => {
+test("registered peers cannot relay tool calls when collaboration is disabled", async (t) => {
 	const root = await fixture(t);
 	const broker = new Broker(root);
 	await broker.start();
@@ -108,23 +108,107 @@ test("even registered peers cannot relay arbitrary tool calls", async (t) => {
 	target.send({
 		type: "sync",
 		id: 1,
-		session: { id: "target", cwd: root, device: "test", status: "idle" },
+		session: {
+			id: "target",
+			cwd: root,
+			device: "test",
+			status: "idle",
+			host: "omp",
+		},
 	});
 	const source = await peer(t, root);
 	source.send({
 		type: "sync",
 		id: 1,
-		session: { id: "source", cwd: root, device: "test", status: "idle" },
+		session: {
+			id: "source",
+			cwd: root,
+			device: "test",
+			status: "idle",
+			host: "omp",
+		},
 	});
 	await until(() => broker.listSessions().length === 2);
 	source.send({
 		type: "request",
 		id: 9,
-		request: { type: "call", sessionId: "target", chatId: "forged", calls: [] },
+		request: {
+			type: "call",
+			sessionId: "target",
+			chatId: "source",
+			requestId: "operation",
+			calls: [
+				{
+					type: "toolCall",
+					id: "tool",
+					name: "read",
+					arguments: { path: "file.txt" },
+				},
+			],
+		},
 	});
 	await delay(60);
 	assert.equal(
-		target.messages.some((m) => m.type === "call"),
+		target.messages.some((message) => message.type === "call"),
+		false,
+	);
+});
+
+test("collaboration relay binds the operation identity to the source session", async (t) => {
+	const root = await fixture(t);
+	await writeFile(
+		join(root, "chappie.json"),
+		JSON.stringify({ localTools: true }),
+	);
+	const broker = new Broker(root);
+	await broker.start();
+	t.after(() => broker.close());
+	const target = await peer(t, root);
+	target.send({
+		type: "sync",
+		id: 1,
+		session: {
+			id: "target",
+			cwd: root,
+			device: "test",
+			status: "idle",
+			host: "omp",
+		},
+	});
+	const source = await peer(t, root);
+	source.send({
+		type: "sync",
+		id: 1,
+		session: {
+			id: "source",
+			cwd: root,
+			device: "test",
+			status: "idle",
+			host: "omp",
+		},
+	});
+	await until(() => broker.listSessions().length === 2);
+	source.send({
+		type: "request",
+		id: 10,
+		request: {
+			type: "call",
+			sessionId: "target",
+			chatId: "forged",
+			requestId: "operation",
+			calls: [
+				{
+					type: "toolCall",
+					id: "tool",
+					name: "read",
+					arguments: { path: "file.txt" },
+				},
+			],
+		},
+	});
+	await delay(60);
+	assert.equal(
+		target.messages.some((message) => message.type === "call"),
 		false,
 	);
 });

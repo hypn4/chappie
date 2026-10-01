@@ -4,22 +4,31 @@ export const questionInstructions =
 	"ask requests a question widget in ChatGPT; its result confirms creation of the request. Immediately call ask_assert with question.id to confirm loading. If the widget fails to load within 10 seconds, the assertion fails and records the question as skipped. Use an installed Pi interactive tool through call when an answer is needed. User answers arrive separately as webAnswer in normal tool results. Apply answers and revisions promptly; a user skip means proceed with available information.";
 
 export const questionInput = z.object({
-	header: z.string().trim().min(1).optional().describe("Short topic label"),
+	header: z
+		.string()
+		.trim()
+		.min(1)
+		.max(256)
+		.optional()
+		.describe("Short topic label"),
 	question: z
 		.string()
 		.trim()
 		.min(1)
+		.max(4096)
 		.describe("One focused question for the user"),
 	context: z
 		.string()
+		.max(16 * 1024)
 		.optional()
 		.describe("Background needed to answer the question"),
 	options: z
 		.array(
 			z.object({
-				title: z.string().trim().min(1).describe("Short choice label"),
+				title: z.string().trim().min(1).max(512).describe("Short choice label"),
 				description: z
 					.string()
+					.max(2048)
 					.optional()
 					.describe("Brief consequence or tradeoff of this choice"),
 				recommended: z
@@ -28,6 +37,7 @@ export const questionInput = z.object({
 					.describe("Preferred choice; place it first"),
 			}),
 		)
+		.max(20)
 		.default([])
 		.describe(
 			"Distinct choices, usually two or three. Freeform answers and skipping are available separately.",
@@ -39,8 +49,12 @@ export const questionInput = z.object({
 });
 
 export const answerInput = z.object({
-	selections: z.array(z.number().int().nonnegative()).default([]),
-	text: z.string().trim().default(""),
+	selections: z.array(z.number().int().nonnegative()).max(20).default([]),
+	text: z
+		.string()
+		.trim()
+		.max(16 * 1024)
+		.default(""),
 	skipped: z.literal(true).optional().describe("The question was skipped"),
 });
 

@@ -35,7 +35,7 @@ const outputSchema = z.object({
 
 const nativeCallSchema = z.object({
 	name: z.string(),
-	arguments: z.record(z.string(), z.unknown()),
+	arguments: z.record(z.string(), z.json()),
 });
 const nativeCallsSchema = z.array(nativeCallSchema).min(1).max(128);
 
@@ -430,7 +430,9 @@ export function createServer(broker: Broker): McpServer {
 				};
 				const sessionId = input.sessionId;
 				delete input.sessionId;
-				const calls: ToolInput[] = [{ name: tool.name, arguments: input }];
+				const calls: ToolInput[] = [
+					{ name: tool.name, arguments: input as ToolInput["arguments"] },
+				];
 				const result = await broker.call(
 					requireChatId(context),
 					sessionId,

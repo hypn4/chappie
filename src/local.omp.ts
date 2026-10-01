@@ -1,18 +1,20 @@
-import type {
-	AssistantMessage,
-	ToolResultMessage,
-} from "@earendil-works/pi-ai";
+import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type {
 	ExtensionAPI as OmpExtensionAPI,
 	ExtensionContext as OmpExtensionContext,
 	ToolDefinition,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import * as z from "zod";
-import type { HistoryRange, HistoryResult } from "./history.ts";
+import {
+	type HistoryRange,
+	type HistoryResult,
+	MAX_HISTORY_ENTRIES,
+} from "./history.ts";
 import type {
 	SessionInput,
 	SessionInspection,
 	SessionListItem,
+	SessionToolResult,
 } from "./ipc.ts";
 import { type ResourceDescriptor, resourceDescriptors } from "./resources.ts";
 import type { ToolInput } from "./tools.ts";
@@ -26,7 +28,7 @@ export interface RemoteCallResult {
 	sessionId: string;
 	cwd: string;
 	inputs: SessionInput[];
-	toolResults: ToolResultMessage[];
+	toolResults: SessionToolResult[];
 }
 
 export interface RemoteChatResult {
@@ -48,11 +50,13 @@ export interface OmpCollaborationSession {
 	): Promise<RemoteToolsResult>;
 	remoteCall(
 		sessionId: string,
+		operationId: string,
 		calls: ToolInput[],
 		signal?: AbortSignal,
 	): Promise<RemoteCallResult>;
 	remoteChat(
 		sessionId: string,
+		operationId: string,
 		text: string,
 		replyTo?: string,
 		signal?: AbortSignal,
@@ -71,13 +75,20 @@ const toolsInput = z.object({
 	sessionId: z.string().min(1),
 	names: z.array(z.string().min(1)).min(1).optional(),
 });
+const operationId = z
+	.string()
+	.trim()
+	.min(1)
+	.max(128)
+	.describe("Stable ID to reuse only when retrying the same remote operation");
 const callInput = z.object({
 	sessionId: z.string().min(1),
+	operationId,
 	calls: z
 		.array(
 			z.object({
 				name: z.string().min(1),
-				arguments: z.record(z.string(), z.unknown()),
+				arguments: z.record(z.string(), z.json()),
 			}),
 		)
 		.min(1)
@@ -85,12 +96,13 @@ const callInput = z.object({
 });
 const chatInput = z.object({
 	sessionId: z.string().min(1),
+	operationId,
 	text: z.string(),
 	replyTo: z.string().min(1).optional(),
 });
 const historyInput = z.object({
 	sessionId: z.string().min(1).optional(),
-	limit: z.number().int().min(1).default(20),
+	limit: z.number().int().min(1).max(MAX_HISTORY_ENTRIES).default(20),
 	before: z.string().min(1).optional(),
 	after: z.string().min(1).optional(),
 	wait: z.boolean().optional(),
@@ -181,7 +193,7 @@ function inputContent(inputs: SessionInput[]): NativeResult["content"] {
 
 function toolResultContent(
 	sessionId: string,
-	toolResults: ToolResultMessage[],
+	toolResults: SessionToolResult[],
 ): NativeResult {
 	const resources = toolResults.flatMap((result) =>
 		resourceDescriptors(result.details),
@@ -269,10 +281,15 @@ export function createOmpCollaborationTools(
 		),
 		nativeTool(
 			"remote_call",
-			"Execute one native tool batch in a connected Chappie session using definitions from remote_tools.",
+			"Execute one native tool batch in a connected Chappie session. Reuse operationId only when retrying the same operation.",
 			callInput,
-			async ({ sessionId, calls }, signal) => {
-				const result = await session.remoteCall(sessionId, calls, signal);
+			async ({ sessionId, operationId, calls }, signal) => {
+				const result = await session.remoteCall(
+					sessionId,
+					operationId,
+					calls,
+					signal,
+				);
 				const native = toolResultContent(sessionId, result.toolResults);
 				if (
 					result.toolResults.some(
@@ -296,11 +313,12 @@ export function createOmpCollaborationTools(
 		),
 		nativeTool(
 			"remote_chat",
-			"Send an assistant message to a Chappie session, or reply to its pending model request with replyTo.",
+			"Send an assistant message to a Chappie session, or reply to its pending model request with replyTo. Reuse operationId only when retrying the same operation.",
 			chatInput,
-			async ({ sessionId, text, replyTo }, signal) => {
+			async ({ sessionId, operationId, text, replyTo }, signal) => {
 				const result = await session.remoteChat(
 					sessionId,
+					operationId,
 					text,
 					replyTo,
 					signal,

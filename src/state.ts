@@ -21,9 +21,25 @@ const operationResourceSchema = z.strictObject({
 	sourceReadAt: z.number().finite().nonnegative().optional(),
 });
 
+const BINDING_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const BINDING_TOUCH_MS = 24 * 60 * 60 * 1000;
+const MAX_BINDINGS = 16_384;
+const bindingRecordSchema = z.strictObject({
+	sessionId: z.string().min(1).max(4096),
+	lastUsedAt: z.number().finite().nonnegative(),
+});
+interface BindingRecord extends z.infer<typeof bindingRecordSchema> {
+	revision: number;
+}
+export interface BindingMutation {
+	revision: number;
+	previous?: z.infer<typeof bindingRecordSchema>;
+}
 const MAX_STATE_BYTES = 32 * 1024 * 1024;
 const stateSchema = z.strictObject({
-	bindings: z.record(z.string(), z.string()).optional(),
+	bindings: z
+		.record(z.string(), z.union([z.string(), bindingRecordSchema]))
+		.optional(),
 	deliveries: z.array(deliverySchema).max(2048).optional(),
 	questions: z
 		.array(
@@ -55,12 +71,15 @@ const stateSchema = z.strictObject({
 export class State {
 	readonly #path: string;
 	readonly #temporaryPath: string;
-	readonly #bindings = new Map<string, string>();
+	readonly #bindings = new Map<string, BindingRecord>();
 	readonly #deliveries = new Map<string, DeliveryRecord>();
 	readonly #questions = new Map<string, QuestionRecord>();
 	readonly #operations = new Map<string, OperationReceipt>();
 	readonly #deliveredIds = new Map<string, number>();
 	#writes = Promise.resolve();
+	readonly #pendingBindings = new Map<string, number>();
+	#acknowledgements = Promise.resolve();
+	#nextBindingRevision = 1;
 
 	constructor(agentDir: string) {
 		this.#path = join(agentDir, "chappie.state.json");
@@ -78,9 +97,22 @@ export class State {
 		if (Buffer.byteLength(contents) > MAX_STATE_BYTES)
 			throw new Error("Chappie state exceeds the 32 MiB limit");
 		const state = stateSchema.parse(JSON.parse(contents));
-		for (const [chatId, sessionId] of Object.entries(state.bindings ?? {})) {
-			if (typeof sessionId === "string") this.#bindings.set(chatId, sessionId);
+		const loadedAt = Date.now();
+		let bindingsChanged = false;
+		for (const [chatId, value] of Object.entries(state.bindings ?? {})) {
+			if (typeof value === "string") bindingsChanged = true;
+			const persisted =
+				typeof value === "string"
+					? { sessionId: value, lastUsedAt: loadedAt }
+					: value;
+			this.#bindings.set(chatId, {
+				...persisted,
+				revision: this.#nextBindingRevision++,
+			});
 		}
+		bindingsChanged = this.#pruneBindings(loadedAt) || bindingsChanged;
+		if (this.#bindings.size > MAX_BINDINGS)
+			throw new Error("Binding limit reached");
 		for (const delivery of state.deliveries ?? []) {
 			// The wire validator checks the persisted native result envelope before restoration.
 			if (delivery?.id)
@@ -94,6 +126,7 @@ export class State {
 		}
 		for (const [id, time] of state.deliveredIds ?? [])
 			this.#deliveredIds.set(id, time);
+		if (bindingsChanged) await this.#save();
 	}
 
 	ownsOperation(
@@ -190,20 +223,110 @@ export class State {
 	}
 
 	binding(chatId: string): string | undefined {
-		return this.#bindings.get(chatId);
+		this.#pruneBindings();
+		return this.#bindings.get(chatId)?.sessionId;
+	}
+	async confirmBindingUse(chatId: string, sessionId: string): Promise<void> {
+		const now = Date.now();
+		this.#pruneBindings(now);
+		const previous = this.#bindings.get(chatId);
+		if (previous && previous.sessionId !== sessionId) return;
+		const next: BindingRecord = {
+			sessionId,
+			lastUsedAt: previous?.lastUsedAt ?? now,
+			revision: this.#nextBindingRevision++,
+		};
+		const pending = (this.#pendingBindings.get(chatId) ?? 0) > 0;
+		const persist =
+			previous === undefined ||
+			pending ||
+			now - next.lastUsedAt >= BINDING_TOUCH_MS;
+		if (persist) next.lastUsedAt = now;
+		this.#bindings.set(chatId, next);
+		if (!persist) return;
+		try {
+			await this.#save();
+		} catch (error) {
+			if (this.#bindings.get(chatId) === next) {
+				if (previous) this.#bindings.set(chatId, previous);
+				else this.#bindings.delete(chatId);
+			}
+			throw error;
+		}
 	}
 
 	bindingCounts(): Map<string, number> {
+		this.#pruneBindings();
 		const counts = new Map<string, number>();
-		for (const sessionId of this.#bindings.values()) {
+		for (const { sessionId } of this.#bindings.values()) {
 			counts.set(sessionId, (counts.get(sessionId) ?? 0) + 1);
 		}
 		return counts;
 	}
 
-	bind(chatId: string, sessionId: string): Promise<void> {
-		this.#bindings.set(chatId, sessionId);
-		return this.#save();
+	async bind(chatId: string, sessionId: string): Promise<BindingMutation> {
+		const previous = this.#bindings.get(chatId);
+		const next: BindingRecord = {
+			sessionId,
+			lastUsedAt: Date.now(),
+			revision: this.#nextBindingRevision++,
+		};
+		this.#pendingBindings.set(
+			chatId,
+			(this.#pendingBindings.get(chatId) ?? 0) + 1,
+		);
+		this.#bindings.set(chatId, next);
+		try {
+			await this.#save();
+		} catch (error) {
+			if (this.#bindings.get(chatId) === next) {
+				if (previous === undefined) this.#bindings.delete(chatId);
+				else this.#bindings.set(chatId, previous);
+			}
+			throw error;
+		} finally {
+			const pending = (this.#pendingBindings.get(chatId) ?? 1) - 1;
+			if (pending > 0) this.#pendingBindings.set(chatId, pending);
+			else this.#pendingBindings.delete(chatId);
+		}
+		return {
+			revision: next.revision,
+			...(previous
+				? {
+						previous: {
+							sessionId: previous.sessionId,
+							lastUsedAt: previous.lastUsedAt,
+						},
+					}
+				: {}),
+		};
+	}
+
+	async restoreBinding(
+		chatId: string,
+		mutation: BindingMutation,
+	): Promise<void> {
+		const current = this.#bindings.get(chatId);
+		if (current?.revision !== mutation.revision) return;
+		const restored = mutation.previous
+			? {
+					...mutation.previous,
+					revision: this.#nextBindingRevision++,
+				}
+			: undefined;
+		if (restored) this.#bindings.set(chatId, restored);
+		else this.#bindings.delete(chatId);
+		try {
+			await this.#save();
+		} catch (error) {
+			const latest = this.#bindings.get(chatId);
+			if (
+				(restored && latest === restored) ||
+				(!restored && latest === undefined)
+			)
+				this.#bindings.set(chatId, current);
+			throw error;
+		}
 	}
 
 	deliveries(chatId: string): DeliveryRecord[] {
@@ -235,10 +358,30 @@ export class State {
 	}
 
 	async addQuestion(question: QuestionRecord): Promise<void> {
-		if (!this.#questions.has(question.id) && this.#questions.size >= 1024)
-			throw new Error("Saved question limit reached");
+		const previous = this.#questions.get(question.id);
+		const removed: [string, QuestionRecord][] = [];
+		if (!previous && this.#questions.size >= 1024) {
+			for (const [id, saved] of this.#questions) {
+				if (!saved.delivered) continue;
+				this.#questions.delete(id);
+				removed.push([id, saved]);
+				if (this.#questions.size < 1024) break;
+			}
+			if (this.#questions.size >= 1024)
+				throw new Error("Saved question limit reached");
+		}
 		this.#questions.set(question.id, question);
-		await this.#save();
+		try {
+			await this.#save();
+		} catch (error) {
+			if (this.#questions.get(question.id) === question) {
+				if (previous) this.#questions.set(question.id, previous);
+				else this.#questions.delete(question.id);
+				for (const [id, saved] of removed)
+					if (!this.#questions.has(id)) this.#questions.set(id, saved);
+			}
+			throw error;
+		}
 	}
 
 	async answer(
@@ -275,63 +418,95 @@ export class State {
 		);
 	}
 
-	async acknowledge(
+	acknowledge(
 		deliveries: DeliveryRecord[],
 		answers: QuestionRecord[],
 		signal: AbortSignal,
 	): Promise<void> {
-		if (deliveries.length === 0 && answers.length === 0) return;
-		signal.throwIfAborted();
-		const delivered = new Map(
-			answers.map((question) => [question, { ...question, delivered: true }]),
-		);
-		for (const delivery of deliveries) {
-			this.#deliveries.delete(delivery.id);
-			this.#deliveredIds.set(delivery.id, Date.now());
-		}
-		for (const [question, updated] of delivered) {
-			if (this.#questions.get(question.id) === question)
-				this.#questions.set(question.id, updated);
-		}
-		try {
-			await this.#save();
+		const run = this.#acknowledgements.then(async () => {
+			if (deliveries.length === 0 && answers.length === 0) return;
 			signal.throwIfAborted();
-		} catch (error) {
+			const delivered = new Map(
+				answers.map((question) => [question, { ...question, delivered: true }]),
+			);
 			for (const delivery of deliveries) {
-				this.#deliveries.set(delivery.id, delivery);
-				this.#deliveredIds.delete(delivery.id);
+				this.#deliveries.delete(delivery.id);
+				this.#deliveredIds.set(delivery.id, Date.now());
 			}
 			for (const [question, updated] of delivered) {
-				if (this.#questions.get(question.id) === updated)
-					this.#questions.set(question.id, question);
+				if (this.#questions.get(question.id) === question)
+					this.#questions.set(question.id, updated);
 			}
-			await this.#save();
-			throw error;
-		}
+			try {
+				await this.#save();
+				signal.throwIfAborted();
+			} catch (error) {
+				for (const delivery of deliveries) {
+					this.#deliveries.set(delivery.id, delivery);
+					this.#deliveredIds.delete(delivery.id);
+				}
+				for (const [question, updated] of delivered) {
+					if (this.#questions.get(question.id) === updated)
+						this.#questions.set(question.id, question);
+				}
+				await this.#save();
+				throw error;
+			}
+		});
+		this.#acknowledgements = run.catch(() => {});
+		return run;
 	}
 
 	async flush(): Promise<void> {
+		await this.#acknowledgements;
 		await this.#writes;
 	}
 
 	#save(): Promise<void> {
+		const contents = this.#snapshot();
 		const saved = this.#writes.then(async () => {
-			const bindings = Object.fromEntries(this.#bindings);
-			for (const [id, time] of this.#deliveredIds) {
-				if (time < Date.now() - 24 * 60 * 60 * 1000)
-					this.#deliveredIds.delete(id);
-			}
-			if (this.#deliveredIds.size > 4096)
-				throw new Error("Delivery receipt limit reached");
-			const contents = `${JSON.stringify({ bindings, deliveries: [...this.#deliveries.values()], questions: [...this.#questions.values()], operations: [...this.#operations.values()], deliveredIds: [...this.#deliveredIds] }, null, 2)}\n`;
-			if (Buffer.byteLength(contents) > MAX_STATE_BYTES)
-				throw new Error(
-					"Chappie state exceeds the 32 MiB limit; pending results were not persisted",
-				);
 			await writeFile(this.#temporaryPath, contents, { mode: 0o600 });
 			await rename(this.#temporaryPath, this.#path);
 		});
 		this.#writes = saved.catch(() => {});
 		return saved;
+	}
+
+	#snapshot(): string {
+		const now = Date.now();
+		this.#pruneBindings(now);
+		if (this.#bindings.size > MAX_BINDINGS)
+			throw new Error("Binding limit reached");
+		const bindings = Object.fromEntries(
+			[...this.#bindings].map(([chatId, binding]) => [
+				chatId,
+				{
+					sessionId: binding.sessionId,
+					lastUsedAt: binding.lastUsedAt,
+				},
+			]),
+		);
+		for (const [id, time] of this.#deliveredIds) {
+			if (time < now - 24 * 60 * 60 * 1000) this.#deliveredIds.delete(id);
+		}
+		if (this.#deliveredIds.size > 4096)
+			throw new Error("Delivery receipt limit reached");
+		const contents = `${JSON.stringify({ bindings, deliveries: [...this.#deliveries.values()], questions: [...this.#questions.values()], operations: [...this.#operations.values()], deliveredIds: [...this.#deliveredIds] }, null, 2)}\n`;
+		if (Buffer.byteLength(contents) > MAX_STATE_BYTES)
+			throw new Error(
+				"Chappie state exceeds the 32 MiB limit; pending results were not persisted",
+			);
+		return contents;
+	}
+
+	#pruneBindings(now = Date.now()): boolean {
+		const cutoff = now - BINDING_TTL_MS;
+		let changed = false;
+		for (const [chatId, binding] of this.#bindings) {
+			if (binding.lastUsedAt >= cutoff) continue;
+			this.#bindings.delete(chatId);
+			changed = true;
+		}
+		return changed;
 	}
 }

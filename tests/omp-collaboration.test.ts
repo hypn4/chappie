@@ -47,10 +47,10 @@ function fixtureSession() {
 				inputs: [],
 			};
 		},
-		async remoteCall(sessionId, remoteCalls, signal) {
+		async remoteCall(sessionId, operationId, remoteCalls, signal) {
 			calls.push({
 				method: "remoteCall",
-				args: [sessionId, remoteCalls, signal],
+				args: [sessionId, operationId, remoteCalls, signal],
 			});
 			return {
 				sessionId,
@@ -78,10 +78,10 @@ function fixtureSession() {
 				],
 			};
 		},
-		async remoteChat(sessionId, text, replyTo, signal) {
+		async remoteChat(sessionId, operationId, text, replyTo, signal) {
 			calls.push({
 				method: "remoteChat",
-				args: [sessionId, text, replyTo, signal],
+				args: [sessionId, operationId, text, replyTo, signal],
 			});
 			return {
 				sessionId,
@@ -139,6 +139,7 @@ test("collaboration tools delegate explicit sessions and preserve resource owner
 		"remote-call",
 		{
 			sessionId: "REMOTE",
+			operationId: "call-one",
 			calls: [
 				{ name: "transfer", arguments: { operationId: "x", paths: ["a"] } },
 			],
@@ -162,7 +163,12 @@ test("collaboration tools delegate explicit sessions and preserve resource owner
 	assert.ok(chat);
 	await chat.execute(
 		"remote-chat",
-		{ sessionId: "REMOTE", text: "summary", replyTo: "generation-1" },
+		{
+			sessionId: "REMOTE",
+			operationId: "chat-one",
+			text: "summary",
+			replyTo: "generation-1",
+		},
 		signal,
 		undefined,
 		{} as OmpExtensionContext,
@@ -170,9 +176,9 @@ test("collaboration tools delegate explicit sessions and preserve resource owner
 	assert.ok(
 		f.calls.some(
 			(entry) =>
-				entry.method === "remoteChat" &&
 				entry.args[0] === "REMOTE" &&
-				entry.args[2] === "generation-1",
+				entry.args[1] === "chat-one" &&
+				entry.args[3] === "generation-1",
 		),
 	);
 });
@@ -242,7 +248,7 @@ test("local collaboration tools are opt-in and only active for non-Chappie model
 });
 
 test("collaboration methods route through real broker IPC with explicit session identity", async (t) => {
-	const f = await multiSessionFixture(t);
+	const f = await multiSessionFixture(t, ["A", "B"], true);
 	const a = f.session("A");
 	const b = f.session("B");
 	const listed = await a.local.sessions("B", f.controller.signal);
@@ -282,6 +288,7 @@ test("collaboration methods route through real broker IPC with explicit session 
 	const provider = b.local.start(output, "B");
 	const pending = a.local.remoteCall(
 		"B",
+		"remote-read-once",
 		[{ name: "read", arguments: { path: "sample.txt" } }],
 		f.controller.signal,
 	);
@@ -310,4 +317,13 @@ test("collaboration methods route through real broker IPC with explicit session 
 	assert.equal(result.sessionId, "B");
 	assert.match(JSON.stringify(result.toolResults), /REMOTE_RESULT/);
 	await provider;
+	await assert.rejects(
+		a.local.remoteCall(
+			"B",
+			"remote-read-once",
+			[{ name: "read", arguments: { path: "sample.txt" } }],
+			f.controller.signal,
+		),
+		/already accepted remote operation/i,
+	);
 });

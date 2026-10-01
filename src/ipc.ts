@@ -14,8 +14,9 @@ import {
 } from "node:tls";
 import type {
 	AssistantMessage,
+	ImageContent,
+	TextContent,
 	ToolCall,
-	ToolResultMessage,
 	UserMessage,
 } from "@earendil-works/pi-ai";
 import type { Activity } from "./activity.ts";
@@ -78,6 +79,16 @@ export type SessionInput = {
 	sessionId: string;
 } & ({ message: UserMessage } | { request: ModelRequest });
 
+export interface SessionToolResult {
+	role: "toolResult";
+	toolCallId: string;
+	toolName: string;
+	content: (TextContent | ImageContent)[];
+	details?: unknown;
+	isError: boolean;
+	timestamp: number;
+}
+
 export type SessionResult =
 	| { sessions: SessionListItem[] }
 	| {
@@ -89,7 +100,7 @@ export type SessionResult =
 	| {
 			message: AssistantMessage;
 			cwd: string;
-			toolResults: ToolResultMessage[];
+			toolResults: SessionToolResult[];
 			inputs: SessionInput[];
 	  }
 	| { inputs: SessionInput[] }

@@ -1,4 +1,4 @@
-import type { ToolResultMessage } from "@earendil-works/pi-ai";
+import type { JsonObject } from "@earendil-works/pi-ai";
 import {
 	createBashToolDefinition,
 	createEditToolDefinition,
@@ -8,14 +8,14 @@ import {
 import { fromJsonSchema } from "@modelcontextprotocol/server";
 import type { Initialization } from "./broker.ts";
 import { toolResultsContent } from "./delivery.ts";
-import type { SessionInput } from "./ipc.ts";
+import type { SessionInput, SessionToolResult } from "./ipc.ts";
 import type { ReplayReceipt } from "./operations.ts";
 import { contentWithImageReferences } from "./resources.ts";
 import { transfer } from "./transfer.ts";
 
 export interface ToolInput {
 	name: string;
-	arguments: Record<string, unknown>;
+	arguments: JsonObject;
 }
 
 export function decodeBase64ToolCalls(value: string): unknown {
@@ -62,7 +62,7 @@ export const directTools = definitions.map((definition) => ({
 }));
 
 export function toolResult(
-	toolResults: ToolResultMessage[],
+	toolResults: SessionToolResult[],
 	sessionId: string,
 	cwd: string,
 	inputs: SessionInput[] = [],

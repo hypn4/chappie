@@ -120,8 +120,8 @@ must use the same endpoint; the host name alone does not filter sessions.
 
 `bun run check` runs formatting, type checks, and the Bun test suite.
 `bun run test:omp` builds the package and checks a temporary native OMP session
-without model inference. CI runs that OMP verification on Linux, macOS, and
-Windows and also checks the declared OMP 18.3 compatibility floor.
+without model inference. CI runs current OMP on Windows, verifies the OMP 18.3
+floor and packaged current OMP on Linux, and exercises otunnel 0.2 on Linux.
 
 GitHub Actions publishes releases to npm using OIDC and the committed
 `publishConfig.tag`; routine releases do not require an npm login.
@@ -183,6 +183,11 @@ OMP users can set `localTools` to `true` to register the opt-in
 `sessions`, `remote_tools`, `remote_call`, `remote_chat`, and
 `history` collaboration tools. They are active only while the OMP session is
 using a non-Chappie model; selecting the Chappie provider keeps ChatGPT-driven
-execution isolated. The default is `false`.
+execution isolated. The broker also requires `localTools=true` before it will
+relay `remote_call` or `remote_chat`; remote deployments therefore enable
+it on both the source OMP side and the broker side. `remote_call` and
+`remote_chat` require a stable `operationId`; reuse it only when retrying
+the same remote operation so the broker can prevent duplicate native execution.
+The default is `false`.
 
 Closely spaced initializations from the same ChatGPT conversation receive guidance to observe through `history` without repeating exports or the completion response. See [participation](docs/tools.md#participation).

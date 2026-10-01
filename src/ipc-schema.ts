@@ -15,7 +15,7 @@ const toolCall = z.strictObject({
 	type: z.literal("toolCall"),
 	id: name,
 	name,
-	arguments: z.record(z.string(), z.unknown()),
+	arguments: z.record(z.string(), z.json()),
 });
 const block = z.union([
 	z.looseObject({ type: z.literal("text"), text }),

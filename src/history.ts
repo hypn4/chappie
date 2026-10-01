@@ -5,11 +5,15 @@ import { toolResultsContent } from "./delivery.ts";
 import type { ProviderOutput } from "./provider-core.ts";
 import { contentWithImageReferences, rememberImages } from "./resources.ts";
 
+export const MAX_HISTORY_ENTRIES = 200;
+const MAX_HISTORY_CONTENT_BLOCKS = 4096;
+
 export const historyInput = z.object({
 	limit: z
 		.number()
 		.int()
 		.min(1)
+		.max(MAX_HISTORY_ENTRIES)
 		.default(20)
 		.describe("Maximum number of history entries"),
 	before: z
@@ -80,12 +84,43 @@ export function historyResult(
 			if (block.type === "toolCall") sources.set(block.id, message.chappie);
 		}
 	}
+	const chunks: ReturnType<typeof toolResultsContent>[] = [];
+	let usedBlocks = 0;
+	let included = 0;
+	let truncated = false;
+	const candidates = after ? selected : [...selected].reverse();
+	for (const entry of candidates) {
+		const blocks = entryContent(entry, sessionId, sources);
+		if (usedBlocks + blocks.length <= MAX_HISTORY_CONTENT_BLOCKS) {
+			chunks.push(blocks);
+			usedBlocks += blocks.length;
+			included++;
+			continue;
+		}
+		const available = MAX_HISTORY_CONTENT_BLOCKS - usedBlocks;
+		if (available > 0) {
+			const retained = Math.max(0, available - 1);
+			const chunk: ReturnType<typeof toolResultsContent> = [];
+			if (retained > 0) {
+				chunk.push(...blocks.slice(0, retained));
+				included++;
+			}
+			chunk.push({
+				type: "text",
+				text: JSON.stringify({
+					historyTruncated: true,
+					reason: "content block limit",
+				}),
+			});
+			chunks.push(chunk);
+		}
+		truncated = true;
+		break;
+	}
 	return {
-		count: selected.length,
-		hasMore: entries.length > selected.length,
-		content: selected.flatMap((entry) =>
-			entryContent(entry, sessionId, sources),
-		),
+		count: included,
+		hasMore: entries.length > selected.length || truncated,
+		content: (after ? chunks : chunks.reverse()).flat(),
 	};
 }
 
