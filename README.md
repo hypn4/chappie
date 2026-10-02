@@ -4,7 +4,7 @@ Use ChatGPT to work through [Oh My Pi (OMP)](https://github.com/can1357/oh-my-pi
 
 This is the maintained [hypn4/chappie](https://github.com/hypn4/chappie) fork of
 [zetaloop/chappie](https://github.com/zetaloop/chappie), published as
-`@hypn4/chappie`. It targets native OMP, MCP 2.0, durable operations, and completion events.
+`@hypn4/chappie`. It targets native OMP, MCP 2.0, and recoverable Chat-only operations.
 The original MIT license and attribution are retained.
 
 ## Setup
@@ -123,6 +123,8 @@ For consistent reviews and work across Chat sessions, start with [AGENTS.md](AGE
 Chappie exposes a small session bridge rather than copying native tool schemas. `init` discovers the complete compact tool/Skill catalog; read relevant `skill://` workflows and request only the needed live definitions with `tools(names)`. Prefer task-specific OMP native/MCP capabilities. `call` runs a native batch, while `start_call` retains long-operation status and results. Oversized responses from any core tool are atomically saved and returned as `resultId`; `get_operation(resultId, offset)` reads lossless pages without repeating native execution. The final response budget counts UTF-8 bytes after formatting, not just individual descriptions.
 
 Chappie is Chat-only and does not advertise MCP Events or Tasks. Detached work is durable rather than proactive: `start_call` returns an operation ID, `get_operation` recovers its status/result, and later Chappie interactions also surface pending deliveries. ChatGPT cannot be woken by the broker after the current Chat turn ends.
+
+Ordinary `call` returns fast results inline. When native waiting exceeds the 25-second application budget, it yields a recoverable `operationId` without cancelling the accepted batch. Read that operation with `get_operation`; use `cancel_operation` to stop it explicitly. Prefer `start_call` from the outset for known long work. Neither a progress notice nor a heartbeat guarantees that ChatGPT will keep a request or conversation open.
 
 `chat` reports progress without ending the native turn by default; `mode: "message"` sends an intentional assistant turn. Batch/work feedback keeps the current Chat controller responsible for the remaining requested scope. `history` reads native progress, and `transfer` moves files between connected environments. See the [tool guide](docs/tools.md) for session selection, durable operation lifetime, recovery, and file transfer.
 

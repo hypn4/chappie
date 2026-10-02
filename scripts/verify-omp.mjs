@@ -45,6 +45,9 @@ const work = join(root, "work");
 await mkdir(agent);
 await mkdir(work);
 await writeFile(join(work, "fixture.txt"), "Alpha\nBeta\nGamma\n");
+await writeFile(join(work, "bounded.txt"), "BOUNDED_NATIVE_OK\n");
+const boundedRelease = join(root, "bounded-release");
+const boundedStarted = join(root, "bounded-started");
 const probeExtension = join(root, "provider-probe.ts");
 const reminderFile = join(root, "todo-reminder.txt");
 const collaborationFile = join(root, "collaboration-tools.txt");
@@ -69,11 +72,24 @@ await symlink(
 await writeFile(
 	probeExtension,
 	`
-import { writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, watch, writeFileSync } from "node:fs";
 import chappie from ${JSON.stringify(candidateEntry)};
 import { createOmpChappieProvider } from ${JSON.stringify(candidateProviderEntry)};
 export default async function probe(api) {
   await chappie(api);
+  api.on("tool_call", async (event) => {
+    if (event.toolName !== "read" || event.input.path !== "bounded.txt") return;
+    appendFileSync(${JSON.stringify(boundedStarted)}, "started\\n");
+    await new Promise((resolve) => {
+      const released = () => {
+        if (!existsSync(${JSON.stringify(boundedRelease)})) return;
+        watcher.close();
+        resolve();
+      };
+      const watcher = watch(${JSON.stringify(root)}, released);
+      released();
+    });
+  });
   let dispose;
   const foreign = createOmpChappieProvider(
     async () => {
@@ -107,7 +123,7 @@ export default async function probe(api) {
 }
 `,
 );
-let broker = new Broker(agent);
+let broker = new Broker(agent, { callWaitMs: 1000 });
 const controller = new AbortController();
 const timer = setTimeout(
 	() => controller.abort(new Error("OMP integration test timed out")),
@@ -249,6 +265,52 @@ try {
 	assert.equal(detachedResult.deliveries.length, 1);
 	assert.equal(detachedResult.deliveries[0]?.toolResults.length, 1);
 	await broker.acknowledge(detachedResult.deliveries, [], signal);
+	// The read is held by a real OMP hook until after the caller receives its
+	// operation reference; no sleep is used to guess native completion.
+	const boundedCaller = new AbortController();
+	const bounded = await broker.call(
+		"integration-chat",
+		session.id,
+		[{ name: "read", arguments: { path: "bounded.txt" } }],
+		"bounded-native-read",
+		boundedCaller.signal,
+	);
+	assert.ok(
+		bounded.operation,
+		"slow native call must yield before the hook is released",
+	);
+	assert.equal(bounded.operation.status, "running");
+	boundedCaller.abort(new Error("Transport response ended after soft detach"));
+	const pendingProgress = await broker.chat(
+		"integration-chat",
+		session.id,
+		"Native read still pending.",
+		"bounded-progress",
+		signal,
+		undefined,
+		"progress",
+	);
+	assert.equal(pendingProgress.progress, true);
+	await writeFile(boundedRelease, "release");
+	let boundedResult = broker.operation(
+		"integration-chat",
+		bounded.operation.operationId,
+	);
+	while (!boundedResult.result) {
+		signal.throwIfAborted();
+		await delay(20);
+		boundedResult = broker.operation(
+			"integration-chat",
+			bounded.operation.operationId,
+		);
+	}
+	assert.equal(boundedResult.operation.status, "completed");
+	assert.match(
+		JSON.stringify(boundedResult.result.toolResults),
+		/BOUNDED_NATIVE_OK/,
+	);
+	assert.equal(await readFile(boundedStarted, "utf8"), "started\n");
+	await broker.acknowledge(boundedResult.deliveries, [], signal);
 	const calls = [
 		{
 			name: "transfer",
@@ -505,7 +567,7 @@ try {
 		signal,
 	);
 	console.log(
-		"OMP integration passed: native tool discovery and batch execution, provider ownership after replacement/disposal, auxiliary rejection, detached operation completion, broker reconnect first-turn routing, saved-session resume first-turn routing, local collaboration registration, nonterminating progress and two-step TODO continuation, exact read, native edit, resource bytes, replay and original-URI recovery.",
+		"OMP integration passed: native tool discovery and batch execution, provider ownership after replacement/disposal, auxiliary rejection, detached operation completion, bounded synchronous call recovery through a gated native read, broker reconnect first-turn routing, saved-session resume first-turn routing, local collaboration registration, nonterminating progress and two-step TODO continuation, exact read, native edit, resource bytes, replay and original-URI recovery.",
 	);
 	console.log(
 		"No subagents, external model inference or live broker changes were used. ChatGPT approval UI and final response rendering are not covered.",
@@ -516,6 +578,7 @@ try {
 	process.exitCode = 1;
 } finally {
 	clearTimeout(timer);
+	await writeFile(boundedRelease, "cleanup");
 	controller.abort(new Error("Integration cleanup"));
 	await omp.stop();
 	await broker.close();

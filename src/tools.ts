@@ -2,7 +2,7 @@ import type { ToolCall } from "@oh-my-pi/pi-ai";
 import type { Initialization } from "./broker.ts";
 import { toolResultsContent } from "./delivery.ts";
 import type { ExecutionWait, SessionInput, SessionToolResult } from "./ipc.ts";
-import type { ReplayReceipt } from "./operations.ts";
+import type { OperationView, ReplayReceipt } from "./operations.ts";
 import { contentWithImageReferences } from "./resources.ts";
 import { continuationFor, type SessionWork } from "./work.ts";
 
@@ -21,6 +21,7 @@ export function toolResult(
 	execution?: ExecutionWait,
 	observation: {
 		work?: SessionWork | undefined;
+		operation?: OperationView | undefined;
 		scope?: "native_batch" | "progress" | "message";
 	} = {},
 ) {
@@ -40,13 +41,16 @@ export function toolResult(
 					...(replay ? { replay } : {}),
 					...(execution ? { execution } : {}),
 					...(observation.work ? { work: observation.work } : {}),
+					...(observation.operation
+						? { operation: observation.operation }
+						: {}),
 					continuation: continuationFor({
 						...observation,
 						needsInput:
 							execution !== undefined ||
 							inputs.some((input) => "request" in input),
 						failed,
-						operationStatus: replay?.status,
+						operationStatus: observation.operation?.status ?? replay?.status,
 					}),
 				}),
 			},

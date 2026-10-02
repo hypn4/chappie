@@ -42,6 +42,8 @@ The ChatGPT controller, not OMP or this broker, decides when the user goal is sa
 
 `work.omp.ts` reads the current native TODO branch with OMP's canonical helper. `work.ts` owns only its small observation schema and advisory continuation cues; it does not import the inference host into the standalone broker. Capture observations with results, preserve them through detached delivery/recovery, and label their session scope/time. Do not infer user authorization from shared TODOs or label a settled board as verified completion. Do not add a hidden planner, stop-hook shim, second task database or host-cancellation bypass.
 
+Ordinary native calls have a one-shot response-wait budget, not a heartbeat. A durably reserved call can yield its recovery ID while the same execution continues. Preserve request-scope keys and cancellation ownership; an auto-ID is an alias, not a second acceptance. Before yielding, the last caller's cancellation still stops native execution; afterwards cancellation is explicit. Fast calls keep inline results, and only yielded completions enter retained delivery. A budget does not certify a host timeout or prevent every network/UI interruption. Direct file transfers and deliberate message turns keep their existing contracts.
+
 ### Logical retry identity and execution identity are different
 
 A logical operation ID identifies caller intent; a random persisted execution ID identifies one acceptance. Reusing a logical ID after terminal retention must not authorize delayed results from the old acceptance. IPC and deferred deliveries carry the execution ID and validate it before mutation. Known-unexecuted `waiting_input` resumes preserve the same acceptance; unresolved work remains fail-closed across restart.

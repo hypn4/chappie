@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { type Activity, chatLabel, source } from "./activity.ts";
 import { readConfig } from "./config.ts";
 import type { DeliveryRecord } from "./delivery.ts";
@@ -120,6 +120,7 @@ export interface ChatResult {
 
 export interface CallResult extends ChatResult {
 	toolResults: SessionToolResult[];
+	operation?: OperationView;
 }
 
 export interface StartedOperation {
@@ -134,19 +135,37 @@ export interface OperationResult {
 	inputs: ModelInput[];
 }
 
+/** Only the transport waiter expires; a yielded acceptance keeps its cancellation owner. */
+interface CallRecovery {
+	chatId: string;
+	sessionId: string;
+	cwd: string;
+	operationId: string;
+	initialization?: Initialization | undefined;
+	reservation: ReturnType<typeof Promise.withResolvers<void>>;
+	detached: boolean;
+	owner?: DetachedOperation;
+	retain?: () => Promise<void>;
+}
+
 interface InFlightOperation {
 	signature: string;
 	promise: Promise<ChatResult | CallResult>;
 	controller: AbortController;
 	waiters: number;
+	recovery?: CallRecovery;
 }
 
 export interface BrokerOptions {
 	sessionWaitMs?: number;
 	inspectionTimeoutMs?: number;
+	callWaitMs?: number;
 }
 
 const INIT_SUMMARY_CHARS = 512;
+
+// Application response budget, not a claim about any ChatGPT timeout.
+const CALL_WAIT_MS = 25_000;
 
 function compactSummary(value: string | undefined): string | undefined {
 	if (!value) return undefined;
@@ -157,6 +176,7 @@ export class Broker {
 	readonly #agentDir: string;
 	readonly #sessionWaitMs: number;
 	readonly #inspectionTimeoutMs: number;
+	readonly #callWaitMs: number;
 	readonly #ipc: IpcServer;
 	readonly #state: State;
 	readonly #responses: ResponseStore;
@@ -180,6 +200,9 @@ export class Broker {
 	constructor(agentDir: string, options: BrokerOptions = {}) {
 		this.#sessionWaitMs = options.sessionWaitMs ?? 5000;
 		this.#inspectionTimeoutMs = options.inspectionTimeoutMs ?? 3000;
+		this.#callWaitMs = options.callWaitMs ?? CALL_WAIT_MS;
+		if (!Number.isSafeInteger(this.#callWaitMs) || this.#callWaitMs < 1)
+			throw new Error("callWaitMs must be a positive integer");
 		this.#agentDir = agentDir;
 		this.#state = new State(agentDir);
 		this.#responses = new ResponseStore(agentDir);
@@ -459,9 +482,25 @@ export class Broker {
 			chatId,
 			target,
 			"call",
-			requestId,
+			!direct && (typeof requestId !== "string" || !requestId)
+				? randomUUID()
+				: requestId,
 			calls,
 		);
+		const recovery: CallRecovery | undefined =
+			!direct && identity
+				? {
+						chatId,
+						sessionId: target,
+						cwd: this.#sessions.get(target)?.description.cwd ?? "",
+						operationId: `call-${createHash("sha256").update(identity.key).digest("hex")}`,
+						initialization,
+						reservation: Promise.withResolvers<void>(),
+						detached: false,
+					}
+				: undefined;
+		// A rejected reservation must not become an unhandled auxiliary promise.
+		void recovery?.reservation.promise.catch(() => {});
 		return this.#coalesceOperation(
 			identity,
 			signal,
@@ -471,12 +510,14 @@ export class Broker {
 					if (!session) throw new Error("Target session disconnected");
 					const replay = await this.#state.reserveOperation({
 						...identity,
+						...(recovery ? { operationId: recovery.operationId } : {}),
 						chatId,
 						sessionId: target,
 						cwd: session.description.cwd,
 						status: "running",
 						updatedAt: Date.now(),
 					});
+					recovery?.reservation.resolve();
 					if (replay) {
 						await this.#confirmBindingUse(chatId, sessionId, target);
 						return {
@@ -485,10 +526,19 @@ export class Broker {
 							inputs: [],
 							toolResults: [],
 							replay: replayReceipt(replay),
+							...(replay.operationId
+								? { operation: operationView(replay) }
+								: {}),
 						};
 					}
 				}
 
+				const executionSource = this.#state.executionSource(identity?.key);
+				const isCurrent = () =>
+					!recovery ||
+					this.#state.findOperation(chatId, recovery.operationId)
+						?.executionId === executionSource.executionId;
+				if (recovery?.owner) recovery.owner.dispatched = true;
 				const toolCalls = nativeToolCalls(calls);
 				const result = await this.#request(
 					target,
@@ -496,16 +546,24 @@ export class Broker {
 						type: "call",
 						id,
 						...source(chatId, requestId),
-						...this.#state.executionSource(identity?.key),
+						...executionSource,
 						sessionId: target,
 						calls: toolCalls,
 						...(direct ? { direct: true } : {}),
 					}),
 					operationSignal,
 				).catch(async (error: unknown) => {
-					await this.#state.finishOperation(identity?.key, "uncertain");
+					if (isCurrent())
+						await this.#state.finishOperation(
+							identity?.key,
+							"uncertain",
+							[],
+							error instanceof Error ? error.message : String(error),
+						);
 					throw error;
 				});
+				if (!isCurrent())
+					throw new Error("Native result belongs to a replaced acceptance");
 				if ("execution" in result) {
 					await this.#recordInputWait(identity?.key, result);
 					return {
@@ -519,6 +577,20 @@ export class Broker {
 					};
 				}
 				if ("toolResults" in result) {
+					if (recovery) {
+						let retained: Promise<void> | undefined;
+						recovery.retain = () =>
+							(retained ??= this.#state.addDelivery({
+								id: `operation:${executionSource.executionId ?? identity?.key}`,
+								chatId,
+								...executionSource,
+								sessionId: target,
+								cwd: result.cwd,
+								toolResults: result.toolResults,
+								...(result.work ? { work: result.work } : {}),
+								complete: true,
+							}));
+					}
 					await this.#state.finishOperation(
 						identity?.key,
 						"completed",
@@ -539,6 +611,7 @@ export class Broker {
 				await this.#state.finishOperation(identity?.key, "uncertain");
 				throw new Error("OMP session returned no tool results");
 			},
+			recovery,
 		);
 	}
 
@@ -596,6 +669,8 @@ export class Broker {
 		);
 		if (!identity?.operationId)
 			throw new Error("Detached calls require a stable operationId");
+		// Auto-yielded calls retain their original request-scope retry identity.
+		if (prior) identity.key = prior.key;
 		const session = this.#sessions.get(target);
 		if (!session) throw new Error("Target session disconnected");
 		await this.#confirmBindingUse(chatId, sessionId, target);
@@ -1151,7 +1226,9 @@ export class Broker {
 		identity: { key: string; signature: string } | undefined,
 		signal: AbortSignal,
 		execute: (signal: AbortSignal) => Promise<T>,
+		recovery?: CallRecovery,
 	): Promise<T> {
+		signal.throwIfAborted();
 		if (!identity) return execute(signal);
 		const existing = this.#inFlightOperations.get(identity.key);
 		if (existing) {
@@ -1160,38 +1237,71 @@ export class Broker {
 			return this.#waitForOperation<T>(existing, signal);
 		}
 		const controller = new AbortController();
-		const task = execute(controller.signal);
+		const completion = Promise.withResolvers<T>();
 		const tracked: InFlightOperation = {
 			signature: identity.signature,
-			promise: task,
+			promise: completion.promise,
 			controller,
 			waiters: 0,
+			...(recovery ? { recovery } : {}),
 		};
 		this.#inFlightOperations.set(identity.key, tracked);
-		void task
+		// Use the same cancellation ownership map as explicit start_call, before admission yields.
+		if (recovery && !this.#detachedOperations.has(identity.key)) {
+			recovery.owner = {
+				controller,
+				promise: completion.promise.then(
+					() => {},
+					() => {},
+				),
+				dispatched: false,
+				signature: identity.signature,
+			};
+			this.#detachedOperations.set(identity.key, recovery.owner);
+		}
+		void completion.promise
 			.finally(() => {
 				if (this.#inFlightOperations.get(identity.key) === tracked)
 					this.#inFlightOperations.delete(identity.key);
+				if (
+					recovery?.owner &&
+					this.#detachedOperations.get(identity.key) === recovery.owner
+				)
+					this.#detachedOperations.delete(identity.key);
 			})
 			.catch(() => {});
-		return this.#waitForOperation<T>(tracked, signal);
+		const waiting = this.#waitForOperation<T>(tracked, signal);
+		void execute(controller.signal)
+			.then(async (value) => {
+				if (recovery?.detached) await recovery.retain?.();
+				return value;
+			})
+			.then(completion.resolve, (error: unknown) => {
+				recovery?.reservation.reject(error);
+				completion.reject(error);
+			});
+		return waiting;
 	}
 
-	#waitForOperation<T>(
+	#waitForOperation<T extends ChatResult | CallResult>(
 		operation: InFlightOperation,
 		signal: AbortSignal,
 	): Promise<T> {
+		const recovery = operation.recovery;
 		if (signal.aborted) {
 			const error = abortError(signal);
-			if (operation.waiters === 0) operation.controller.abort(error);
+			if (operation.waiters === 0 && !recovery?.detached)
+				operation.controller.abort(error);
 			return Promise.reject(error);
 		}
 		operation.waiters++;
 		const completion = Promise.withResolvers<T>();
 		let released = false;
+		let timer: ReturnType<typeof setTimeout> | undefined;
 		const release = () => {
 			if (released) return;
 			released = true;
+			clearTimeout(timer);
 			signal.removeEventListener("abort", onAbort);
 			operation.waiters--;
 		};
@@ -1199,16 +1309,66 @@ export class Broker {
 			const error = abortError(signal);
 			release();
 			completion.reject(error);
-			if (operation.waiters === 0) operation.controller.abort(error);
+			if (operation.waiters === 0 && !recovery?.detached)
+				operation.controller.abort(error);
+		};
+		const snapshot = (): CallResult => {
+			if (!recovery)
+				throw new Error("Only native calls can yield an operation");
+			return {
+				sessionId: recovery.sessionId,
+				cwd: recovery.cwd,
+				inputs: [],
+				toolResults: [],
+				operation: this.operation(recovery.chatId, recovery.operationId)
+					.operation,
+				...(recovery.initialization
+					? { initialization: recovery.initialization }
+					: {}),
+			};
+		};
+		const yieldOperation = async () => {
+			if (!recovery) return;
+			try {
+				await recovery.reservation.promise;
+				if (released) return;
+				signal.throwIfAborted();
+				operation.controller.signal.throwIfAborted();
+				recovery.detached = true;
+				await recovery.retain?.();
+				if (released) return;
+				const result = snapshot();
+				release();
+				completion.resolve(result as T);
+			} catch (error) {
+				if (released) return;
+				release();
+				completion.reject(error);
+			}
 		};
 		signal.addEventListener("abort", onAbort, { once: true });
 		if (signal.aborted) onAbort();
+		if (recovery && !released) {
+			if (recovery.detached) void yieldOperation();
+			else
+				timer = setTimeout(() => {
+					void yieldOperation();
+				}, this.#callWaitMs);
+		}
 		void (operation.promise as Promise<T>).then(
 			(value) => {
-				release();
-				completion.resolve(value);
+				if (released) return;
+				try {
+					const result = recovery?.detached ? (snapshot() as T) : value;
+					release();
+					completion.resolve(result);
+				} catch (error) {
+					release();
+					completion.reject(error);
+				}
 			},
 			(error) => {
+				if (released) return;
 				release();
 				completion.reject(error);
 			},

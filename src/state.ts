@@ -227,6 +227,11 @@ export class State {
 			// yielding, so simultaneous retries still dispatch just one batch.
 			const resumed: OperationReceipt = {
 				...existing,
+				// A pre-upgrade unexecuted request can acquire a public recovery alias,
+				// but keeps the original key and acceptance incarnation.
+				...(existing.operationId === undefined && receipt.operationId
+					? { operationId: receipt.operationId }
+					: {}),
 				status: "running",
 				updatedAt: Date.now(),
 			};

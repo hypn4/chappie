@@ -474,7 +474,7 @@ export function createServer(
 		{
 			title: "Call OMP tools",
 			description:
-				"Execute one discovered native OMP batch, not the entire user goal. Inspect returned continuation/work and keep calling the needed tools while authorized work remains; a batch result is not a reason to end Chat. Prefer the most specific native capability. Batch only calls whose arguments are already known; if a later call depends on an earlier result, use a separate call. Native schemas, routing guidance and validation belong to OMP. A pending model request returns needs_input/executed:false without running the batch.",
+				"Execute one discovered native OMP batch. Fast results return inline; after a 25-second native wait budget, a durably accepted batch yields operation.operationId without cancelling execution. Recover with get_operation; cancel explicitly with cancel_operation. Prefer start_call for known long work. Neither result form completes the user goal: inspect continuation/work and continue authorized scope. Use the most specific native capability. Batch only independent calls; dependent steps require separate calls. Native schemas and permissions remain OMP-owned. needs_input/executed:false means no work ran.",
 			outputSchema,
 			inputSchema: z.strictObject({
 				calls: nativeCallsSchema,
@@ -500,7 +500,7 @@ export function createServer(
 					result.initialization,
 					result.replay,
 					result.execution,
-					{ work: result.work },
+					{ work: result.work, operation: result.operation },
 				),
 				true,
 				!result.execution && result.inputs.length
@@ -638,7 +638,7 @@ export function createServer(
 		{
 			title: "Cancel long operation",
 			description:
-				"Cancel a running operation started with start_call. Cancellation is explicit and independent of the originating ChatGPT MCP request. Repeating cancellation is safe and returns the current durable state.",
+				"Cancel a running operation started with start_call or yielded by call. Cancellation is explicit and independent of the originating ChatGPT MCP request. Repeating cancellation is safe and returns the current durable state.",
 			outputSchema,
 			inputSchema: z.object({
 				operationId: z.string().trim().min(1).max(128),

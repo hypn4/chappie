@@ -12,7 +12,7 @@ Legacy MCP handshakes and the standalone Pi host are not supported.
 | `chat` | Report progress without ending a turn; use `mode: "message"` for an intentional assistant turn or `replyTo` for a model request. |
 | `ask` | Create a persistent question in ChatGPT. |
 | `ask_assert` | Confirm that an `ask` widget loaded. |
-| `call` | Run one or more OMP tools as one native batch and wait for completion. |
+| `call` | Run a native batch; return fast results inline or yield a durable operation after the wait budget. |
 | `start_call` | Durably start a native OMP tool batch without keeping the ChatGPT MCP request open. |
 | `get_operation` | Read operation status with `operationId`, or losslessly page a retained tool response with `resultId` and `offset`. |
 | `cancel_operation` | Explicitly request cancellation of a detached native batch. |
@@ -115,7 +115,7 @@ For `start_call`, this feedback persists as `waiting_input`; `get_operation` ret
 
 ### Long-running operations
 
-`call` keeps the ChatGPT MCP request open until the native OMP batch completes. For work that may outlive a host request deadline, use `start_call` instead:
+`call` waits up to a 25-second application budget after session selection, including native queueing. Fast results remain inline. Once a receipt is durably reserved, exceeding the budget yields `operation` with its caller-visible `operationId` and current state, without cancelling or restarting the native batch. Use `get_operation` for completion or input-wait recovery and `cancel_operation` for explicit cancellation. The budget is not a documented ChatGPT deadline or a hard real-time guarantee: storage, scheduling and session selection can add latency. For work known to be long, avoid that initial wait by using `start_call`:
 
 ```json
 {
@@ -138,9 +138,13 @@ Read the state later with:
 
 Full detached results remain available through `get_operation(operationId)` after pending-delivery acknowledgement. Terminal receipts and results are retained for 24 hours. Within that window, an identical logical ID replays the accepted operation and conflicting arguments are rejected. After retirement, a fresh acceptance gets a new persisted `executionId`; native requests and deferred results must match that execution, so delayed output cannot complete a successor with the same logical ID. `waiting_input` resumes the same acceptance rather than generating a new one. Unresolved running/waiting/uncertain receipts are not automatically evicted.
 
+Automatic recovery IDs are derived from the originating request identity and scoped to its conversation/session. The internal request key is preserved, so retries keep the original acceptance. A host retry without a stable request identity cannot be deduplicated by inference; prefer an explicit `start_call` ID for consequential long operations. Reuse the returned auto-ID with `start_call` only to resume its known-unexecuted `waiting_input` state after answering the model request. A pre-upgrade input wait may acquire a recovery alias without changing its execution ID; completed old receipts are not re-executed. Direct `transfer` and deliberate `chat(mode=message)` retain their separate lifetime contracts.
+
+Before a call yields, aborting its last waiting request still cancels native work. After yielding, ending that transport request does not cancel the accepted operation. A failed response send does not authorize repetition: recover with the original request identity or known operation ID. Broker loss leaves unfinished work `uncertain`, not automatically resumed. Native `isError` remains a failed tool result even when the operation is `completed` as a batch.
+
 `cancel_operation` owns cancellation from the start of initial acceptance or a `waiting_input` reclaim, including while the receipt is being persisted. Cancellation before dispatch prevents later native execution. Cancelling a waiting operation does not abort its independent model request. Ending the original MCP request does not cancel accepted detached work. Cancellation cannot undo side effects or promise to stop independent child processes. Request-cancel notices report `executionPhase`: queued work was removed before dispatch; in-flight/result-pending work may already have effects. A reason such as `Request ended` is the upstream abort reason, not proof of edit rollback or a diagnosis of why the host ended the request. Inspect history and files before deciding whether any further action is safe. Broker recovery marks interrupted running receipts `uncertain`; known-unexecuted waits stay resumable. Reconcile uncertain work rather than re-executing it.
 
-Do not send heartbeat or rapidly poll to extend a ChatGPT tool request. Detach the native batch, and use persistent process supervision separately when the process itself must survive the agent or broker exiting.
+Do not send periodic heartbeat or rapidly poll to extend a ChatGPT tool request. MCP progress needs a request token and client handling; timeout renewal is optional and does not remove maximum-total limits. The current `2026-07-28` protocol also removed `ping`. Chappie owns a stdio JSON-RPC boundary, not the upstream HTTP/SSE stream, so arbitrary stdout/SSE keepalives are invalid. `chat(mode=progress)` records an OMP notice, not transport keepalive. No verified ChatGPT timeout-renewal guarantee is assumed. Detach the native batch, and use persistent process supervision separately when the process itself must survive the agent or broker exiting. See [MCP lifecycle timeouts](https://github.com/modelcontextprotocol/modelcontextprotocol/blob/main/docs/specification/2025-03-26/basic/lifecycle.mdx#timeouts), [progress semantics](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/progress), and the [current protocol's ping removal](https://github.com/modelcontextprotocol/go-sdk/blob/main/docs/protocol.md#ping).
 
 ### Chat continuation
 

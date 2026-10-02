@@ -132,3 +132,34 @@ test("concurrent waiting_input reclaims keep one acceptance identity", async (t)
 	assert.equal(claims.filter((value) => value === undefined).length, 1);
 	assert.equal(state.operation("chat", "id").executionId, before.executionId);
 });
+
+test("resuming an old unaliased input wait adopts recovery identity without changing its execution", async (t) => {
+	const root = await mkdtemp(join(tmpdir(), "ch-upgrade-wait-"));
+	t.after(() => rm(root, { recursive: true, force: true }));
+	const state = new State(root);
+	const old: OperationReceipt = {
+		key: "original-request-key",
+		signature: "sig",
+		chatId: "chat",
+		sessionId: "A",
+		cwd: root,
+		status: "running",
+		updatedAt: Date.now(),
+	};
+	await state.reserveOperation(old);
+	const execution = state.executionSource(old.key).executionId;
+	await state.waitForInput(old.key, [
+		{ id: "model", sessionId: "A", request: { kind: "compaction", input: {} } },
+	]);
+	await state.reserveOperation({ ...old, operationId: "call-recovery" });
+	const resumed = state.operation("chat", "call-recovery");
+	assert.equal(resumed.key, old.key);
+	assert.equal(resumed.executionId, execution);
+	assert.equal(resumed.status, "running");
+	const restored = new State(root);
+	await restored.load();
+	assert.equal(
+		restored.operation("chat", "call-recovery").executionId,
+		execution,
+	);
+});
