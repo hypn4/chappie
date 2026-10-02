@@ -51,6 +51,7 @@ import {
 	State,
 } from "./state.ts";
 import type { ToolInput } from "./tools.ts";
+import type { ChatMode, SessionWork } from "./work.ts";
 
 const observerInstructions =
 	"This ChatGPT conversation recently initialized or resumed work in this OMP session. A recent initialization may still own this task; do not assume another completion is needed. Participate as an observer for this task: read history with observer: true, follow new entries with after and wait: true, and think independently. Leave execution and OMP communication to the ongoing work. Do not export files, repeat the completed report, or publish a second completion response. Leave the single completion response to the original execution. Continue observing rather than reinitializing to take over.";
@@ -107,6 +108,8 @@ export interface InspectedSession extends SessionInspection {
 }
 
 export interface ChatResult {
+	progress?: true;
+	work?: SessionWork;
 	replay?: ReplayReceipt;
 	initialization?: Initialization;
 	sessionId: string;
@@ -275,6 +278,7 @@ export class Broker {
 				selection,
 				...(initialization ? { initialization } : {}),
 				session: inspection.session,
+				...(inspection.work ? { work: inspection.work } : {}),
 				tools: inspection.tools.map(({ name, description }) => ({
 					name,
 					description: compactSummary(description) ?? "",
@@ -313,7 +317,10 @@ export class Broker {
 		requestId: unknown,
 		signal: AbortSignal,
 		replyTo?: string,
+		mode: ChatMode = "message",
 	): Promise<ChatResult> {
+		if (mode === "progress" && replyTo)
+			throw new Error("Progress cannot answer a model request");
 		const { sessionId: target, initialization } = await this.#selectSession(
 			chatId,
 			sessionId,
@@ -325,7 +332,7 @@ export class Broker {
 			target,
 			"chat",
 			requestId,
-			replyTo ? JSON.stringify({ text, replyTo }) : text,
+			JSON.stringify({ text, replyTo, mode }),
 		);
 		return this.#coalesceOperation(
 			identity,
@@ -362,6 +369,7 @@ export class Broker {
 						...this.#state.executionSource(identity?.key),
 						sessionId: target,
 						text,
+						mode,
 						...(replyTo ? { replyTo } : {}),
 					}),
 					operationSignal,
@@ -375,17 +383,20 @@ export class Broker {
 						sessionId: target,
 						cwd: result.cwd,
 						inputs: result.inputs,
+						...(result.work ? { work: result.work } : {}),
 						execution: result.execution,
 						...(initialization ? { initialization } : {}),
 					};
 				}
 				await this.#state.finishOperation(identity?.key, "completed");
-				if ("message" in result) {
+				if ("message" in result || "progress" in result) {
 					await this.#confirmBindingUse(chatId, sessionId, target);
 					return {
+						...("progress" in result ? { progress: true as const } : {}),
 						sessionId: target,
 						cwd: result.cwd,
 						inputs: result.inputs,
+						...(result.work ? { work: result.work } : {}),
 						...(initialization ? { initialization } : {}),
 					};
 				}
@@ -501,6 +512,7 @@ export class Broker {
 						sessionId: target,
 						cwd: result.cwd,
 						inputs: result.inputs,
+						...(result.work ? { work: result.work } : {}),
 						toolResults: [],
 						execution: result.execution,
 						...(initialization ? { initialization } : {}),
@@ -521,6 +533,7 @@ export class Broker {
 						cwd: result.cwd,
 						toolResults: result.toolResults,
 						inputs: result.inputs,
+						...(result.work ? { work: result.work } : {}),
 					};
 				}
 				await this.#state.finishOperation(identity?.key, "uncertain");
@@ -682,6 +695,7 @@ export class Broker {
 							sessionId: target,
 							cwd: result.cwd,
 							toolResults: result.toolResults,
+							...(result.work ? { work: result.work } : {}),
 							complete: true,
 						});
 					})
@@ -1427,9 +1441,11 @@ export class Broker {
 						const { operationId: _nestedId, ...argumentsWithoutId } = input;
 						return { name, arguments: argumentsWithoutId };
 					})
-				: request.replyTo
-					? JSON.stringify({ text: request.text, replyTo: request.replyTo })
-					: request.text;
+				: JSON.stringify({
+						text: request.text,
+						replyTo: request.replyTo,
+						mode: request.mode ?? "message",
+					});
 		const identity = operationIdentity(
 			request.chatId,
 			request.sessionId,
@@ -1473,7 +1489,7 @@ export class Broker {
 		}
 		if (
 			(request.type === "call" && "toolResults" in result) ||
-			(request.type === "chat" && "message" in result)
+			(request.type === "chat" && ("message" in result || "progress" in result))
 		) {
 			await this.#state.finishOperation(
 				identity?.key,

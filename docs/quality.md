@@ -32,6 +32,7 @@ These stable IDs organize reviews. The cited tests are starting points, not a cl
 | Q-OWNER | Provider provenance, conversation/session ownership and IPC authorization survive switches and reconnects | `provider.omp.ts`, `ipc.ts`; `omp-provider-*`, `session-*`, `ipc-security`, `tls` |
 | Q-FILES | Staged writes preserve prior destinations on failure; source identity and attachment approval are not fabricated | `transfer.ts`, `resources.ts`; `transfer-safety`, `transfer-receipts`, `file-mutation-queue` |
 | Q-PACKAGE | Validate and publish the same artifact; keep private state and credentials out | `scripts/verify-package.mjs`, workflows; `package-consumer`, `release-metadata`, installed-consumer verification |
+| Q-CHAT | One batch/progress acknowledgement never implies goal completion; no progress-induced provider stop; scoped continuation remains with ChatGPT | `work*.ts`, `session.ts`, `server.ts`; `chat-workflow`, `work-feedback`, `result-continuation`, real OMP two-step sequence |
 | Q-CONTEXT | A new session can locate rules and checkpoint; stale verification cannot masquerade as current proof | `quality-evidence` tests, `quality-skill` loader test, recovery exercise below |
 
 For async/lifecycle changes, enumerate absence, in-flight duplicate, conflicting arguments, input wait, terminal state, expiry boundary, restart, cancellation before/after dispatch, late result and replaced pending value. Test the affected transitions together; do not discover the policy one patch at a time.
@@ -142,3 +143,21 @@ When these instructions, the Skill or context transport change, exercise the fol
 | Registered relevant Skill/MCP | Reads workflow and live definition; no indiscriminate preload or approval bypass |
 
 Record evaluator identity, supplied context, observed tool trace, expected behavior, outcome and limitations in the issue. Distinguish three kinds of evidence: deterministic freshness tests, real OMP loader/resource tests, and an independent fresh-context agent evaluation. The first two do not prove the third. No automatic auxiliary model calls or subagents are introduced for evaluation. When the current task disallows them, record independent agent evaluation as `not_run` and leave the reusable scenario for an explicitly authorized fresh session.
+
+
+## Chat continuation acceptance scenarios
+
+The current contract is [Chat control loop](tools.md#chat-control-loop). Use the following direct, indirect and negative prompts when changing its instructions or tool metadata. Record the actual controlling model, installed plugin version, Chat surface, supplied scope, tool trace and final result. The local scripted OMP sequence proves mechanics, not autonomous model instruction-following or production frequency. Do not mark the independent Chat evaluation PASS without that trace.
+
+| Scenario | Required observable behavior |
+|---|---|
+| Direct: finish tasks A and B and verify, without another continue prompt | Returns each batch promptly, reports progress without stopping OMP, calls the next authorized action, verifies scope before final |
+| Indirect: finish the remaining items for this issue | Recovers the issue and current native state; does not equate one completed operation to the issue |
+| Negative: inspect task A only while unrelated TODO B is pending | Reports A only; no implementation of B or scope expansion |
+| A progress report while a batch or compaction reply is pending | Native batch/model obligation survives; report does not wake/stop/abort provider output |
+| Known-unexecuted model-input wait | Reads request, replies via replyTo, resumes only the same authorized unexecuted attempt |
+| Tool failure, uncertain receipt, user stop or denied approval | Inspects/reconciles or stops; no blind retry, detachment bypass or invented success |
+| All TODOs settled but required verification has not run | Performs the missing authorized verification; never certifies from counters alone |
+| Oversized result, historical retained work or new Chat | Recovers complete result/checkpoint, rechecks current scope; no duplicate side effects |
+
+Repository checkpoints must retain the user's completion conditions and scope as well as the next action. Completing a local TODO phase or checkpoint update is not a reason to end the controlling Chat when actionable authorized work remains. A genuine blocker or host interruption is reported as incomplete, not a promise of autonomous background execution.

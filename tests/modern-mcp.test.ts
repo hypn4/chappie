@@ -63,6 +63,11 @@ test("modern start_call returns supported durable operation output, not a fake T
 	assert.equal(result.resultType, "complete");
 	assert.deepEqual(JSON.parse(String(record(result.structuredContent).text)), {
 		operation,
+		continuation: {
+			scope: "native_batch",
+			userGoal: "not_evaluated",
+			nextAction: "inspect_operation",
+		},
 	});
 });
 

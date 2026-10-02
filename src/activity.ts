@@ -7,6 +7,7 @@ export interface Source {
 }
 
 export interface Activity extends Partial<Source> {
+	executionPhase?: "queued" | "in_flight" | "result_pending";
 	event?: string;
 	initialization?: "explicit" | "implicit";
 }

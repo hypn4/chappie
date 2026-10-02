@@ -124,7 +124,7 @@ Chappie exposes a small session bridge rather than copying native tool schemas. 
 
 Chappie is Chat-only and does not advertise MCP Events or Tasks. Detached work is durable rather than proactive: `start_call` returns an operation ID, `get_operation` recovers its status/result, and later Chappie interactions also surface pending deliveries. ChatGPT cannot be woken by the broker after the current Chat turn ends.
 
-`chat` sends assistant messages to the agent, `history` reads native progress, and `transfer` moves files between connected environments. See the [tool guide](docs/tools.md) for session selection, durable operation lifetime, recovery, and file transfer.
+`chat` reports progress without ending the native turn by default; `mode: "message"` sends an intentional assistant turn. Batch/work feedback keeps the current Chat controller responsible for the remaining requested scope. `history` reads native progress, and `transfer` moves files between connected environments. See the [tool guide](docs/tools.md) for session selection, durable operation lifetime, recovery, and file transfer.
 
 ## Configuration
 

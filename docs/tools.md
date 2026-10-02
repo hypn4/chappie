@@ -9,7 +9,7 @@ Legacy MCP handshakes and the standalone Pi host are not supported.
 | `history` | Read the current OMP branch with timestamps and entry IDs. |
 | `sessions` | List connected OMP sessions and the current default. |
 | `tools` | Read current full definitions of selected active OMP tools, including registered MCP-backed tools. |
-| `chat` | Send an assistant message to OMP. |
+| `chat` | Report progress without ending a turn; use `mode: "message"` for an intentional assistant turn or `replyTo` for a model request. |
 | `ask` | Create a persistent question in ChatGPT. |
 | `ask_assert` | Confirm that an `ask` widget loaded. |
 | `call` | Run one or more OMP tools as one native batch and wait for completion. |
@@ -51,9 +51,19 @@ Set `observer: true` to read as an observer. New messages and work activity wake
 
 History includes saved messages, tool results, summaries, image/file references and work activity. It never cuts an entry in half. A native page can stop between entries; `hasMore` means there are other entries addressable by `before`/`after`. An oversized single entry is retained intact by the final response layer and is read using `resultId` pages, whose own `hasMore` and `nextOffset` describe text-fragment continuation. Reading history does not acknowledge pending inputs or re-export files.
 
+## Chat control loop
+
+The current ChatGPT conversation is the planner. `turn_end` returns one native batch promptly so ChatGPT can select the next call; it does not end ChatGPT's user-facing turn. A successful batch, `operation.status=completed`, progress report or empty TODO is not proof that the requested multi-step goal is complete. `start_call` detaches one batch, not an autonomous workflow.
+
+For a request to finish all work, keep the approved scope and acceptance conditions in the configured tracker/checkpoint. After every result: recover any `resultId` pages, handle model obligations or failures, inspect the remaining scoped work when needed, and issue the next authorized native call in the same Chat. Use interim commentary instead of a premature final answer. Stop at verified completion, an explicit stop/redirection, denied approval, or a genuine blocker; preserve the checkpoint when the host or an external dependency prevents continuation. Never expand one requested task to unrelated repository issues or shared-session TODOs.
+
+`init`, selected tool inspection and native results may include a `work` observation with `source: "omp_todo"`, `scope: "session"`, `observedAt`, a state and counts. OMP's canonical branch reader is authoritative; Chappie does not cache, mutate or duplicate its task board. States are `actionable` (pending/in-progress), `blocked`, `settled`, `untracked`, or `unknown`. Settled includes abandoned items and does not certify tests, acceptance or user-scope completion. Retrieve the current native TODO for titles/details. A retained/replayed observation is historical, not a live tracker query.
+
+Execution/progress results include `continuation: { scope, userGoal: "not_evaluated", nextAction }`. Cues distinguish answering a model request, inspecting an operation/failure, reconciling uncertain or cancelled work, continuing requested work, reviewing blockers and verifying the requested scope. They are observations and controller guidance, not executable commands or authorization. No server response can force ChatGPT to issue its next tool call, intercept its final answer, or wake an ended ordinary Chat.
+
 ## Participation
 
-The executing assistant uses `chat` to share progress and completion in OMP. When initialization directs an assistant to observe, it follows that work through `history` with `observer: true` and `wait: true`, thinks independently, and leaves the completion response to the original execution. Observers must not repeat exports or post a second completion response.
+The executing assistant uses `chat` (default `mode: "progress"`) for intermediate updates. Progress is an acknowledged native notice, not a provider stop or a new turn. Use `mode: "message"` only for an intentional assistant message/turn; it does not certify completion of the whole user goal. When initialization directs an assistant to observe, it follows that work through `history` with `observer: true` and `wait: true`, thinks independently, and leaves the completion response to the original execution. Observers must not repeat exports or post a second completion response.
 
 ## OMP Skills and tools
 
@@ -99,7 +109,7 @@ OMP controls execution inside that batch. Separate requests run in order within 
 
 ### Model-input waits
 
-When OMP is waiting for a recognized compaction or branch-summary reply, a new `call` or ordinary `chat` returns `execution: { status: "needs_input", executed: false, reason: "model_request_pending" }` and the `modelRequest` input. The native `remote_call` and `remote_chat` relay paths preserve exactly the same nonterminal state; an empty tool-results list is not completion. Reply with `chat({ sessionId, replyTo: modelRequest, text })` (or native `remote_chat`), then retry only that unexecuted batch with its original identity and unchanged arguments. Calls queued before a model request begins receive the same feedback. Reading or acknowledging input does not discharge OMP's reply obligation.
+When OMP is waiting for a recognized compaction or branch-summary reply, a new `call` or `chat` with `mode: "message"` returns `execution: { status: "needs_input", executed: false, reason: "model_request_pending" }` and the `modelRequest` input. The native `remote_call` and `remote_chat` relay paths preserve exactly the same nonterminal state; an empty tool-results list is not completion. Reply with `chat({ sessionId, replyTo: modelRequest, text })` (or native `remote_chat`), then retry only that unexecuted batch with its original identity and unchanged arguments. Calls queued before a model request begins receive the same feedback. Reading or acknowledging input does not discharge OMP's reply obligation. This known-unexecuted wait is normal flow-control feedback (`isError: false`), not successful native execution; `execution.executed` stays false and `continuation.nextAction` requests the model reply. A progress report can be acknowledged while that obligation remains outstanding. Actual native tool failures still set `isError: true`.
 
 For `start_call`, this feedback persists as `waiting_input`; `get_operation` returns the saved model inputs. Answer the current request and explicitly repeat the same `start_call` ID and arguments. Simultaneous identical retries dispatch one batch; conflicting arguments are rejected even during acceptance. A saved model input can be stale after a reply, reconnection, or session switch: inspect current `tools`/inputs before replying. A retry stays on its original session.
 
@@ -128,7 +138,7 @@ Read the state later with:
 
 Full detached results remain available through `get_operation(operationId)` after pending-delivery acknowledgement. Terminal receipts and results are retained for 24 hours. Within that window, an identical logical ID replays the accepted operation and conflicting arguments are rejected. After retirement, a fresh acceptance gets a new persisted `executionId`; native requests and deferred results must match that execution, so delayed output cannot complete a successor with the same logical ID. `waiting_input` resumes the same acceptance rather than generating a new one. Unresolved running/waiting/uncertain receipts are not automatically evicted.
 
-`cancel_operation` owns cancellation from the start of initial acceptance or a `waiting_input` reclaim, including while the receipt is being persisted. Cancellation before dispatch prevents later native execution. Cancelling a waiting operation does not abort its independent model request. Ending the original MCP request does not cancel accepted detached work. Cancellation cannot undo side effects or promise to stop independent child processes. Broker recovery marks interrupted running receipts `uncertain`; known-unexecuted waits stay resumable. Reconcile uncertain work rather than re-executing it.
+`cancel_operation` owns cancellation from the start of initial acceptance or a `waiting_input` reclaim, including while the receipt is being persisted. Cancellation before dispatch prevents later native execution. Cancelling a waiting operation does not abort its independent model request. Ending the original MCP request does not cancel accepted detached work. Cancellation cannot undo side effects or promise to stop independent child processes. Request-cancel notices report `executionPhase`: queued work was removed before dispatch; in-flight/result-pending work may already have effects. A reason such as `Request ended` is the upstream abort reason, not proof of edit rollback or a diagnosis of why the host ended the request. Inspect history and files before deciding whether any further action is safe. Broker recovery marks interrupted running receipts `uncertain`; known-unexecuted waits stay resumable. Reconcile uncertain work rather than re-executing it.
 
 Do not send heartbeat or rapidly poll to extend a ChatGPT tool request. Detach the native batch, and use persistent process supervision separately when the process itself must survive the agent or broker exiting.
 
@@ -138,11 +148,13 @@ Chappie targets ordinary ChatGPT Chat and does not advertise MCP Events or Tasks
 
 If a detached operation reaches `waiting_input` after the initiating turn has ended, the next Chat interaction must retrieve the saved model input, answer it with `chat.replyTo`, and explicitly resume the unchanged operation. Never create heartbeat loops, webhook callbacks, or a new operation ID to simulate proactive continuation.
 
-`chat` creates a normal assistant message in OMP:
+`chat` defaults to a non-terminating progress notice in OMP:
 
 ```json
-{ "text": "Updated the parser and its callers." }
+{ "text": "Updated the parser; continuing the remaining checks.", "mode": "progress" }
 ```
+
+Use `{ "text": "Requested scope verified.", "mode": "message" }` for an intentional assistant turn after checking the current scope. `replyTo` implies message mode; combining it with progress is rejected. Existing native OMP-to-OMP `remote_chat` remains a message by default. Broker and extension must be updated together, and the public tool schema refreshed after deployment.
 
 When a result contains `modelRequest`, use its ID as `replyTo` instead of
 starting a normal OMP turn:

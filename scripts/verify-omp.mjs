@@ -348,10 +348,14 @@ try {
 		links[0].uri,
 	);
 	const todoName = "Verify OMP provider ownership";
+	const nextTodoName = "Verify continuing the authorized scope";
 	for (const [label, call] of [
 		[
 			"todo-init",
-			{ name: "todo", arguments: { op: "init", items: [todoName] } },
+			{
+				name: "todo",
+				arguments: { op: "init", items: [todoName, nextTodoName] },
+			},
 		],
 		["todo-read", { name: "read", arguments: { path: "fixture.txt" } }],
 	]) {
@@ -364,6 +368,23 @@ try {
 		);
 		assert.ok(result.toolResults.every((item) => !item.isError));
 	}
+	const progress = await broker.chat(
+		"integration-chat",
+		session.id,
+		"Continuing both tasks.",
+		"todo-progress",
+		signal,
+		undefined,
+		"progress",
+	);
+	assert.equal(progress.progress, true);
+	assert.equal(progress.work?.state, "actionable");
+	assert.equal(progress.work.counts?.pending, 1);
+	assert.equal(progress.work.counts?.inProgress, 1);
+	await assert.rejects(
+		readFile(reminderFile, "utf8"),
+		(error) => error.code === "ENOENT",
+	);
 	await broker.chat(
 		"integration-chat",
 		session.id,
@@ -389,6 +410,28 @@ try {
 		signal,
 	);
 	assert.ok(completedTodo.toolResults.every((item) => !item.isError));
+	assert.equal(completedTodo.work?.state, "actionable");
+	assert.equal(completedTodo.work.counts?.completed, 1);
+	const nextReport = await broker.chat(
+		"integration-chat",
+		session.id,
+		"First task done, continuing the second.",
+		"second-progress",
+		signal,
+		undefined,
+		"progress",
+	);
+	assert.equal(nextReport.progress, true);
+	const finalTodo = await broker.call(
+		"integration-chat",
+		session.id,
+		[{ name: "todo", arguments: { op: "done", task: nextTodoName } }],
+		"second-todo-done",
+		signal,
+	);
+	assert.ok(finalTodo.toolResults.every((item) => !item.isError));
+	assert.equal(finalTodo.work?.state, "settled");
+	assert.equal(finalTodo.work.counts?.completed, 2);
 	// Keep OMP alive while restarting only the broker. The first remote request
 	// after the session reconnects must take the normal Chappie provider path;
 	// this is the lifecycle that previously misclassified the primary turn as
@@ -462,7 +505,7 @@ try {
 		signal,
 	);
 	console.log(
-		"OMP integration passed: native tool discovery and batch execution, provider ownership after replacement/disposal, auxiliary rejection, detached operation completion, broker reconnect first-turn routing, saved-session resume first-turn routing, local collaboration registration, TODO continuation, exact read, native edit, resource bytes, replay and original-URI recovery.",
+		"OMP integration passed: native tool discovery and batch execution, provider ownership after replacement/disposal, auxiliary rejection, detached operation completion, broker reconnect first-turn routing, saved-session resume first-turn routing, local collaboration registration, nonterminating progress and two-step TODO continuation, exact read, native edit, resource bytes, replay and original-URI recovery.",
 	);
 	console.log(
 		"No subagents, external model inference or live broker changes were used. ChatGPT approval UI and final response rendering are not covered.",

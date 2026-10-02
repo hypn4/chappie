@@ -335,12 +335,13 @@ test("MCP call and chat expose a model-input wait as unexecuted, not successful 
 	});
 	for (const [name, args] of [
 		["call", { calls: [{ name: "read", arguments: { path: "x" } }] }],
-		["chat", { text: "progress" }],
+		["chat", { text: "assistant message", mode: "message" }],
 	] as const) {
 		const result = await f.call(name, args);
-		assert.equal(result.isError, true, name);
+		assert.equal(result.isError, false, name);
 		const text = (result.structuredContent as { text: string }).text;
 		assert.match(text, /"executed":false/);
+		assert.match(text, /"nextAction":"answer_model_request"/);
 		assert.match(text, /model-obligation/);
 	}
 });

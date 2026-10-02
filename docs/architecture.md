@@ -36,6 +36,12 @@ OMP API registration is process-wide. The provider dispatcher must remain statel
 
 Transient resume context must not discard a legitimate request hook, but an explicit provider/session switch must invalidate stale work. Native completion is delivered at `turn_end`, independently of a later model request or TODO continuation. Idle remote work uses an invisible control message removed from model context. Starting another `chappie/chatgpt` agent does not create a ChatGPT conversation.
 
+### Chat planning is separate from native turn completion
+
+The ChatGPT controller, not OMP or this broker, decides when the user goal is satisfied. Keep returning batch results at `turn_end`: delaying them until all TODOs finish would block the very controller needed to select further tools and extend host request lifetimes. `chat` progress instead uses a native notice with an IPC response; it never resolves the provider output, schedules a turn, or cancels active work. Intentional message turns and recognized model replies remain explicit.
+
+`work.omp.ts` reads the current native TODO branch with OMP's canonical helper. `work.ts` owns only its small observation schema and advisory continuation cues; it does not import the inference host into the standalone broker. Capture observations with results, preserve them through detached delivery/recovery, and label their session scope/time. Do not infer user authorization from shared TODOs or label a settled board as verified completion. Do not add a hidden planner, stop-hook shim, second task database or host-cancellation bypass.
+
 ### Logical retry identity and execution identity are different
 
 A logical operation ID identifies caller intent; a random persisted execution ID identifies one acceptance. Reusing a logical ID after terminal retention must not authorize delayed results from the old acceptance. IPC and deferred deliveries carry the execution ID and validate it before mutation. Known-unexecuted `waiting_input` resumes preserve the same acceptance; unresolved work remains fail-closed across restart.

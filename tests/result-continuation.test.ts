@@ -396,3 +396,49 @@ test("result pages validate offsets and never advance on malformed selectors", a
 	}
 	assert.equal(f.acks, 0);
 });
+
+test("oversized batch results retain work feedback without declaring the user goal complete", async (t) => {
+	const f = await fixture(t);
+	const body = "native-result-tail ".repeat(7000);
+	t.mock.method(f.broker, "call", async () => ({
+		sessionId: "A",
+		cwd: f.root,
+		inputs: [],
+		work: {
+			source: "omp_todo" as const,
+			scope: "session" as const,
+			observedAt: 1,
+			state: "actionable" as const,
+			counts: {
+				pending: 1,
+				inProgress: 1,
+				blocked: 0,
+				completed: 1,
+				abandoned: 0,
+			},
+		},
+		toolResults: [
+			{
+				role: "toolResult" as const,
+				toolCallId: "batch-1",
+				toolName: "read",
+				content: [{ type: "text" as const, text: body }],
+				isError: false,
+				timestamp: 1,
+			},
+		],
+	}));
+	const reply = await f.request("call", {
+		calls: [{ name: "read", arguments: { path: "file" } }],
+	});
+	assert.ok(textData(reply).resultId);
+	const full = await recover(f, reply);
+	const header = JSON.parse(full.content[0].text);
+	assert.deepEqual(header.continuation, {
+		scope: "native_batch",
+		userGoal: "not_evaluated",
+		nextAction: "continue_requested_work",
+	});
+	assert.equal(header.work.counts.pending, 1);
+	assert.equal(full.content[2].text, body);
+});

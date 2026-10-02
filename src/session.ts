@@ -55,6 +55,8 @@ import {
 	type TransferUpdate,
 	transferResult,
 } from "./transfer.ts";
+import { observeSessionWork } from "./work.omp.ts";
+import type { SessionWork } from "./work.ts";
 
 type RemoteRequest = Extract<BrokerMessage, { type: "chat" | "call" }>;
 
@@ -154,6 +156,7 @@ interface ActiveRequest {
 	error?: string;
 	cancelled: string | undefined;
 	toolResults: SessionToolResult[];
+	work?: SessionWork;
 }
 
 interface GenerationRequest {
@@ -1041,10 +1044,16 @@ export class LocalSession {
 						? [...new Set(request.calls.map((call) => call.name))].join(", ")
 						: "chat";
 				this.#notify(
-					`${name} cancelled for ${chatLabel(request)}: ${message.reason}`,
+					`${name} request cancelled for ${chatLabel(request)}: ${message.reason}. ${queued !== -1 ? "Removed before dispatch." : "Effects may already exist; inspect history and files before retrying."}`,
 					"warning",
 					{
 						event: "cancelled",
+						executionPhase:
+							queued !== -1
+								? "queued"
+								: this.#active?.completed
+									? "result_pending"
+									: "in_flight",
 						...source(request.chatId, request.requestId),
 					},
 				);
@@ -1077,6 +1086,30 @@ export class LocalSession {
 					);
 					break;
 				}
+				if (message.type === "chat" && message.mode === "progress") {
+					if (message.replyTo) {
+						await this.#sendError(
+							message.id,
+							"Progress cannot answer a model request",
+						);
+						break;
+					}
+					await this.#reply(message.id, message.sessionId, async (signal) => {
+						signal.throwIfAborted();
+						this.#notify(message.text, "info", {
+							...source(message.chatId, message.requestId),
+							event: "progress",
+						});
+						return {
+							type: "result",
+							id: message.id,
+							progress: true,
+							cwd: this.#description().cwd,
+							inputs: this.#inputs(),
+						};
+					});
+					break;
+				}
 				if (message.type === "chat" && message.replyTo) {
 					const generation = this.#generations.get(message.replyTo);
 					if (
@@ -1101,6 +1134,7 @@ export class LocalSession {
 						id: message.id,
 						cwd: this.#context.cwd,
 						message: generation.output.message,
+						work: this.#work(),
 						inputs: this.#inputs(),
 					});
 					break;
@@ -1153,6 +1187,7 @@ export class LocalSession {
 				reason: "model_request_pending",
 			},
 			toolResults: [],
+			work: this.#work(),
 			inputs,
 		});
 	}
@@ -1277,11 +1312,24 @@ export class LocalSession {
 		this.#histories.delete(id);
 	}
 
+	#work(): SessionWork {
+		const context = this.#context;
+		if (!context || context.sessionManager.getSessionId() !== this.#sessionId)
+			return {
+				source: "omp_todo",
+				scope: "session",
+				observedAt: Date.now(),
+				state: "unknown",
+			};
+		return observeSessionWork(context.sessionManager.getBranch());
+	}
+
 	#inspection(): SessionInspection {
 		const activeTools = new Set(this.#api.getActiveTools());
 		this.#collectInputs();
 		return {
 			session: this.#description(),
+			work: this.#work(),
 			tools: this.#api
 				.getAllTools()
 				.filter((tool) => activeTools.has(tool.name)),
@@ -1433,6 +1481,8 @@ export class LocalSession {
 		} else {
 			active.toolResults = toolResults;
 		}
+		if (context.sessionManager.getSessionId() === active.session.id)
+			active.work = observeSessionWork(context.sessionManager.getBranch());
 		active.completed = true;
 		if (this.#retired.delete(active.id)) this.#retainResult(active);
 		else {
@@ -1458,6 +1508,7 @@ export class LocalSession {
 			sessionId: active.session.id,
 			cwd: active.session.cwd,
 			toolResults: active.toolResults,
+			...(active.work ? { work: active.work } : {}),
 			...(active.cancelled || active.error
 				? { error: active.cancelled ?? active.error }
 				: {}),
@@ -1493,6 +1544,7 @@ export class LocalSession {
 						id: active.request.id,
 						cwd: active.session.cwd,
 						message: active.message,
+						...(active.work ? { work: active.work } : {}),
 						inputs: active.session.id === this.#sessionId ? this.#inputs() : [],
 						...(active.request.type === "call"
 							? { toolResults: active.toolResults }
@@ -1635,7 +1687,9 @@ export class LocalSession {
 				return;
 			if (sessionId !== this.#sessionId)
 				throw new Error("Session changed before request completion");
-			await connection?.send(result);
+			await connection?.send(
+				"inputs" in result ? { ...result, work: this.#work() } : result,
+			);
 		} catch (error) {
 			if (
 				connection === this.#connection &&

@@ -24,7 +24,7 @@ Chappie is a Chat-only bridge from ChatGPT to native Oh My Pi (OMP), not an infe
 
 Keep OMP as the source of truth for native arguments, permissions and execution. Keep logical operation IDs separate from acceptance execution IDs; uncertain work is not automatically retried. Preserve conversation/session/file ownership, mTLS and staged writes. Do not reintroduce direct native wrappers, retired host/protocol compatibility, Events/Tasks, webhooks, heartbeat processes, schema caches or auxiliary inference routers.
 
-Use existing tests and fixtures rather than a second framework. Report implementation, local verification, review, CI, publication and live validation separately. Do not call inline review independent review or claim a host/UI check that was not performed. Follow the quality standard's stop conditions rather than repeatedly reopening work for speculative hardening.
+Use existing tests and fixtures rather than a second framework. Report implementation, local verification, review, CI, publication and live validation separately. A batch result or progress acknowledgement is not goal completion; follow the quality standard's Q-CHAT scope and continuation contract. Do not call inline review independent review or claim a host/UI check that was not performed. Follow the quality standard's stop conditions rather than repeatedly reopening work for speculative hardening.
 
 ## Before stopping
 

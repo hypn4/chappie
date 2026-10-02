@@ -2,6 +2,7 @@ import * as z from "zod";
 import { historyInput } from "./history.ts";
 import type { BrokerMessage, SessionMessage } from "./ipc.ts";
 import { nativeCallSchema } from "./native-calls.ts";
+import { sessionWorkSchema } from "./work.ts";
 
 const id = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const text = z.string().max(64 * 1024 * 1024);
@@ -79,6 +80,7 @@ const descriptor = z.strictObject({
 	size: id,
 });
 const inspection = z.strictObject({
+	work: sessionWorkSchema.optional(),
 	session,
 	tools: z
 		.array(
@@ -140,6 +142,7 @@ const sessionRequest = z.union([
 		type: z.literal("chat"),
 		sessionId: name,
 		text,
+		mode: z.enum(["progress", "message"]).optional(),
 		replyTo: name.optional(),
 		...source,
 	}),
@@ -166,8 +169,10 @@ export const deliverySchema = z.strictObject({
 	toolResults,
 	error: text.optional(),
 	complete: z.boolean().optional(),
+	work: sessionWorkSchema.optional(),
 });
 const resultPayloads = [
+	{ progress: z.literal(true), cwd: path, inputs },
 	{ sessions: z.array(listedSession).max(4096) },
 	{ inspection, inputs, globalAgents: z.strictObject({ path }).optional() },
 	{ inputs },
@@ -198,7 +203,12 @@ const resultPayloads = [
 const result = (type: "result" | "response") =>
 	z.union(
 		resultPayloads.map((payload) =>
-			z.strictObject({ type: z.literal(type), id, ...payload }),
+			z.strictObject({
+				type: z.literal(type),
+				id,
+				...payload,
+				work: sessionWorkSchema.optional(),
+			}),
 		),
 	);
 
@@ -231,6 +241,7 @@ const brokerMessage = z.union([
 		id,
 		sessionId: name,
 		text,
+		mode: z.enum(["progress", "message"]).optional(),
 		replyTo: name.optional(),
 		...source,
 	}),

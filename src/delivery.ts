@@ -4,6 +4,7 @@ import {
 	contentWithImageReferences,
 	resourceDescriptors,
 } from "./resources.ts";
+import { continuationFor, type SessionWork } from "./work.ts";
 
 export interface DeliveryRecord extends Source {
 	id: string;
@@ -12,6 +13,7 @@ export interface DeliveryRecord extends Source {
 	toolResults: SessionToolResult[];
 	error?: string;
 	complete?: boolean;
+	work?: SessionWork;
 }
 
 export function toolResultsContent(
@@ -52,6 +54,18 @@ export function deliveryContent(deliveries: DeliveryRecord[]) {
 				sessionId: delivery.sessionId,
 				cwd: delivery.cwd,
 				error: delivery.error,
+				...(delivery.work ? { work: delivery.work } : {}),
+				continuation: continuationFor({
+					work: delivery.work,
+					failed:
+						Boolean(delivery.error) ||
+						delivery.toolResults.some(
+							(result) =>
+								result.isError ||
+								(result.details as { failed?: boolean } | undefined)?.failed ===
+									true,
+						),
+				}),
 			}),
 		},
 		...toolResultsContent(

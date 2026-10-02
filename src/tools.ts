@@ -4,6 +4,7 @@ import { toolResultsContent } from "./delivery.ts";
 import type { ExecutionWait, SessionInput, SessionToolResult } from "./ipc.ts";
 import type { ReplayReceipt } from "./operations.ts";
 import { contentWithImageReferences } from "./resources.ts";
+import { continuationFor, type SessionWork } from "./work.ts";
 
 export interface ToolInput {
 	name: string;
@@ -18,7 +19,16 @@ export function toolResult(
 	initialization?: Initialization,
 	replay?: ReplayReceipt,
 	execution?: ExecutionWait,
+	observation: {
+		work?: SessionWork | undefined;
+		scope?: "native_batch" | "progress" | "message";
+	} = {},
 ) {
+	const failed = toolResults.some(
+		(result) =>
+			result.isError ||
+			(result.details as { failed?: boolean } | undefined)?.failed === true,
+	);
 	return {
 		content: [
 			{
@@ -29,6 +39,15 @@ export function toolResult(
 					...(initialization ? { initialization } : {}),
 					...(replay ? { replay } : {}),
 					...(execution ? { execution } : {}),
+					...(observation.work ? { work: observation.work } : {}),
+					continuation: continuationFor({
+						...observation,
+						needsInput:
+							execution !== undefined ||
+							inputs.some((input) => "request" in input),
+						failed,
+						operationStatus: replay?.status,
+					}),
 				}),
 			},
 			...toolResultsContent(toolResults, sessionId),
@@ -42,13 +61,7 @@ export function toolResult(
 				: []),
 			...inputContent(inputs),
 		],
-		isError:
-			execution !== undefined ||
-			toolResults.some(
-				(result) =>
-					result.isError ||
-					(result.details as { failed?: boolean } | undefined)?.failed === true,
-			),
+		isError: failed,
 	};
 }
 

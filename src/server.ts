@@ -3,7 +3,7 @@ import { McpServer, ResourceTemplate } from "@modelcontextprotocol/server";
 import * as z from "zod";
 import packageJson from "../package.json" with { type: "json" };
 import type { Broker } from "./broker.ts";
-import { deliveryContent } from "./delivery.ts";
+import { deliveryContent, toolResultsContent } from "./delivery.ts";
 import { historyInput } from "./history.ts";
 import { nativeCallsSchema } from "./native-calls.ts";
 import {
@@ -16,6 +16,7 @@ import {
 import { MAX_RESULT_BYTES } from "./responses.ts";
 import { inputContent, toolResult } from "./tools.ts";
 import { operationIdSchema, transferSchema } from "./transfer.ts";
+import { continuationFor } from "./work.ts";
 
 const instructions = readFileSync(
 	new URL("./instructions.md", import.meta.url),
@@ -217,24 +218,34 @@ export function createServer(
 		{
 			title: "Reply in OMP",
 			description:
-				"Send a Markdown assistant message to OMP. When modelRequest is returned by a prior Chappie result, set replyTo to that modelRequest ID.",
+				"Report progress to OMP without ending or starting a provider turn (default mode=progress). Use mode=message only for an intentional assistant turn after reviewing the requested scope, or replyTo for a recognized model request. Neither a progress report nor a native turn means the whole user task is complete.",
 			outputSchema,
-			inputSchema: z.object({
-				text: z.string().min(1).describe("Assistant message in Markdown"),
-				sessionId: z
-					.string()
-					.optional()
-					.describe(
-						"OMP session for this operation; becomes the default if none is set",
-					),
-				replyTo: z
-					.string()
-					.min(1)
-					.optional()
-					.describe(
-						"Model request ID to answer instead of starting a OMP turn",
-					),
-			}),
+			inputSchema: z
+				.object({
+					text: z.string().min(1).describe("Assistant message in Markdown"),
+					mode: z
+						.enum(["progress", "message"])
+						.optional()
+						.describe(
+							"Defaults to progress: report without a provider stop. message completes one native assistant turn. replyTo implies message and cannot use progress.",
+						),
+					sessionId: z
+						.string()
+						.optional()
+						.describe(
+							"OMP session for this operation; becomes the default if none is set",
+						),
+					replyTo: z
+						.string()
+						.min(1)
+						.optional()
+						.describe(
+							"Model request ID to answer instead of starting a OMP turn",
+						),
+				})
+				.refine((args) => !(args.mode === "progress" && args.replyTo), {
+					message: "Progress cannot answer a model request",
+				}),
 			annotations: toolAnnotations("chat"),
 		},
 		handle(async (args, context) => {
@@ -245,6 +256,7 @@ export function createServer(
 				context.mcpReq._meta?.["otunnel/requestId"],
 				context.mcpReq.signal,
 				args.replyTo,
+				args.mode ?? (args.replyTo ? "message" : "progress"),
 			);
 			return finish(
 				context,
@@ -256,6 +268,10 @@ export function createServer(
 					result.initialization,
 					result.replay,
 					result.execution,
+					{
+						work: result.work,
+						scope: args.mode ?? (args.replyTo ? "message" : "progress"),
+					},
 				),
 				true,
 				!result.execution && result.inputs.length
@@ -438,6 +454,7 @@ export function createServer(
 					{
 						session: inspected.session,
 						tools: inspected.tools,
+						...(inspected.work ? { work: inspected.work } : {}),
 						...(inspected.initialization
 							? { initialization: inspected.initialization }
 							: {}),
@@ -457,7 +474,7 @@ export function createServer(
 		{
 			title: "Call OMP tools",
 			description:
-				"Execute one discovered native OMP batch. Prefer the most specific native capability. Batch only calls whose arguments are already known; if a later call depends on an earlier result, use a separate call. Native schemas, routing guidance and validation belong to OMP. A pending model request returns needs_input/executed:false without running the batch.",
+				"Execute one discovered native OMP batch, not the entire user goal. Inspect returned continuation/work and keep calling the needed tools while authorized work remains; a batch result is not a reason to end Chat. Prefer the most specific native capability. Batch only calls whose arguments are already known; if a later call depends on an earlier result, use a separate call. Native schemas, routing guidance and validation belong to OMP. A pending model request returns needs_input/executed:false without running the batch.",
 			outputSchema,
 			inputSchema: z.strictObject({
 				calls: nativeCallsSchema,
@@ -483,6 +500,7 @@ export function createServer(
 					result.initialization,
 					result.replay,
 					result.execution,
+					{ work: result.work },
 				),
 				true,
 				!result.execution && result.inputs.length
@@ -497,7 +515,7 @@ export function createServer(
 		{
 			title: "Start long OMP tool batch",
 			description:
-				"Start one discovered native OMP batch independently of this MCP request. Apply the same discovery and batching rules as call: use current full definitions, and do not batch calls whose arguments depend on earlier results. Returns durable operation status. Use get_operation or a later Chappie interaction to recover status and retained results. Reuse the same operationId and arguments; explicitly resume waiting_input only after handling its model request.",
+				"Start one discovered native OMP batch independently of this MCP request. Apply the same discovery and batching rules as call: use current full definitions, and do not batch calls whose arguments depend on earlier results. Returns one batch's durable operation status, not completion of all TODOs. Use get_operation or a later Chappie interaction to recover status and retained results. Reuse the same operationId and arguments; explicitly resume waiting_input only after handling its model request.",
 			outputSchema,
 			inputSchema: z.strictObject({
 				operationId: z
@@ -527,6 +545,9 @@ export function createServer(
 				context,
 				textResult({
 					operation: result.operation,
+					continuation: continuationFor({
+						operationStatus: result.operation.status,
+					}),
 					...(result.initialization
 						? { initialization: result.initialization }
 						: {}),
@@ -540,7 +561,7 @@ export function createServer(
 		{
 			title: "Get long operation status",
 			description:
-				"Read an operation with operationId, or recover an oversized tool response with resultId and offset. Follow nextOffset while hasMore is true; pages contain ordered JSON-fragment text. Neither path re-executes native work. waiting_input is a known-unexecuted batch; completed refers to its native batch, not child jobs.",
+				"Read an operation with operationId, or recover an oversized tool response with resultId and offset. Follow nextOffset while hasMore is true; pages contain ordered JSON-fragment text. Neither path re-executes native work. waiting_input is a known-unexecuted batch; completed refers to its native batch, not child jobs or the user goal. Retained work observations are historical; check the current scoped tracker before deciding the next action.",
 			outputSchema,
 			inputSchema: z
 				.object({
@@ -575,14 +596,32 @@ export function createServer(
 				context,
 				{
 					content: [
-						...textResult({ operation: result.operation }, result.inputs)
-							.content,
+						...textResult(
+							{
+								operation: result.operation,
+								...(result.result?.work ? { work: result.result.work } : {}),
+								continuation: continuationFor({
+									operationStatus: result.operation.status,
+									work: result.result?.work,
+									needsInput: result.inputs.length > 0,
+									failed:
+										Boolean(result.result?.error) ||
+										(result.result?.toolResults.some(
+											(item) =>
+												item.isError ||
+												(item.details as { failed?: boolean } | undefined)
+													?.failed === true,
+										) ??
+											false),
+								}),
+							},
+							result.inputs,
+						).content,
 						...(result.result
-							? toolResult(
+							? toolResultsContent(
 									result.result.toolResults,
 									result.result.sessionId,
-									result.result.cwd,
-								).content
+								)
 							: deliveryContent(result.deliveries)),
 					],
 				},
@@ -652,6 +691,7 @@ export function createServer(
 					result.initialization,
 					result.replay,
 					result.execution,
+					{ work: result.work },
 				),
 				true,
 				!result.execution && result.inputs.length

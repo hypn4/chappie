@@ -26,6 +26,7 @@ import type { HistoryRange, HistoryResult } from "./history.ts";
 import { validateBrokerMessage, validateSessionMessage } from "./ipc-schema.ts";
 import type { ResourceData, ResourceDescriptor } from "./resources.ts";
 import type { TransferDetails } from "./transfer.ts";
+import type { ChatMode, SessionWork } from "./work.ts";
 
 const defaultPort = 24274;
 
@@ -64,6 +65,7 @@ export interface SessionSkillInfo {
 }
 
 export interface SessionInspection {
+	work?: SessionWork;
 	session: SessionDescription;
 	tools: SessionToolInfo[];
 	skills: SessionSkillInfo[];
@@ -97,7 +99,7 @@ export interface SessionToolResult {
 	timestamp: number;
 }
 
-export type SessionResult =
+export type SessionResult = (
 	| { sessions: SessionListItem[] }
 	| {
 			inspection: SessionInspection;
@@ -117,11 +119,13 @@ export type SessionResult =
 			inputs: SessionInput[];
 			toolResults: [];
 	  }
+	| { progress: true; cwd: string; inputs: SessionInput[] }
 	| { inputs: SessionInput[] }
 	| { history: HistoryResult; cwd: string }
 	| { resource: ResourceData }
 	| { transfer: TransferDetails }
-	| { error: string };
+	| { error: string }
+) & { work?: SessionWork };
 
 export type SessionRequest =
 	| { type: "sessions"; sessionId?: string }
@@ -144,6 +148,7 @@ export type SessionRequest =
 			operationKey?: string;
 			executionId?: string | undefined;
 			text: string;
+			mode?: ChatMode;
 			replyTo?: string;
 	  }
 	| {
@@ -195,6 +200,7 @@ export type BrokerMessage =
 			executionId?: string | undefined;
 			sessionId: string;
 			text: string;
+			mode?: ChatMode;
 			replyTo?: string;
 	  }
 	| {
