@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { ModelInput } from "./ipc.ts";
 import type { ResourceDescriptor } from "./resources.ts";
 import type { ToolInput } from "./tools.ts";
 
@@ -9,6 +10,7 @@ export interface OperationResource extends ResourceDescriptor {
 
 export type OperationStatus =
 	| "running"
+	| "waiting_input"
 	| "completed"
 	| "failed"
 	| "cancelled"
@@ -27,6 +29,7 @@ export interface OperationReceipt {
 	updatedAt: number;
 	error?: string | undefined;
 	resources?: OperationResource[] | undefined;
+	waitingInputs?: ModelInput[] | undefined;
 }
 
 export interface ReplayReceipt {

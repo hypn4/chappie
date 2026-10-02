@@ -141,3 +141,37 @@ test("an older successful write cannot mask a newer snapshot failure", async (t)
 	await valid;
 	await assert.rejects(state.flush(), /32 MiB/);
 });
+
+test("input waits survive persistence without a terminal event and cancellation clears the wait", async (t) => {
+	const { state, root, subscription } = await fixture(t);
+	await state.upsertEventSubscription(subscription);
+	await assert.rejects(
+		state.waitForInput("op-key", [
+			{
+				id: "other",
+				sessionId: "B",
+				request: { kind: "compaction", input: {} },
+			},
+		]),
+		/another operation session/,
+	);
+	await state.waitForInput("op-key", [
+		{ id: "model", sessionId: "A", request: { kind: "compaction", input: {} } },
+	]);
+	assert.equal(state.nextEvent(Date.now()), undefined);
+	const restored = new State(root);
+	await restored.load();
+	assert.equal(restored.operation("owner", "op").status, "waiting_input");
+	assert.equal(
+		restored.operation("owner", "op").waitingInputs?.[0]?.id,
+		"model",
+	);
+	await restored.finishOperation(
+		"op-key",
+		"cancelled",
+		[],
+		"Explicitly cancelled",
+	);
+	assert.equal(restored.operation("owner", "op").waitingInputs, undefined);
+	assert.equal(restored.nextEvent(Date.now())?.data.status, "cancelled");
+});

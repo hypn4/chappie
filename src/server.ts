@@ -10,16 +10,16 @@ import packageJson from "../package.json" with { type: "json" };
 import type { Broker } from "./broker.ts";
 import { deliveryContent } from "./delivery.ts";
 import {
-	EVENT_DEFINITION,
+	EVENT_DEFINITIONS,
 	eventsListParamsSchema,
 	eventsListResultSchema,
 	eventsSubscribeParamsSchema,
 	eventsSubscribeResultSchema,
 	eventsUnsubscribeParamsSchema,
 	eventsUnsubscribeResultSchema,
-	OPERATION_FINISHED_EVENT,
 } from "./event-types.ts";
 import { historyInput } from "./history.ts";
+import { nativeCallsSchema } from "./native-calls.ts";
 import {
 	answerContent,
 	answerInput,
@@ -27,12 +27,8 @@ import {
 	questionInstructions,
 	questionOutput,
 } from "./questions.ts";
-import {
-	directTools,
-	inputContent,
-	type ToolInput,
-	toolResult,
-} from "./tools.ts";
+import { inputContent, toolResult } from "./tools.ts";
+import { operationIdSchema, transferSchema } from "./transfer.ts";
 
 const instructions = readFileSync(
 	new URL("./instructions.md", import.meta.url),
@@ -47,29 +43,16 @@ const outputSchema = z.object({
 		),
 });
 
-const nativeCallSchema = z.object({
-	name: z.string(),
-	arguments: z.record(z.string(), z.json()),
-});
-const nativeCallsSchema = z.array(nativeCallSchema).min(1).max(128);
-
 const questionTemplate = "ui://chappie/question.html";
 const questionSchema = outputSchema.extend({ question: questionOutput });
 function toolAnnotations(name: string) {
-	const readOnly = [
-		"tools",
-		"read",
-		"history",
-		"sessions",
-		"get_operation",
-	].includes(name);
+	const readOnly = ["tools", "history", "sessions", "get_operation"].includes(
+		name,
+	);
 	const dangerous = [
 		"call",
 		"start_call",
 		"cancel_operation",
-		"bash",
-		"write",
-		"edit",
 		"transfer",
 	].includes(name);
 	return {
@@ -81,7 +64,7 @@ function toolAnnotations(name: string) {
 			name === "transfer" ||
 			name === "start_call" ||
 			name === "cancel_operation",
-		openWorldHint: dangerous || name === "read",
+		openWorldHint: dangerous,
 	};
 }
 
@@ -190,27 +173,25 @@ export function createServer(broker: Broker): McpServer {
 			annotations: toolAnnotations("chat"),
 		},
 		handle(async (args, context) => {
-			const chatId = requireChatId(context);
-			const { sessionId, cwd, inputs, initialization, replay } =
-				await broker.chat(
-					chatId,
-					args.sessionId,
-					args.text,
-					context.mcpReq._meta?.["otunnel/requestId"],
-					context.mcpReq.signal,
-					args.replyTo,
-				);
+			const result = await broker.chat(
+				requireChatId(context),
+				args.sessionId,
+				args.text,
+				context.mcpReq._meta?.["otunnel/requestId"],
+				context.mcpReq.signal,
+				args.replyTo,
+			);
 			return finishResult(
 				broker,
 				context,
-				textResult(
-					{
-						sessionId,
-						cwd,
-						...(initialization ? { initialization } : {}),
-						...(replay ? { replay } : {}),
-					},
-					inputs,
+				toolResult(
+					[],
+					result.sessionId,
+					result.cwd,
+					result.inputs,
+					result.initialization,
+					result.replay,
+					result.execution,
 				),
 			);
 		}),
@@ -358,7 +339,7 @@ export function createServer(broker: Broker): McpServer {
 		{
 			title: "OMP tools",
 			description:
-				"Get full definitions of OMP tools for call. Filter by names, or omit names to list all active tools.",
+				"Discover current native OMP tool definitions for call and start_call. Choose names from init's short catalog and request only the definitions needed. Omit names only to inspect the entire active catalog.",
 			outputSchema,
 			inputSchema: z.object({
 				names: z
@@ -405,7 +386,7 @@ export function createServer(broker: Broker): McpServer {
 		{
 			title: "Call OMP tools",
 			description:
-				"Execute OMP tools using the definitions returned by tools. Each calls array is one native OMP batch.",
+				"Execute one native OMP batch with tool names and arguments from tools. Native schemas and validation belong to OMP. A pending model request returns needs_input/executed:false instead of running the batch.",
 			outputSchema,
 			inputSchema: z.strictObject({
 				calls: nativeCallsSchema,
@@ -431,6 +412,7 @@ export function createServer(broker: Broker): McpServer {
 					result.inputs,
 					result.initialization,
 					result.replay,
+					result.execution,
 				),
 			);
 		}),
@@ -441,7 +423,7 @@ export function createServer(broker: Broker): McpServer {
 		{
 			title: "Start long OMP tool batch",
 			description:
-				"Start a native OMP tool batch independently of this ChatGPT MCP request. Returns durable operation status, not an MCP Tasks handle. Subscribe to operation.finished for completion, or use get_operation to recover the result. Reuse the same operationId for transport retries; never change its arguments.",
+				"Start a discovered native OMP batch independently of this MCP request. Returns durable operation status, not an MCP Tasks handle. Use get_operation or an authorized operation.finished subscription. Reuse the same operationId and arguments; explicitly resume waiting_input only after handling its model request.",
 			outputSchema,
 			inputSchema: z.strictObject({
 				operationId: z
@@ -489,7 +471,7 @@ export function createServer(broker: Broker): McpServer {
 		async (_params, context) => {
 			requireChatId(context);
 			return eventsListResultSchema.parse({
-				events: [EVENT_DEFINITION],
+				events: EVENT_DEFINITIONS,
 			});
 		},
 	);
@@ -513,6 +495,7 @@ export function createServer(broker: Broker): McpServer {
 			try {
 				subscription = await broker.subscribeOperationEvent(
 					chatId,
+					params.name,
 					params.arguments.operation_id,
 					params.delivery.url,
 					params.delivery.secret,
@@ -544,13 +527,9 @@ export function createServer(broker: Broker): McpServer {
 		},
 		async (params, context) => {
 			const chatId = requireChatId(context);
-			if (params.name !== OPERATION_FINISHED_EVENT)
-				throw new ProtocolError(
-					ProtocolErrorCode.InvalidParams,
-					"Unknown event name",
-				);
 			await broker.unsubscribeOperationEvent(
 				chatId,
+				params.name,
 				params.arguments.operation_id,
 				params.delivery.url,
 			);
@@ -563,7 +542,7 @@ export function createServer(broker: Broker): McpServer {
 		{
 			title: "Get long operation status",
 			description:
-				"Read the durable status and retained native result of a start_call operation. Completion refers to the native batch, not child jobs it may have started. Result retrieval is repeatable; it never re-executes the work.",
+				"Read durable operation status, waiting model inputs, and retained native results without re-executing work. waiting_input is a known-unexecuted batch; completed refers to the native batch, not child jobs it may have started.",
 			outputSchema,
 			inputSchema: z.object({
 				operationId: z.string().trim().min(1).max(128),
@@ -577,7 +556,8 @@ export function createServer(broker: Broker): McpServer {
 				context,
 				{
 					content: [
-						...textResult({ operation: result.operation }).content,
+						...textResult({ operation: result.operation }, result.inputs)
+							.content,
 						...(result.result
 							? toolResult(
 									result.result.toolResults,
@@ -619,51 +599,48 @@ export function createServer(broker: Broker): McpServer {
 		}),
 	);
 
-	for (const tool of directTools) {
-		server.registerTool(
-			tool.name,
-			{
-				title: tool.name,
-				description: tool.description,
-				outputSchema,
-				inputSchema: tool.inputSchema,
-				annotations: toolAnnotations(tool.name),
-				...(tool.fileParams
-					? { _meta: { "openai/fileParams": tool.fileParams } }
-					: {}),
-			},
-			handle(async (args, context) => {
-				const input = { ...args } as Record<string, unknown> & {
-					sessionId?: string;
-				};
-				const sessionId = input.sessionId;
-				delete input.sessionId;
-				const calls: ToolInput[] = [
-					{ name: tool.name, arguments: input as ToolInput["arguments"] },
-				];
-				const result = await broker.call(
-					requireChatId(context),
-					sessionId,
-					calls,
-					context.mcpReq._meta?.["otunnel/requestId"],
-					context.mcpReq.signal,
-					true,
-				);
-				return finishResult(
-					broker,
-					context,
-					toolResult(
-						result.toolResults,
-						result.sessionId,
-						result.cwd,
-						result.inputs,
-						result.initialization,
-						result.replay,
-					),
-				);
+	server.registerTool(
+		"transfer",
+		{
+			title: "Transfer files",
+			description:
+				"Import host-injected ChatGPT files, copy between OMP sessions, or export local files and images.",
+			outputSchema,
+			inputSchema: transferSchema.extend({
+				operationId: operationIdSchema,
+				sessionId: z
+					.string()
+					.min(1)
+					.optional()
+					.describe("OMP session for this transfer"),
 			}),
-		);
-	}
+			annotations: toolAnnotations("transfer"),
+			_meta: { "openai/fileParams": ["files"] },
+		},
+		handle(async ({ sessionId, ...input }, context) => {
+			const result = await broker.call(
+				requireChatId(context),
+				sessionId,
+				[{ name: "transfer", arguments: input }],
+				context.mcpReq._meta?.["otunnel/requestId"],
+				context.mcpReq.signal,
+				true,
+			);
+			return finishResult(
+				broker,
+				context,
+				toolResult(
+					result.toolResults,
+					result.sessionId,
+					result.cwd,
+					result.inputs,
+					result.initialization,
+					result.replay,
+					result.execution,
+				),
+			);
+		}),
+	);
 
 	server.registerTool(
 		"history",

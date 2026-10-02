@@ -39,7 +39,7 @@ test("MCP tool annotations describe mutation and external access accurately", as
 		name: string;
 		annotations: Record<string, boolean>;
 	}[];
-	for (const name of ["write", "edit", "bash", "call"]) {
+	for (const name of ["call"]) {
 		const info = tools.find((tool) => tool.name === name);
 		assert.equal(info?.annotations.readOnlyHint, false, name);
 		assert.equal(info?.annotations.idempotentHint, false, name);

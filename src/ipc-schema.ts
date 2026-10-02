@@ -1,6 +1,7 @@
 import * as z from "zod";
 import { historyInput } from "./history.ts";
 import type { BrokerMessage, SessionMessage } from "./ipc.ts";
+import { nativeCallSchema } from "./native-calls.ts";
 
 const id = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const text = z.string().max(64 * 1024 * 1024);
@@ -11,11 +12,9 @@ const source = {
 	requestId: name.optional(),
 	operationKey: name.optional(),
 };
-const toolCall = z.strictObject({
+const toolCall = nativeCallSchema.extend({
 	type: z.literal("toolCall"),
 	id: name,
-	name,
-	arguments: z.record(z.string(), z.json()),
 });
 const block = z.union([
 	z.looseObject({ type: z.literal("text"), text }),
@@ -39,6 +38,14 @@ const toolResult = z.looseObject({
 	details: z.unknown().optional(),
 });
 const toolResults = z.array(toolResult).max(128);
+export const modelInputSchema = z.strictObject({
+	id: name,
+	sessionId: name,
+	request: z.strictObject({
+		kind: z.enum(["compaction", "branch_summary"]),
+		input: z.unknown(),
+	}),
+});
 const inputs = z
 	.array(
 		z.union([
@@ -50,14 +57,7 @@ const inputs = z
 					content: z.union([text, content]),
 				}),
 			}),
-			z.strictObject({
-				id: name,
-				sessionId: name,
-				request: z.strictObject({
-					kind: z.enum(["compaction", "branch_summary"]),
-					input: z.unknown(),
-				}),
-			}),
+			modelInputSchema,
 		]),
 	)
 	.max(4096);
@@ -166,6 +166,16 @@ const resultPayloads = [
 	{ sessions: z.array(listedSession).max(4096) },
 	{ inspection, inputs, globalAgents: z.strictObject({ path }).optional() },
 	{ inputs },
+	{
+		execution: z.strictObject({
+			status: z.literal("needs_input"),
+			executed: z.literal(false),
+			reason: z.literal("model_request_pending"),
+		}),
+		cwd: path,
+		inputs,
+		toolResults: z.tuple([]),
+	},
 	{
 		message: assistant,
 		cwd: path,

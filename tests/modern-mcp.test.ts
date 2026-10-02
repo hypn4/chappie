@@ -280,3 +280,34 @@ test("tool batches use one JSON contract and reject the removed Base64 alias", a
 		assert.ok("error" in rejected || resultOf(rejected).isError === true);
 	}
 });
+
+test("input-required event has its own discoverable and authorized subscription", async (t) => {
+	const calls: unknown[][] = [];
+	const f = await fixture(t, {
+		subscribeOperationEvent: async (...args: unknown[]) => {
+			calls.push(args);
+			return { id: "input-sub", expiresAt: null };
+		},
+		unsubscribeOperationEvent: async (...args: unknown[]) => {
+			calls.push(args);
+		},
+	});
+	const events = resultOf(await f.request("events/list")).events;
+	assert.ok(Array.isArray(events));
+	assert.deepEqual(
+		events.map((event) => record(event).name),
+		["operation.finished", "operation.input_required"],
+	);
+	const params = { ...eventParams, name: "operation.input_required" };
+	assert.equal(
+		resultOf(await f.request("events/subscribe", params)).id,
+		"input-sub",
+	);
+	assert.equal(calls[0]?.[1], params.name);
+	const { secret: _secret, ...delivery } = params.delivery;
+	resultOf(await f.request("events/unsubscribe", { ...params, delivery }));
+	assert.equal(calls[1]?.[1], params.name);
+	assert.ok(
+		"error" in (await f.request("events/subscribe", params, "another-chat")),
+	);
+});

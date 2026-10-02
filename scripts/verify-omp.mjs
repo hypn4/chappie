@@ -191,7 +191,6 @@ try {
 		[{ name: "read", arguments: { path: "fixture.txt:2+1" } }],
 		"read-line",
 		signal,
-		true,
 	);
 	const text = read.toolResults
 		.flatMap((result) =>
@@ -215,7 +214,6 @@ try {
 		],
 		"edit-line",
 		signal,
-		true,
 	);
 	assert.ok(edit.toolResults.every((result) => !result.isError));
 	assert.equal(
@@ -464,7 +462,7 @@ try {
 		signal,
 	);
 	console.log(
-		"OMP integration passed: provider ownership after replacement/disposal, auxiliary rejection, detached operation completion, broker reconnect first-turn routing, saved-session resume first-turn routing, local collaboration registration, TODO continuation, exact read, native edit, resource bytes, replay and original-URI recovery.",
+		"OMP integration passed: native tool discovery and batch execution, provider ownership after replacement/disposal, auxiliary rejection, detached operation completion, broker reconnect first-turn routing, saved-session resume first-turn routing, local collaboration registration, TODO continuation, exact read, native edit, resource bytes, replay and original-URI recovery.",
 	);
 	console.log(
 		"No subagents, external model inference or live broker changes were used. ChatGPT approval UI and final response rendering are not covered.",

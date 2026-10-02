@@ -79,6 +79,14 @@ export type SessionInput = {
 	sessionId: string;
 } & ({ message: UserMessage } | { request: ModelRequest });
 
+export type ModelInput = Extract<SessionInput, { request: ModelRequest }>;
+
+export interface ExecutionWait {
+	status: "needs_input";
+	executed: false;
+	reason: "model_request_pending";
+}
+
 export interface SessionToolResult {
 	role: "toolResult";
 	toolCallId: string;
@@ -102,6 +110,12 @@ export type SessionResult =
 			cwd: string;
 			toolResults: SessionToolResult[];
 			inputs: SessionInput[];
+	  }
+	| {
+			execution: ExecutionWait;
+			cwd: string;
+			inputs: SessionInput[];
+			toolResults: [];
 	  }
 	| { inputs: SessionInput[] }
 	| { history: HistoryResult; cwd: string }

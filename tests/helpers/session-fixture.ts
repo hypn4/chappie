@@ -279,6 +279,7 @@ export async function sessionFixture(t: TestContext) {
 	);
 	return {
 		root,
+		api,
 		local,
 		controller,
 		context,

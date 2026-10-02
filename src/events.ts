@@ -1,8 +1,5 @@
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
-import type {
-	EventSubscription,
-	OPERATION_FINISHED_EVENT,
-} from "./event-types.ts";
+import type { EventSubscription, OperationEventName } from "./event-types.ts";
 import type { State } from "./state.ts";
 import {
 	HttpsWebhookTransport,
@@ -73,7 +70,7 @@ export class EventService {
 
 	async subscribe(input: {
 		chatId: string;
-		name: typeof OPERATION_FINISHED_EVENT;
+		name: OperationEventName;
 		operationId: string;
 		url: string;
 		secret: string;
@@ -138,14 +135,14 @@ export class EventService {
 			expiresAt: ttl === null ? null : updatedAt + ttl,
 			updatedAt,
 		};
-		// State queues an already-terminal result atomically with subscription creation.
+		// State queues the current matching snapshot atomically with subscription creation.
 		await this.#state.upsertEventSubscription(subscription);
 		return subscription;
 	}
 
 	async unsubscribe(input: {
 		chatId: string;
-		name: typeof OPERATION_FINISHED_EVENT;
+		name: OperationEventName;
 		operationId: string;
 		url: string;
 	}): Promise<void> {

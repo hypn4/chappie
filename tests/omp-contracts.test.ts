@@ -4,7 +4,6 @@ import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema/wire";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import * as z from "zod";
 import { createOmpHostApi } from "../src/session.ts";
-import { directTools } from "../src/tools.ts";
 import { sessionFixture } from "./helpers/session-fixture.ts";
 
 test("OMP schemas are serialized by the official wire API", () => {
@@ -40,20 +39,6 @@ test("wire conversion failures stay explicit and never silently erase a tool sch
 	);
 });
 
-test("direct tools expose current native read and edit input without aliases", () => {
-	const read = directTools.find((tool) => tool.name === "read");
-	const edit = directTools.find((tool) => tool.name === "edit");
-	assert.ok(read && edit);
-	const readSchema = z.toJSONSchema(read.inputSchema);
-	const editSchema = z.toJSONSchema(edit.inputSchema);
-	assert.deepEqual(readSchema.required, ["path"]);
-	assert.deepEqual(editSchema.required, ["input"]);
-	assert.equal(readSchema.properties?.offset, undefined);
-	assert.equal(readSchema.properties?.limit, undefined);
-	assert.equal(editSchema.properties?.patch, undefined);
-	assert.equal(editSchema.properties?.edits, undefined);
-});
-
 test("native read selectors reach OMP unchanged", async (t) => {
 	const f = await sessionFixture(t);
 	const pending = f.broker.call(
@@ -62,7 +47,6 @@ test("native read selectors reach OMP unchanged", async (t) => {
 		[{ name: "read", arguments: { path: "test.txt:6+1" } }],
 		"native-selector",
 		f.controller.signal,
-		true,
 	);
 	const output = await f.dispatch();
 	const call = output.message.content.find(

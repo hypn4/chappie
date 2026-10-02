@@ -1,15 +1,16 @@
 import { randomUUID } from "node:crypto";
-import type { ToolCall } from "@oh-my-pi/pi-ai";
 import { type Activity, chatLabel, source } from "./activity.ts";
 import { readConfig } from "./config.ts";
 import type { DeliveryRecord } from "./delivery.ts";
-import { OPERATION_FINISHED_EVENT } from "./event-types.ts";
+import type { OperationEventName } from "./event-types.ts";
 import { EventService, type WebhookTransport } from "./events.ts";
 import { type HistoryRange, historyInstructions } from "./history.ts";
 import {
 	type BrokerMessage,
+	type ExecutionWait,
 	IpcServer,
 	type JsonLinePeer,
+	type ModelInput,
 	type SessionDescription,
 	type SessionInput,
 	type SessionInspection,
@@ -19,6 +20,11 @@ import {
 	type SessionResult,
 	type SessionToolResult,
 } from "./ipc.ts";
+import {
+	hasHostFileImport,
+	nativeToolCalls,
+	validateNativeCalls,
+} from "./native-calls.ts";
 import {
 	type OperationReceipt,
 	type OperationView,
@@ -46,19 +52,13 @@ import type { ToolInput } from "./tools.ts";
 const observerInstructions =
 	"This ChatGPT conversation recently initialized or resumed work in this OMP session. A recent initialization may still own this task; do not assume another completion is needed. Participate as an observer for this task: read history with observer: true, follow new entries with after and wait: true, and think independently. Leave execution and OMP communication to the ongoing work. Do not export files, repeat the completed report, or publish a second completion response. Leave the single completion response to the original execution. Continue observing rather than reinitializing to take over.";
 
-function hasHostFileImport(
-	calls: readonly { name: string; arguments: Record<string, unknown> }[],
-): boolean {
-	return calls.some(
-		(call) => call.name === "transfer" && Array.isArray(call.arguments.files),
-	);
-}
-
 const operationCancelledMessage = "Operation cancelled by ChatGPT";
 
 interface DetachedOperation {
 	controller: AbortController;
 	promise: Promise<void>;
+	dispatched: boolean;
+	signature: string;
 }
 
 interface RegisteredSession {
@@ -107,6 +107,7 @@ export interface ChatResult {
 	sessionId: string;
 	cwd: string;
 	inputs: SessionInput[];
+	execution?: ExecutionWait;
 }
 
 export interface CallResult extends ChatResult {
@@ -122,6 +123,7 @@ export interface OperationResult {
 	operation: OperationView;
 	deliveries: DeliveryRecord[];
 	result?: DeliveryRecord | undefined;
+	inputs: ModelInput[];
 }
 
 interface InFlightOperation {
@@ -343,6 +345,16 @@ export class Broker {
 					await this.#state.finishOperation(identity?.key, "uncertain");
 					throw error;
 				});
+				if ("execution" in result) {
+					await this.#recordInputWait(identity?.key, result);
+					return {
+						sessionId: target,
+						cwd: result.cwd,
+						inputs: result.inputs,
+						execution: result.execution,
+						...(initialization ? { initialization } : {}),
+					};
+				}
 				await this.#state.finishOperation(identity?.key, "completed");
 				if ("message" in result) {
 					const inputs = result.inputs;
@@ -374,9 +386,17 @@ export class Broker {
 			signal,
 		);
 		const { inspection, inputs } = await this.#inspect(target, signal);
+		const selected = names ? new Set(names) : undefined;
+		if (selected) {
+			const available = new Set(inspection.tools.map(({ name }) => name));
+			const missing = [...selected].filter((name) => !available.has(name));
+			if (missing.length)
+				throw new Error(
+					`Native tools are not active: ${missing.join(", ")}. Refresh the session tool catalog.`,
+				);
+		}
 		await this.#ackInputs(target, inputs, signal);
 		await this.#confirmBindingUse(chatId, sessionId, target);
-		const selected = names ? new Set(names) : undefined;
 		return {
 			...inspection,
 			...(initialization ? { initialization } : {}),
@@ -395,10 +415,8 @@ export class Broker {
 		signal: AbortSignal,
 		direct = false,
 	): Promise<CallResult> {
-		if (calls.length < 1 || calls.length > 128)
-			throw new Error("Tool batches must contain between 1 and 128 calls");
-		if (!direct && hasHostFileImport(calls))
-			throw new Error("Host file imports require the direct transfer tool");
+		signal.throwIfAborted();
+		calls = validateNativeCalls(calls, direct);
 		const { sessionId: target, initialization } = await this.#selectSession(
 			chatId,
 			sessionId,
@@ -439,12 +457,7 @@ export class Broker {
 					}
 				}
 
-				const toolCalls: ToolCall[] = calls.map((call) => ({
-					type: "toolCall",
-					id: `chappie-${randomUUID()}`,
-					name: call.name,
-					arguments: call.arguments,
-				}));
+				const toolCalls = nativeToolCalls(calls);
 				const result = await this.#request(
 					target,
 					(id) => ({
@@ -461,6 +474,17 @@ export class Broker {
 					await this.#state.finishOperation(identity?.key, "uncertain");
 					throw error;
 				});
+				if ("execution" in result) {
+					await this.#recordInputWait(identity?.key, result);
+					return {
+						sessionId: target,
+						cwd: result.cwd,
+						inputs: result.inputs,
+						toolResults: [],
+						execution: result.execution,
+						...(initialization ? { initialization } : {}),
+					};
+				}
 				if ("toolResults" in result) {
 					await this.#state.finishOperation(
 						identity?.key,
@@ -494,10 +518,7 @@ export class Broker {
 		signal: AbortSignal,
 	): Promise<StartedOperation> {
 		signal.throwIfAborted();
-		if (calls.length < 1 || calls.length > 128)
-			throw new Error("Tool batches must contain between 1 and 128 calls");
-		if (hasHostFileImport(calls))
-			throw new Error("Host file imports require the direct transfer tool");
+		calls = validateNativeCalls(calls);
 		const stableId = validateOperationId(operationId);
 		const prior = this.#state.findOperation(chatId, stableId);
 		if (prior) {
@@ -515,10 +536,16 @@ export class Broker {
 			);
 			if (replay?.signature !== prior.signature)
 				throw new Error("Operation identifier reused with different arguments");
-			await this.#state.flush();
-			return {
-				operation: operationView(this.#state.operation(chatId, stableId)),
-			};
+			if (prior.status !== "waiting_input") {
+				await this.#state.flush();
+				return {
+					operation: operationView(this.#state.operation(chatId, stableId)),
+				};
+			}
+			// Finish recording the known-unexecuted attempt before reclaiming it.
+			await this.#detachedOperations.get(prior.key)?.promise;
+			signal.throwIfAborted();
+			sessionId = prior.sessionId;
 		}
 		const { sessionId: target, initialization } = await this.#selectSession(
 			chatId,
@@ -550,78 +577,110 @@ export class Broker {
 			status: "running" as const,
 			updatedAt: createdAt,
 		};
-		const existing = await this.#state.reserveOperation(receipt);
-		if (existing) {
+		// Own cancellation before reserveOperation exposes running state or yields.
+		// A competing submitter must not replace the owner of this acceptance.
+		const accepting = this.#detachedOperations.get(identity.key);
+		if (accepting) {
+			if (accepting.signature !== identity.signature)
+				throw new Error("Operation identifier reused with different arguments");
+			await this.#state.flush();
 			return {
-				operation: operationView(existing),
-				...(initialization ? { initialization } : {}),
+				operation: operationView(this.#state.operation(chatId, stableId)),
 			};
 		}
-
-		const toolCalls: ToolCall[] = calls.map((call) => ({
-			type: "toolCall",
-			id: `chappie-${randomUUID()}`,
-			name: call.name,
-			arguments: call.arguments,
-		}));
+		const completion = Promise.withResolvers<void>();
 		const execution = new AbortController();
-		const detached = this.#request(
-			target,
-			(id) => ({
-				type: "call",
-				id,
-				chatId,
-				requestId: stableId,
-				operationKey: identity.key,
-				sessionId: target,
-				calls: toolCalls,
-			}),
-			execution.signal,
-		)
-			.then(async (result) => {
-				if (!("toolResults" in result)) {
-					await this.#state.finishOperation(
-						identity.key,
-						"uncertain",
-						[],
-						"Agent session returned no tool results",
-					);
-					return;
-				}
-				await this.#state.addDelivery({
-					id: `operation:${identity.key}`,
-					chatId,
-					operationKey: identity.key,
-					sessionId: target,
-					cwd: result.cwd,
-					toolResults: result.toolResults,
-					complete: true,
-				});
+		const tracked: DetachedOperation = {
+			controller: execution,
+			promise: completion.promise,
+			dispatched: false,
+			signature: identity.signature,
+		};
+		this.#detachedOperations.set(identity.key, tracked);
+		void completion.promise
+			.finally(() => {
+				if (this.#detachedOperations.get(identity.key) === tracked)
+					this.#detachedOperations.delete(identity.key);
 			})
-			.catch(async (error: unknown) => {
-				const cancelled =
-					execution.signal.aborted &&
-					execution.signal.reason instanceof Error &&
-					execution.signal.reason.message === operationCancelledMessage;
+			.catch(() => {});
+		try {
+			const existing = await this.#state.reserveOperation(receipt);
+			if (!existing && execution.signal.aborted) {
+				const error = execution.signal.reason;
 				await this.#state.finishOperation(
 					identity.key,
-					cancelled ? "cancelled" : "uncertain",
+					error instanceof Error && error.message === operationCancelledMessage
+						? "cancelled"
+						: "uncertain",
 					[],
 					error instanceof Error ? error.message : String(error),
 				);
-			});
-		this.#detachedOperations.set(identity.key, {
-			controller: execution,
-			promise: detached,
-		});
-		void detached
-			.finally(() => this.#detachedOperations.delete(identity.key))
-			.catch(() => {});
-
-		return {
-			operation: operationView(receipt),
-			...(initialization ? { initialization } : {}),
-		};
+			}
+			if (
+				!existing &&
+				!execution.signal.aborted &&
+				this.#state.operation(chatId, stableId).status === "running"
+			) {
+				const toolCalls = nativeToolCalls(calls);
+				tracked.dispatched = true;
+				const detached = this.#request(
+					target,
+					(id) => ({
+						type: "call",
+						id,
+						chatId,
+						requestId: stableId,
+						operationKey: identity.key,
+						sessionId: target,
+						calls: toolCalls,
+					}),
+					execution.signal,
+				)
+					.then(async (result) => {
+						if ("execution" in result) {
+							await this.#recordInputWait(identity.key, result);
+							return;
+						}
+						if (!("toolResults" in result)) {
+							await this.#state.finishOperation(
+								identity.key,
+								"uncertain",
+								[],
+								"Agent session returned no tool results",
+							);
+							return;
+						}
+						await this.#state.addDelivery({
+							id: `operation:${identity.key}`,
+							chatId,
+							operationKey: identity.key,
+							sessionId: target,
+							cwd: result.cwd,
+							toolResults: result.toolResults,
+							complete: true,
+						});
+					})
+					.catch(async (error: unknown) => {
+						const cancelled =
+							execution.signal.aborted &&
+							execution.signal.reason instanceof Error &&
+							execution.signal.reason.message === operationCancelledMessage;
+						await this.#state.finishOperation(
+							identity.key,
+							cancelled ? "cancelled" : "uncertain",
+							[],
+							error instanceof Error ? error.message : String(error),
+						);
+					});
+				void detached.then(completion.resolve, completion.reject);
+			}
+			return {
+				operation: operationView(this.#state.operation(chatId, stableId)),
+				...(initialization ? { initialization } : {}),
+			};
+		} finally {
+			if (!tracked.dispatched) completion.resolve();
+		}
 	}
 
 	operation(chatId: string, operationId: string): OperationResult {
@@ -633,11 +692,23 @@ export class Broker {
 			operation: operationView(receipt),
 			deliveries: this.#state.deliveriesForOperation(chatId, receipt.key),
 			result: this.#state.resultForOperation(chatId, operationId),
+			inputs: receipt.waitingInputs ?? [],
 		};
+	}
+
+	async #recordInputWait(
+		key: string | undefined,
+		result: Extract<SessionResult, { execution: ExecutionWait }>,
+	): Promise<void> {
+		await this.#state.waitForInput(
+			key,
+			result.inputs.filter((input): input is ModelInput => "request" in input),
+		);
 	}
 
 	async subscribeOperationEvent(
 		chatId: string,
+		name: OperationEventName,
 		operationId: string,
 		url: string,
 		secret: string,
@@ -646,7 +717,7 @@ export class Broker {
 	) {
 		return await this.#events.subscribe({
 			chatId,
-			name: OPERATION_FINISHED_EVENT,
+			name,
 			operationId,
 			url,
 			secret,
@@ -657,12 +728,13 @@ export class Broker {
 
 	async unsubscribeOperationEvent(
 		chatId: string,
+		name: OperationEventName,
 		operationId: string,
 		url: string,
 	): Promise<void> {
 		await this.#events.unsubscribe({
 			chatId,
-			name: OPERATION_FINISHED_EVENT,
+			name,
 			operationId,
 			url,
 		});
@@ -681,19 +753,29 @@ export class Broker {
 	}
 
 	async #cancelDetached(receipt: OperationReceipt) {
-		if (receipt.status !== "running") return;
+		if (receipt.status !== "running" && receipt.status !== "waiting_input")
+			return;
 		const detached = this.#detachedOperations.get(receipt.key);
-		if (!detached) {
+		if (detached) {
+			detached.controller.abort(new Error(operationCancelledMessage));
+			// Persist the intent even if the result is concurrently becoming an input wait.
 			await this.#state.finishOperation(
 				receipt.key,
-				"uncertain",
+				"cancelled",
 				[],
-				"Detached execution is no longer attached to this broker",
+				operationCancelledMessage,
 			);
+			if (detached.dispatched) await detached.promise;
 			return;
 		}
-		detached.controller.abort(new Error(operationCancelledMessage));
-		await detached.promise;
+		await this.#state.finishOperation(
+			receipt.key,
+			receipt.status === "waiting_input" ? "cancelled" : "uncertain",
+			[],
+			receipt.status === "waiting_input"
+				? operationCancelledMessage
+				: "Detached execution is no longer attached to this broker",
+		);
 	}
 	async history(
 		chatId: string,
@@ -1380,6 +1462,10 @@ export class Broker {
 			await this.#state.finishOperation(identity?.key, "uncertain");
 			throw error;
 		});
+		if ("execution" in result) {
+			await this.#recordInputWait(identity?.key, result);
+			return result;
+		}
 		if (
 			(request.type === "call" && "toolResults" in result) ||
 			(request.type === "chat" && "message" in result)

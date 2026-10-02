@@ -9,7 +9,8 @@ import {
 	eventSubscriptionSchema,
 	operationEvent,
 } from "./event-types.ts";
-import { deliverySchema } from "./ipc-schema.ts";
+import type { ModelInput } from "./ipc.ts";
+import { deliverySchema, modelInputSchema } from "./ipc-schema.ts";
 import type { OperationReceipt } from "./operations.ts";
 import type { QuestionAnswer, QuestionRecord } from "./questions.ts";
 import { questionOutput } from "./questions.ts";
@@ -74,6 +75,7 @@ const stateSchema = z.strictObject({
 				createdAt: z.number().nonnegative().optional(),
 				status: z.enum([
 					"running",
+					"waiting_input",
 					"completed",
 					"failed",
 					"cancelled",
@@ -85,6 +87,7 @@ const stateSchema = z.strictObject({
 					.max(64 * 1024)
 					.optional(),
 				resources: z.array(operationResourceSchema).max(16384).optional(),
+				waitingInputs: z.array(modelInputSchema).max(4096).optional(),
 			}),
 		)
 		.max(16384)
@@ -203,8 +206,27 @@ export class State {
 		if (existing) {
 			if (existing.signature !== receipt.signature)
 				throw new Error("Operation identifier reused with different arguments");
-			await this.flush();
-			return existing;
+			if (existing.status !== "waiting_input") {
+				await this.flush();
+				return existing;
+			}
+			// Only a host-confirmed unexecuted request may be retried. Claim before
+			// yielding, so simultaneous retries still dispatch just one batch.
+			const resumed: OperationReceipt = {
+				...existing,
+				status: "running",
+				updatedAt: Date.now(),
+			};
+			delete resumed.waitingInputs;
+			delete resumed.error;
+			this.#operations.set(receipt.key, resumed);
+			try {
+				await this.#save();
+			} catch (error) {
+				resumed.status = "uncertain";
+				throw error;
+			}
+			return undefined;
 		}
 		const cutoff = Date.now() - 24 * 60 * 60 * 1000;
 		for (const [key, value] of this.#operations) {
@@ -230,6 +252,24 @@ export class State {
 			throw error;
 		}
 		return undefined;
+	}
+
+	async waitForInput(
+		key: string | undefined,
+		inputs: ModelInput[],
+	): Promise<void> {
+		if (!key) return;
+		const receipt = this.#operations.get(key);
+		if (receipt?.status !== "running") return;
+		const waitingInputs = z
+			.array(modelInputSchema)
+			.min(1)
+			.max(4096)
+			.parse(inputs);
+		if (waitingInputs.some((input) => input.sessionId !== receipt.sessionId))
+			throw new Error("Model input belongs to another operation session");
+		receipt.waitingInputs = waitingInputs;
+		await this.finishOperation(key, "waiting_input");
 	}
 
 	async finishOperation(
@@ -272,6 +312,7 @@ export class State {
 		if (!terminal) {
 			receipt.status = status;
 			receipt.updatedAt = Date.now();
+			if (status !== "waiting_input") delete receipt.waitingInputs;
 			if (error) receipt.error = error.slice(0, 64 * 1024);
 			else if (status === "completed") delete receipt.error;
 		}
@@ -385,11 +426,12 @@ export class State {
 		subscription: EventSubscription,
 		event: EventRecord,
 	): void {
-		if (subscription.eventId) return;
+		if (subscription.eventId === event.eventId) return;
 		if (this.#eventOutbox.size >= 8192)
 			throw new Error("Event outbox limit reached");
 		subscription.eventId = event.eventId;
 		subscription.deliveryStatus = "pending";
+		delete subscription.deliveryError;
 		this.#eventOutbox.set(event.eventId, event);
 	}
 

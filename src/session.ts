@@ -23,6 +23,7 @@ import { type HistoryRange, historyResult } from "./history.ts";
 import {
 	type BrokerMessage,
 	IpcClient,
+	type ModelInput,
 	type ModelRequest,
 	type SessionDescription,
 	type SessionInput,
@@ -34,6 +35,7 @@ import {
 	type SessionToolInfo,
 	type SessionToolResult,
 } from "./ipc.ts";
+import { nativeToolCalls, validateNativeCalls } from "./native-calls.ts";
 import { markOmpPrimaryContext } from "./omp-primary-context.ts";
 import { ProviderOutput } from "./provider-core.ts";
 import {
@@ -495,11 +497,18 @@ export class LocalSession {
 			generation.connectionGeneration = this.#connectionGeneration;
 			output.begin();
 			await this.#sync();
+			// Capture once: a reply may arrive while these unexecuted results send.
+			const inputs = this.#inputs();
+			if (inputs.some((input) => "request" in input)) {
+				for (const queued of this.#queue.splice(0))
+					await this.#returnInputWait(queued, inputs);
+			}
 			await output.finished;
 		} finally {
 			this.#generations.delete(id);
 			this.#pendingInputs.delete(id);
 			void this.#sync().catch(() => {});
+			this.#dispatch();
 		}
 	}
 
@@ -561,8 +570,7 @@ export class LocalSession {
 		calls: ToolInput[],
 		signal?: AbortSignal,
 	) {
-		if (calls.length < 1 || calls.length > 128)
-			throw new Error("Tool batches must contain between 1 and 128 calls");
+		calls = validateNativeCalls(calls);
 		const self = this.#context?.sessionManager.getSessionId();
 		if (!self) throw new Error("Chappie session is not available");
 		const result = await this.#request(
@@ -571,12 +579,7 @@ export class LocalSession {
 				sessionId,
 				chatId: self,
 				requestId: operationId,
-				calls: calls.map((call) => ({
-					type: "toolCall",
-					id: `chappie-${randomUUID()}`,
-					name: call.name,
-					arguments: call.arguments,
-				})),
+				calls: nativeToolCalls(calls),
 			},
 			signal,
 		);
@@ -605,7 +608,7 @@ export class LocalSession {
 			},
 			signal,
 		);
-		if (!("message" in result))
+		if (!("message" in result) && !("execution" in result))
 			throw new Error("Agent session returned no assistant message");
 		return { sessionId, ...result };
 	}
@@ -1102,10 +1105,56 @@ export class LocalSession {
 					});
 					break;
 				}
+				if (this.#modelInputs().length) {
+					await this.#returnInputWait(message);
+					break;
+				}
 				this.#queue.push(message);
 				this.#dispatch();
 				break;
 		}
+	}
+
+	#modelInputs(): ModelInput[] {
+		return [...this.#generations]
+			.filter(
+				([, generation]) =>
+					!generation.output.closed && generation.sessionId === this.#sessionId,
+			)
+			.map(([id, generation]) => ({
+				id,
+				sessionId: generation.sessionId,
+				request: generation.request,
+			}));
+	}
+
+	async #returnInputWait(
+		request: RemoteRequest,
+		inputs = this.#inputs(),
+	): Promise<void> {
+		const context = this.#context;
+		if (
+			!context ||
+			context.sessionManager.getSessionId() !== request.sessionId
+		) {
+			await this.#sendError(
+				request.id,
+				"The requested OMP session is no longer active",
+			);
+			return;
+		}
+		await this.#connection?.send({
+			type: "result",
+			id: request.id,
+			cwd: context.cwd,
+			execution: {
+				status: "needs_input",
+				executed: false,
+				reason: "model_request_pending",
+			},
+			toolResults: [],
+			inputs,
+		});
 	}
 
 	async #request(
@@ -1254,7 +1303,7 @@ export class LocalSession {
 	}
 
 	#dispatch(): void {
-		if (this.#active) return;
+		if (this.#active || this.#modelInputs().length) return;
 		const request = this.#queue[0];
 		if (!request) return;
 		if (
@@ -1305,6 +1354,7 @@ export class LocalSession {
 	#wake(): void {
 		if (
 			this.#starting ||
+			this.#modelInputs().length > 0 ||
 			this.#output ||
 			this.#active ||
 			this.#queue.length === 0 ||
@@ -1499,7 +1549,12 @@ export class LocalSession {
 
 	#inputs(): SessionInput[] {
 		this.#collectInputs();
-		return [...this.#pendingInputs.values()];
+		return [
+			...this.#modelInputs(),
+			...[...this.#pendingInputs.values()].filter(
+				(input) => !("request" in input),
+			),
+		];
 	}
 
 	#failGenerations(error: Error): void {

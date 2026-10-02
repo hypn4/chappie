@@ -27,6 +27,7 @@ const required = [
 	"dist/src/event-types.js",
 	"dist/src/events.js",
 	"dist/src/webhook.js",
+	"dist/src/native-calls.js",
 	"src/index.omp.ts",
 	"LICENSE",
 ];

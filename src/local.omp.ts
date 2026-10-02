@@ -11,11 +11,13 @@ import {
 	MAX_HISTORY_ENTRIES,
 } from "./history.ts";
 import type {
+	ExecutionWait,
 	SessionInput,
 	SessionInspection,
 	SessionListItem,
 	SessionToolResult,
 } from "./ipc.ts";
+import { nativeCallsSchema } from "./native-calls.ts";
 import { type ResourceDescriptor, resourceDescriptors } from "./resources.ts";
 import type { ToolInput } from "./tools.ts";
 
@@ -29,14 +31,17 @@ export interface RemoteCallResult {
 	cwd: string;
 	inputs: SessionInput[];
 	toolResults: SessionToolResult[];
+	execution?: ExecutionWait;
 }
 
-export interface RemoteChatResult {
+export type RemoteChatResult = {
 	sessionId: string;
 	cwd: string;
 	inputs: SessionInput[];
-	message: AssistantMessage;
-}
+} & (
+	| { message: AssistantMessage; execution?: never }
+	| { execution: ExecutionWait; message?: never }
+);
 
 export interface OmpCollaborationSession {
 	sessions(
@@ -84,15 +89,7 @@ const operationId = z
 const callInput = z.object({
 	sessionId: z.string().min(1),
 	operationId,
-	calls: z
-		.array(
-			z.object({
-				name: z.string().min(1),
-				arguments: z.record(z.string(), z.json()),
-			}),
-		)
-		.min(1)
-		.max(128),
+	calls: nativeCallsSchema,
 });
 const chatInput = z.object({
 	sessionId: z.string().min(1),
@@ -307,7 +304,18 @@ export function createOmpCollaborationTools(
 					);
 				return {
 					...native,
-					content: [...native.content, ...inputContent(result.inputs)],
+					content: [
+						...(result.execution
+							? [
+									{
+										type: "text" as const,
+										text: JSON.stringify({ execution: result.execution }),
+									},
+								]
+							: []),
+						...native.content,
+						...inputContent(result.inputs),
+					],
 				};
 			},
 		),
@@ -327,9 +335,13 @@ export function createOmpCollaborationTools(
 					content: [
 						{
 							type: "text",
-							text: JSON.stringify({ sessionId, cwd: result.cwd }),
+							text: JSON.stringify({
+								sessionId,
+								cwd: result.cwd,
+								...(result.execution ? { execution: result.execution } : {}),
+							}),
 						},
-						...nativeContent(result.message.content),
+						...(result.message ? nativeContent(result.message.content) : []),
 						...inputContent(result.inputs),
 					],
 				};
