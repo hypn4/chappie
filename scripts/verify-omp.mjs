@@ -123,13 +123,53 @@ export default async function probe(api) {
 }
 `,
 );
-let broker = new Broker(agent, { callWaitMs: 1000 });
+let broker = new Broker(agent, {
+	callWaitMs: Number(process.env.CHAPPIE_VERIFY_CALL_WAIT_MS ?? 1000),
+});
 const controller = new AbortController();
 const timer = setTimeout(
 	() => controller.abort(new Error("OMP integration test timed out")),
 	25000,
 );
 const signal = controller.signal;
+
+// Assertions that require effects must follow a yielded call to its result.
+// Keep the dedicated bounded-call probe below unwrapped to test the early return.
+async function completedCall(...args) {
+	const response = await broker.call(...args);
+	if (response.replay) return response;
+	if (!response.operation) {
+		assert.equal(response.toolResults.length, args[2].length);
+		return response;
+	}
+	const [chatId] = args;
+	const id = response.operation.operationId;
+	let observed = broker.operation(chatId, id);
+	while (
+		observed.operation.status === "running" ||
+		(observed.operation.status === "completed" && !observed.result)
+	) {
+		signal.throwIfAborted();
+		await delay(20);
+		observed = broker.operation(chatId, id);
+	}
+	assert.equal(
+		observed.operation.status,
+		"completed",
+		JSON.stringify(observed.operation),
+	);
+	assert.ok(
+		observed.result,
+		"Completed native work must have a retained result",
+	);
+	assert.equal(observed.result.toolResults.length, args[2].length);
+	await broker.acknowledge(observed.deliveries, [], signal);
+	return {
+		...response,
+		toolResults: observed.result.toolResults,
+		...(observed.result.work ? { work: observed.result.work } : {}),
+	};
+}
 const commonArgs = [
 	"--mode",
 	"rpc",
@@ -201,7 +241,7 @@ try {
 	assert.ok(
 		definitions.tools.every((tool) => tool.parameters && !tool.schemaError),
 	);
-	const read = await broker.call(
+	const read = await completedCall(
 		"integration-chat",
 		session.id,
 		[{ name: "read", arguments: { path: "fixture.txt:2+1" } }],
@@ -219,7 +259,7 @@ try {
 	// Native OMP may include surrounding lines to provide an anchored preview.
 	const anchor = text.match(/\[([^\]]+#\w{4})\]/)?.[1];
 	assert.ok(anchor, "Native read must return a file snapshot anchor");
-	const edit = await broker.call(
+	const edit = await completedCall(
 		"integration-chat",
 		session.id,
 		[
@@ -317,7 +357,7 @@ try {
 			arguments: { operationId: "integration-export", paths: ["fixture.txt"] },
 		},
 	];
-	const exported = await broker.call(
+	const exported = await completedCall(
 		"integration-chat",
 		session.id,
 		calls,
@@ -338,7 +378,7 @@ try {
 		"Alpha\nBeta edited\nGamma\n",
 	);
 	for (let index = 0; index < 3; index++) {
-		const replay = await broker.call(
+		const replay = await completedCall(
 			"integration-chat",
 			session.id,
 			calls,
@@ -375,7 +415,7 @@ try {
 			},
 		},
 	];
-	const recovered = await broker.call(
+	const recovered = await completedCall(
 		"integration-chat",
 		session.id,
 		recoveryCalls,
@@ -396,7 +436,7 @@ try {
 		).toString(),
 		"Alpha\nBeta edited\nGamma\n",
 	);
-	const recoveredReplay = await broker.call(
+	const recoveredReplay = await completedCall(
 		"integration-chat",
 		session.id,
 		recoveryCalls,
@@ -421,7 +461,7 @@ try {
 		],
 		["todo-read", { name: "read", arguments: { path: "fixture.txt" } }],
 	]) {
-		const result = await broker.call(
+		const result = await completedCall(
 			"integration-chat",
 			session.id,
 			[call],
@@ -455,7 +495,7 @@ try {
 		signal,
 	);
 	// Read-after-stop exercises the real automatic continuation, not a fake task.
-	const resumed = await broker.call(
+	const resumed = await completedCall(
 		"integration-chat",
 		session.id,
 		[{ name: "read", arguments: { path: "fixture.txt" } }],
@@ -464,7 +504,7 @@ try {
 	);
 	assert.ok(resumed.toolResults.every((item) => !item.isError));
 	assert.equal(await readFile(reminderFile, "utf8"), "seen");
-	const completedTodo = await broker.call(
+	const completedTodo = await completedCall(
 		"integration-chat",
 		session.id,
 		[{ name: "todo", arguments: { op: "done", task: todoName } }],
@@ -484,7 +524,7 @@ try {
 		"progress",
 	);
 	assert.equal(nextReport.progress, true);
-	const finalTodo = await broker.call(
+	const finalTodo = await completedCall(
 		"integration-chat",
 		session.id,
 		[{ name: "todo", arguments: { op: "done", task: nextTodoName } }],
@@ -509,7 +549,7 @@ try {
 	}
 	const reconnected = broker.listSessions()[0];
 	assert.equal(reconnected.id, session.id);
-	const firstAfterReconnect = await broker.call(
+	const firstAfterReconnect = await completedCall(
 		"integration-chat",
 		reconnected.id,
 		[{ name: "read", arguments: { path: "fixture.txt" } }],
@@ -531,7 +571,7 @@ try {
 		() => broker.listSessions(),
 		signal,
 	);
-	const primed = await broker.call(
+	const primed = await completedCall(
 		"resume-integration-chat",
 		persisted.id,
 		[{ name: "read", arguments: { path: "fixture.txt" } }],
@@ -548,7 +588,7 @@ try {
 		signal,
 		persisted.id,
 	);
-	const firstAfterSessionResume = await broker.call(
+	const firstAfterSessionResume = await completedCall(
 		"resume-integration-chat",
 		restored.id,
 		[{ name: "read", arguments: { path: "fixture.txt" } }],
