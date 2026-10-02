@@ -2,8 +2,6 @@ import { randomUUID } from "node:crypto";
 import { type Activity, chatLabel, source } from "./activity.ts";
 import { readConfig } from "./config.ts";
 import type { DeliveryRecord } from "./delivery.ts";
-import type { OperationEventName } from "./event-types.ts";
-import { EventService, type WebhookTransport } from "./events.ts";
 import { type HistoryRange, historyInstructions } from "./history.ts";
 import {
 	type BrokerMessage,
@@ -88,12 +86,14 @@ export interface Initialization {
 	instructions: string;
 }
 
-export interface InitializedSession extends Omit<SessionInspection, "tools"> {
+export interface InitializedSession
+	extends Omit<SessionInspection, "tools" | "skills"> {
 	selection: "existing" | "explicit" | "automatic";
 	initialization?: Initialization;
 	globalAgents?: { path: string };
 	inputs: SessionInput[];
 	tools: { name: string; description: string }[];
+	skills: { name: string; description?: string; uri: string }[];
 }
 
 export interface InspectedSession extends SessionInspection {
@@ -136,7 +136,13 @@ interface InFlightOperation {
 export interface BrokerOptions {
 	sessionWaitMs?: number;
 	inspectionTimeoutMs?: number;
-	webhookTransport?: WebhookTransport;
+}
+
+const INIT_SUMMARY_CHARS = 512;
+
+function compactSummary(value: string | undefined): string | undefined {
+	if (!value) return undefined;
+	return value.split("\n", 1)[0]?.slice(0, INIT_SUMMARY_CHARS);
 }
 
 export class Broker {
@@ -145,7 +151,6 @@ export class Broker {
 	readonly #inspectionTimeoutMs: number;
 	readonly #ipc: IpcServer;
 	readonly #state: State;
-	readonly #events: EventService;
 	readonly #sessions = new Map<string, RegisteredSession>();
 	// Pending automatic selections, keyed by chat so retries do not take a second slot.
 	readonly #selectionReservations = new Map<string, string>();
@@ -168,7 +173,6 @@ export class Broker {
 		this.#inspectionTimeoutMs = options.inspectionTimeoutMs ?? 3000;
 		this.#agentDir = agentDir;
 		this.#state = new State(agentDir);
-		this.#events = new EventService(this.#state, options.webhookTransport);
 		this.#ipc = new IpcServer(
 			agentDir,
 			(peer, message) => this.#receive(peer, message),
@@ -186,11 +190,9 @@ export class Broker {
 			...(config.tls ? { tls: config.tls } : {}),
 			...(config.listenHost ? { host: config.listenHost } : {}),
 		});
-		this.#events.start();
 	}
 
 	async close(): Promise<void> {
-		await this.#events.close();
 		const error = new Error("Chappie broker ended");
 		for (const operation of this.#detachedOperations.values())
 			operation.controller.abort(error);
@@ -254,16 +256,23 @@ export class Broker {
 				target,
 				signal,
 			);
-			if (initialization?.mode !== "observer")
-				await this.#ackInputs(target, inputs, signal);
 			return {
 				selection,
 				...(initialization ? { initialization } : {}),
-				...inspection,
+				session: inspection.session,
 				tools: inspection.tools.map(({ name, description }) => ({
 					name,
-					description: description.split("\n", 1)[0] ?? description,
+					description: compactSummary(description) ?? "",
 				})),
+				skills: inspection.skills.map(({ name, description }) => {
+					const skillName = name.startsWith("skill:") ? name.slice(6) : name;
+					const summary = compactSummary(description);
+					return {
+						name: skillName,
+						...(summary ? { description: summary } : {}),
+						uri: `skill://${skillName}`,
+					};
+				}),
 				inputs: initialization?.mode === "observer" ? [] : inputs,
 				...(globalAgents ? { globalAgents } : {}),
 			};
@@ -357,13 +366,11 @@ export class Broker {
 				}
 				await this.#state.finishOperation(identity?.key, "completed");
 				if ("message" in result) {
-					const inputs = result.inputs;
-					await this.#ackInputs(target, inputs, operationSignal);
 					await this.#confirmBindingUse(chatId, sessionId, target);
 					return {
 						sessionId: target,
 						cwd: result.cwd,
-						inputs,
+						inputs: result.inputs,
 						...(initialization ? { initialization } : {}),
 					};
 				}
@@ -395,7 +402,6 @@ export class Broker {
 					`Native tools are not active: ${missing.join(", ")}. Refresh the session tool catalog.`,
 				);
 		}
-		await this.#ackInputs(target, inputs, signal);
 		await this.#confirmBindingUse(chatId, sessionId, target);
 		return {
 			...inspection,
@@ -493,7 +499,6 @@ export class Broker {
 							resourceDescriptors(result.details),
 						),
 					);
-					await this.#ackInputs(target, result.inputs, operationSignal);
 					await this.#confirmBindingUse(chatId, sessionId, target);
 					return {
 						sessionId: target,
@@ -706,40 +711,6 @@ export class Broker {
 		);
 	}
 
-	async subscribeOperationEvent(
-		chatId: string,
-		name: OperationEventName,
-		operationId: string,
-		url: string,
-		secret: string,
-		ttlMs?: number | null,
-		signal?: AbortSignal,
-	) {
-		return await this.#events.subscribe({
-			chatId,
-			name,
-			operationId,
-			url,
-			secret,
-			...(ttlMs !== undefined ? { ttlMs } : {}),
-			...(signal ? { signal } : {}),
-		});
-	}
-
-	async unsubscribeOperationEvent(
-		chatId: string,
-		name: OperationEventName,
-		operationId: string,
-		url: string,
-	): Promise<void> {
-		await this.#events.unsubscribe({
-			chatId,
-			name,
-			operationId,
-			url,
-		});
-	}
-
 	async cancelOperation(
 		chatId: string,
 		operationId: string,
@@ -804,6 +775,13 @@ export class Broker {
 			return { sessionId: target, ...result };
 		}
 		throw new Error("OMP session returned no history");
+	}
+
+	async acknowledgeInputs(
+		sessionId: string,
+		inputs: SessionInput[],
+	): Promise<void> {
+		await this.#ackInputs(sessionId, inputs);
 	}
 
 	async inputs(
@@ -1397,9 +1375,9 @@ export class Broker {
 	async #ackInputs(
 		sessionId: string,
 		inputs: SessionInput[],
-		signal: AbortSignal,
+		signal?: AbortSignal,
 	): Promise<void> {
-		signal.throwIfAborted();
+		signal?.throwIfAborted();
 		if (inputs.length === 0) return;
 		const session = this.#sessions.get(sessionId);
 		if (!session) throw new Error(`OMP session ${sessionId} is offline`);

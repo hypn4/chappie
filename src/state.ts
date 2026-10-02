@@ -2,13 +2,6 @@ import { readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import * as z from "zod";
 import type { DeliveryRecord } from "./delivery.ts";
-import {
-	type EventRecord,
-	type EventSubscription,
-	eventRecordSchema,
-	eventSubscriptionSchema,
-	operationEvent,
-} from "./event-types.ts";
 import type { ModelInput } from "./ipc.ts";
 import { deliverySchema, modelInputSchema } from "./ipc-schema.ts";
 import type { OperationReceipt } from "./operations.ts";
@@ -44,7 +37,8 @@ export interface BindingMutation {
 	previous?: z.infer<typeof bindingRecordSchema>;
 }
 const MAX_STATE_BYTES = 32 * 1024 * 1024;
-const RESULT_RETENTION_MS = 24 * 60 * 60 * 1000;
+const TERMINAL_RETENTION_MS = 24 * 60 * 60 * 1000;
+const RESULT_RETENTION_MS = TERMINAL_RETENTION_MS;
 const stateSchema = z.strictObject({
 	bindings: z.record(z.string(), bindingRecordSchema).optional(),
 	deliveries: z.array(deliverySchema).max(2048).optional(),
@@ -96,8 +90,6 @@ const stateSchema = z.strictObject({
 		.array(z.tuple([z.string(), z.number().nonnegative()]))
 		.max(4096)
 		.optional(),
-	eventSubscriptions: z.array(eventSubscriptionSchema).max(2048).optional(),
-	eventOutbox: z.array(eventRecordSchema).max(8192).optional(),
 });
 
 export class State {
@@ -111,22 +103,14 @@ export class State {
 	#writes = Promise.resolve();
 	readonly #operationResults = new Map<string, DeliveryRecord>();
 	readonly #pendingBindings = new Map<string, number>();
-	readonly #eventSubscriptions = new Map<string, EventSubscription>();
-	readonly #eventOutbox = new Map<string, EventRecord>();
 	#acknowledgements = Promise.resolve();
 	#nextBindingRevision = 1;
-	readonly #eventListeners = new Set<() => void>();
 	#writeError: unknown;
 	#writeRevision = 0;
 
 	constructor(agentDir: string) {
 		this.#path = join(agentDir, "chappie.state.json");
 		this.#temporaryPath = `${this.#path}.tmp`;
-	}
-
-	onEventsPending(listener: () => void): () => void {
-		this.#eventListeners.add(listener);
-		return () => this.#eventListeners.delete(listener);
 	}
 
 	async load(): Promise<void> {
@@ -139,7 +123,20 @@ export class State {
 		}
 		if (Buffer.byteLength(contents) > MAX_STATE_BYTES)
 			throw new Error("Chappie state exceeds the 32 MiB limit");
-		const state = stateSchema.parse(JSON.parse(contents));
+		let persisted: unknown = JSON.parse(contents);
+		if (
+			persisted &&
+			typeof persisted === "object" &&
+			!Array.isArray(persisted)
+		) {
+			const {
+				eventSubscriptions: _eventSubscriptions,
+				eventOutbox: _eventOutbox,
+				...current
+			} = persisted as Record<string, unknown>;
+			persisted = current;
+		}
+		const state = stateSchema.parse(persisted);
 		const loadedAt = Date.now();
 		for (const [chatId, persisted] of Object.entries(state.bindings ?? {})) {
 			this.#bindings.set(chatId, {
@@ -167,15 +164,10 @@ export class State {
 			if (receipt.status === "running") receipt.status = "uncertain";
 			this.#operations.set(receipt.key, receipt);
 		}
+		const operationsChanged = this.#pruneOperations(loadedAt);
 		for (const [id, time] of state.deliveredIds ?? [])
 			this.#deliveredIds.set(id, time);
-		for (const subscription of state.eventSubscriptions ?? []) {
-			this.#eventSubscriptions.set(subscription.id, subscription);
-		}
-		for (const event of state.eventOutbox ?? []) {
-			this.#eventOutbox.set(event.eventId, event);
-		}
-		if (bindingsChanged) await this.#save();
+		if (bindingsChanged || operationsChanged) await this.#save();
 	}
 
 	ownsOperation(
@@ -228,17 +220,7 @@ export class State {
 			}
 			return undefined;
 		}
-		const cutoff = Date.now() - 24 * 60 * 60 * 1000;
-		for (const [key, value] of this.#operations) {
-			if (
-				!value.operationId &&
-				(value.status === "completed" ||
-					value.status === "failed" ||
-					value.status === "cancelled") &&
-				value.updatedAt < cutoff
-			)
-				this.#operations.delete(key);
-		}
+		this.#pruneOperations();
 		if (this.#operations.size >= 16384)
 			throw new Error(
 				"Operation receipt limit reached; reconcile pending work before retrying",
@@ -316,8 +298,6 @@ export class State {
 			if (error) receipt.error = error.slice(0, 64 * 1024);
 			else if (status === "completed") delete receipt.error;
 		}
-		// The terminal transition and all matching outbox entries share one snapshot.
-		this.#queueOperationEvents(receipt);
 		await this.#save();
 	}
 
@@ -367,133 +347,6 @@ export class State {
 		const receipt = this.operation(chatId, operationId);
 		const retained = this.#operationResults.get(receipt.key);
 		return retained ? structuredClone(retained) : undefined;
-	}
-
-	eventSubscription(id: string): EventSubscription | undefined {
-		const value = this.#eventSubscriptions.get(id);
-		return value ? structuredClone(value) : undefined;
-	}
-
-	async upsertEventSubscription(
-		subscription: EventSubscription,
-	): Promise<void> {
-		const previous = this.#eventSubscriptions.get(subscription.id);
-		if (!previous && this.#eventSubscriptions.size >= 2048)
-			throw new Error("Event subscription limit reached");
-		if (previous && previous.chatId !== subscription.chatId)
-			throw new Error("Event subscription belongs to another conversation");
-		const next = eventSubscriptionSchema.parse({
-			...subscription,
-			...(previous?.eventId
-				? {
-						eventId: previous.eventId,
-						deliveryStatus: previous.deliveryStatus,
-						deliveryError: previous.deliveryError,
-					}
-				: {}),
-		});
-		this.#eventSubscriptions.set(next.id, next);
-		const receipt = [...this.#operations.values()].find(
-			(value) =>
-				value.chatId === next.chatId && value.operationId === next.operationId,
-		);
-		const event = receipt ? operationEvent(next, receipt) : undefined;
-		if (event) this.#queueSubscriptionEvent(next, event);
-		try {
-			await this.#save();
-		} catch (error) {
-			if (this.#eventSubscriptions.get(next.id) === next) {
-				if (previous) this.#eventSubscriptions.set(next.id, previous);
-				else this.#eventSubscriptions.delete(next.id);
-				if (event) this.#eventOutbox.delete(event.eventId);
-			}
-			throw error;
-		}
-	}
-
-	async removeEventSubscription(id: string, chatId: string): Promise<void> {
-		const subscription = this.#eventSubscriptions.get(id);
-		if (subscription && subscription.chatId !== chatId)
-			throw new Error("Event subscription belongs to another conversation");
-		this.#eventSubscriptions.delete(id);
-		for (const [eventId, event] of this.#eventOutbox) {
-			if (event.subscriptionId === id) this.#eventOutbox.delete(eventId);
-		}
-		await this.#save();
-	}
-
-	#queueSubscriptionEvent(
-		subscription: EventSubscription,
-		event: EventRecord,
-	): void {
-		if (subscription.eventId === event.eventId) return;
-		if (this.#eventOutbox.size >= 8192)
-			throw new Error("Event outbox limit reached");
-		subscription.eventId = event.eventId;
-		subscription.deliveryStatus = "pending";
-		delete subscription.deliveryError;
-		this.#eventOutbox.set(event.eventId, event);
-	}
-
-	#queueOperationEvents(receipt: OperationReceipt): void {
-		for (const subscription of this.#eventSubscriptions.values()) {
-			const event = operationEvent(subscription, receipt);
-			if (event) this.#queueSubscriptionEvent(subscription, event);
-		}
-	}
-
-	nextEvent(now: number): EventRecord | undefined {
-		let selected: EventRecord | undefined;
-		for (const event of this.#eventOutbox.values()) {
-			if (event.nextAttemptAt > now) continue;
-			if (
-				!selected ||
-				event.nextAttemptAt < selected.nextAttemptAt ||
-				(event.nextAttemptAt === selected.nextAttemptAt &&
-					event.eventId < selected.eventId)
-			)
-				selected = event;
-		}
-		return selected ? structuredClone(selected) : undefined;
-	}
-
-	nextEventTime(): number | undefined {
-		let next: number | undefined;
-		for (const event of this.#eventOutbox.values()) {
-			if (next === undefined || event.nextAttemptAt < next)
-				next = event.nextAttemptAt;
-		}
-		return next;
-	}
-
-	async rescheduleEvent(
-		eventId: string,
-		attempts: number,
-		nextAttemptAt: number,
-	): Promise<void> {
-		const existing = this.#eventOutbox.get(eventId);
-		if (!existing) return;
-		this.#eventOutbox.set(
-			eventId,
-			eventRecordSchema.parse({
-				...existing,
-				attempts,
-				nextAttemptAt,
-			}),
-		);
-		await this.#save();
-	}
-
-	async removeEvent(eventId: string, failure?: string): Promise<void> {
-		const event = this.#eventOutbox.get(eventId);
-		if (!event) return;
-		const subscription = this.#eventSubscriptions.get(event.subscriptionId);
-		if (subscription?.eventId === eventId) {
-			subscription.deliveryStatus = failure ? "failed" : "delivered";
-			if (failure) subscription.deliveryError = failure.slice(0, 256);
-		}
-		this.#eventOutbox.delete(eventId);
-		await this.#save();
 	}
 
 	binding(chatId: string): string | undefined {
@@ -773,14 +626,13 @@ export class State {
 		this.#writes = saved.catch((error) => {
 			if (revision === this.#writeRevision) this.#writeError = error;
 		});
-		return saved.then(() => {
-			for (const listener of this.#eventListeners) listener();
-		});
+		return saved;
 	}
 
 	#snapshot(): string {
 		const now = Date.now();
 		this.#pruneBindings(now);
+		this.#pruneOperations(now);
 		if (this.#bindings.size > MAX_BINDINGS)
 			throw new Error("Binding limit reached");
 		const bindings = Object.fromEntries(
@@ -801,15 +653,6 @@ export class State {
 					receipt.updatedAt >= now - RESULT_RETENTION_MS)
 			)
 				continue;
-			if (
-				receipt &&
-				[...this.#eventSubscriptions.values()].some(
-					(subscription) =>
-						subscription.chatId === receipt.chatId &&
-						subscription.operationId === receipt.operationId,
-				)
-			)
-				continue;
 			this.#operationResults.delete(key);
 		}
 		for (const [id, time] of this.#deliveredIds) {
@@ -817,14 +660,6 @@ export class State {
 		}
 		if (this.#deliveredIds.size > 4096)
 			throw new Error("Delivery receipt limit reached");
-		for (const [id, subscription] of this.#eventSubscriptions) {
-			if (subscription.expiresAt !== null && subscription.expiresAt <= now) {
-				this.#eventSubscriptions.delete(id);
-				for (const [eventId, event] of this.#eventOutbox) {
-					if (event.subscriptionId === id) this.#eventOutbox.delete(eventId);
-				}
-			}
-		}
 		const contents = `${JSON.stringify(
 			{
 				bindings,
@@ -835,8 +670,6 @@ export class State {
 				questions: [...this.#questions.values()],
 				operations: [...this.#operations.values()],
 				deliveredIds: [...this.#deliveredIds],
-				eventSubscriptions: [...this.#eventSubscriptions.values()],
-				eventOutbox: [...this.#eventOutbox.values()],
 			},
 			null,
 			2,
@@ -855,6 +688,24 @@ export class State {
 			if (binding.lastUsedAt >= cutoff) continue;
 			this.#bindings.delete(chatId);
 			changed = true;
+		}
+		return changed;
+	}
+
+	#pruneOperations(now = Date.now()): boolean {
+		const cutoff = now - TERMINAL_RETENTION_MS;
+		let changed = false;
+		for (const [key, receipt] of this.#operations) {
+			if (
+				(receipt.status === "completed" ||
+					receipt.status === "failed" ||
+					receipt.status === "cancelled") &&
+				receipt.updatedAt < cutoff
+			) {
+				this.#operations.delete(key);
+				this.#operationResults.delete(key);
+				changed = true;
+			}
 		}
 		return changed;
 	}

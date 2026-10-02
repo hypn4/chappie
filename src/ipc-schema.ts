@@ -91,7 +91,11 @@ const inspection = z.strictObject({
 		.max(4096),
 	skills: z
 		.array(
-			z.looseObject({ name, source: z.enum(["extension", "prompt", "skill"]) }),
+			z.looseObject({
+				name,
+				description: text.optional(),
+				source: z.enum(["extension", "prompt", "skill"]),
+			}),
 		)
 		.max(4096),
 });

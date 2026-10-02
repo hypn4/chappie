@@ -24,9 +24,6 @@ const required = [
 	"dist/src/index.omp.js",
 	"dist/src/instructions.md",
 	"dist/src/question.html",
-	"dist/src/event-types.js",
-	"dist/src/events.js",
-	"dist/src/webhook.js",
 	"dist/src/native-calls.js",
 	"src/index.omp.ts",
 	"LICENSE",
@@ -93,16 +90,24 @@ export async function inspectPackage(archive) {
 		...pkg.devDependencies,
 	}))
 		assert.ok(
-			!key.startsWith("@earendil-works/") && key !== "typebox",
-			`Retired host dependency: ${key}`,
+			!key.startsWith("@earendil-works/") &&
+				key !== "typebox" &&
+				key !== "standardwebhooks",
+			`Retired dependency: ${key}`,
 		);
 	for (const removed of [
 		"src/index.ts",
 		"src/provider.ts",
 		"src/host-tools.ts",
+		"src/event-types.ts",
+		"src/events.ts",
+		"src/webhook.ts",
 		"dist/src/index.js",
 		"dist/src/provider.js",
 		"dist/src/host-tools.js",
+		"dist/src/event-types.js",
+		"dist/src/events.js",
+		"dist/src/webhook.js",
 	])
 		assert.ok(
 			!files.includes(`package/${removed}`),

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 import { mcpFixture } from "./helpers/mcp-fixture.ts";
 import { sessionFixture } from "./helpers/session-fixture.ts";
@@ -153,6 +154,101 @@ test("discovery follows active OMP definitions without a hardcoded tool list or 
 		f.controller.signal,
 	);
 	assert.equal(refreshed.tools[0]?.description, native.description);
+});
+
+test("Chat init exposes compact OMP skill discovery without filesystem metadata", async (t) => {
+	const f = await sessionFixture(t);
+	t.mock.method(f.api, "getCommands", () => [
+		{
+			name: "skill:codebase-memory",
+			description: "Use the codebase graph.\nLong internal guidance.",
+			source: "skill",
+			path: "/private/cache/codebase-memory/SKILL.md",
+		},
+		{
+			name: "skill:superpowers/brainstorming",
+			description: "Design before implementation.",
+			source: "skill",
+			path: "/private/cache/brainstorming/SKILL.md",
+		},
+	]);
+	const initialized = await f.broker.initialize(
+		"test-chat",
+		"A",
+		"skills-shortlist",
+		f.controller.signal,
+	);
+	assert.deepEqual(initialized.skills, [
+		{
+			name: "codebase-memory",
+			description: "Use the codebase graph.",
+			uri: "skill://codebase-memory",
+		},
+		{
+			name: "superpowers/brainstorming",
+			description: "Design before implementation.",
+			uri: "skill://superpowers/brainstorming",
+		},
+	]);
+	assert.doesNotMatch(
+		JSON.stringify(initialized),
+		/\/private\/cache|SKILL\.md/,
+	);
+});
+
+test("Chat init bounds pathological single-line tool and Skill summaries", async (t) => {
+	const f = await sessionFixture(t);
+	const huge = "x".repeat(1024 * 1024);
+	t.mock.method(f.api, "getActiveTools", () => ["huge"]);
+	t.mock.method(f.api, "getAllTools", () => [
+		{
+			name: "huge",
+			description: huge,
+			parameters: { type: "object", properties: {} },
+		},
+	]);
+	t.mock.method(f.api, "getCommands", () => [
+		{ name: "skill:huge", description: huge, source: "skill" },
+	]);
+	const initialized = await f.broker.initialize(
+		"test-chat",
+		"A",
+		"bounded-shortlist",
+		f.controller.signal,
+	);
+	assert.ok((initialized.tools[0]?.description.length ?? Infinity) <= 512);
+	assert.ok((initialized.skills[0]?.description?.length ?? Infinity) <= 512);
+	assert.ok(JSON.stringify(initialized).length < 16 * 1024);
+});
+
+test("bridge metadata teaches progressive native discovery and dependency-aware batches", async (t) => {
+	const f = await mcpFixture(t);
+	const catalog = await f.request("tools/list", {});
+	const tools = catalog.tools as Array<{ name: string; description?: string }>;
+	const description = (name: string) =>
+		tools.find((tool) => tool.name === name)?.description ?? "";
+	assert.match(description("init"), /shortlist/i);
+	assert.match(description("init"), /Skill/i);
+	assert.match(description("tools"), /first use/i);
+	assert.match(description("tools"), /reuse/i);
+	assert.match(description("tools"), /MCP/i);
+	assert.match(description("call"), /arguments are already known/i);
+	assert.match(description("call"), /depends on an earlier result/i);
+});
+
+test("controller instructions keep Skills and MCPs first-class without eager loading", async () => {
+	const instructions = await readFile(
+		new URL("../src/instructions.md", import.meta.url),
+		"utf8",
+	);
+	assert.match(instructions, /skills guide workflows/i);
+	assert.match(instructions, /read only task-relevant skills/i);
+	assert.match(instructions, /skill:\/\//i);
+	assert.match(instructions, /registered OMP MCP tools.*first-class/i);
+	assert.match(instructions, /specialized.*MCP/i);
+	assert.match(instructions, /shortlist, not an argument contract/i);
+	assert.match(instructions, /native definitions remain authoritative/i);
+	assert.match(instructions, /do not preload unrelated skills/i);
 });
 
 test("MCP call and chat expose a model-input wait as unexecuted, not successful completion", async (t) => {

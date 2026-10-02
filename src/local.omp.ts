@@ -254,7 +254,7 @@ export function createOmpCollaborationTools(
 		),
 		nativeTool(
 			"remote_tools",
-			"Read native tool definitions from a connected Chappie session.",
+			"Read current native tool definitions from a connected Chappie session. Request specific names when known; reuse definitions while that target session and toolset are unchanged.",
 			toolsInput,
 			async ({ sessionId, names }, signal) => {
 				const result = await session.tools(sessionId, names, signal);
@@ -278,7 +278,7 @@ export function createOmpCollaborationTools(
 		),
 		nativeTool(
 			"remote_call",
-			"Execute one native tool batch in a connected Chappie session. Reuse operationId only when retrying the same operation.",
+			"Execute one discovered native tool batch in a connected Chappie session. Batch only calls whose arguments are already known; use a later batch when an argument depends on an earlier result. Reuse operationId only when retrying the same operation.",
 			callInput,
 			async ({ sessionId, operationId, calls }, signal) => {
 				const result = await session.remoteCall(

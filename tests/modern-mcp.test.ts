@@ -12,15 +12,6 @@ const operation = {
 	updatedAt: Date.now(),
 	status: "running",
 };
-const eventParams = {
-	name: "operation.finished",
-	arguments: { operation_id: "long-op" },
-	delivery: {
-		mode: "webhook",
-		url: "https://events.example.test/callback",
-		secret: `whsec_${Buffer.alloc(32, 1).toString("base64")}`,
-	},
-};
 function record(value: unknown): Record<string, unknown> {
 	assert.ok(value && typeof value === "object" && !Array.isArray(value));
 	return value as Record<string, unknown>;
@@ -40,8 +31,6 @@ async function fixture(
 				throw new Error("Operation not found");
 			return { operation, deliveries: [] };
 		},
-		subscribeOperationEvent: async () => ({ id: "sub_test", expiresAt: null }),
-		unsubscribeOperationEvent: async () => {},
 		...overrides,
 	} as unknown as Broker;
 	const pending = new Map<number, (message: JSONRPCMessage) => void>();
@@ -112,17 +101,16 @@ function resultOf(message: JSONRPCMessage) {
 	return record(message.result);
 }
 
-test("modern discovery advertises Events without nonfunctional Tasks support", async (t) => {
+test("modern discovery stays tool-only for Chat and does not serve Events", async (t) => {
 	const f = await fixture(t);
 	const discovery = resultOf(await f.request("server/discover"));
 	assert.equal(discovery.resultType, "complete");
 	const capabilities = record(discovery.capabilities);
-	assert.deepEqual(capabilities.events, {});
+	assert.equal(capabilities.events, undefined);
 	assert.equal(capabilities.tasks, undefined);
 	assert.equal(capabilities.extensions, undefined);
-	const events = resultOf(await f.request("events/list"));
-	assert.ok(Array.isArray(events.events));
-	assert.equal(record(events.events[0]).name, "operation.finished");
+	const events = await f.request("events/list");
+	assert.ok("error" in events);
 });
 
 test("modern start_call returns supported durable operation output, not a fake Task", async (t) => {
@@ -159,51 +147,6 @@ test("modern operation retrieval requires the originating conversation", async (
 		}),
 	);
 	assert.notEqual(result.isError, true);
-});
-
-test("Events subscribe and unsubscribe follow the documented wire profile", async (t) => {
-	const f = await fixture(t);
-	const subscribed = resultOf(await f.request("events/subscribe", eventParams));
-	assert.equal(subscribed.id, "sub_test");
-	assert.equal(subscribed.cursor, null);
-	assert.equal(subscribed.refreshBefore, null);
-	assert.equal(subscribed.truncated, false);
-	const { secret: _secret, ...delivery } = eventParams.delivery;
-	const removed = resultOf(
-		await f.request("events/unsubscribe", { ...eventParams, delivery }),
-	);
-	assert.equal(removed.resultType, "complete");
-	const denied = await f.request(
-		"events/subscribe",
-		eventParams,
-		"another-chat",
-	);
-	assert.ok("error" in denied);
-});
-
-test("Events callback verification errors are protocol errors without secrets", async (t) => {
-	const f = await fixture(t, {
-		subscribeOperationEvent: async () => {
-			throw new Error("Webhook verification challenge mismatch");
-		},
-	});
-	const response = await f.request("events/subscribe", eventParams);
-	assert.ok("error" in response);
-	assert.equal(record(response.error).code, -32015);
-	assert.equal(record(record(response.error).data).reason, "challenge_failed");
-	assert.ok(!JSON.stringify(response).includes(eventParams.delivery.secret));
-});
-
-test("Events rejects unsupported delivery modes and replay cursors", async (t) => {
-	const f = await fixture(t);
-	for (const params of [
-		{ ...eventParams, cursor: "unsupported" },
-		{ ...eventParams, delivery: { mode: "poll" } },
-	]) {
-		const response = await f.request("events/subscribe", params);
-		assert.ok("error" in response);
-		assert.equal(record(response.error).code, -32602);
-	}
 });
 
 test("get_operation returns retained native output after pending delivery was acknowledged", async (t) => {
@@ -279,35 +222,4 @@ test("tool batches use one JSON contract and reject the removed Base64 alias", a
 		});
 		assert.ok("error" in rejected || resultOf(rejected).isError === true);
 	}
-});
-
-test("input-required event has its own discoverable and authorized subscription", async (t) => {
-	const calls: unknown[][] = [];
-	const f = await fixture(t, {
-		subscribeOperationEvent: async (...args: unknown[]) => {
-			calls.push(args);
-			return { id: "input-sub", expiresAt: null };
-		},
-		unsubscribeOperationEvent: async (...args: unknown[]) => {
-			calls.push(args);
-		},
-	});
-	const events = resultOf(await f.request("events/list")).events;
-	assert.ok(Array.isArray(events));
-	assert.deepEqual(
-		events.map((event) => record(event).name),
-		["operation.finished", "operation.input_required"],
-	);
-	const params = { ...eventParams, name: "operation.input_required" };
-	assert.equal(
-		resultOf(await f.request("events/subscribe", params)).id,
-		"input-sub",
-	);
-	assert.equal(calls[0]?.[1], params.name);
-	const { secret: _secret, ...delivery } = params.delivery;
-	resultOf(await f.request("events/unsubscribe", { ...params, delivery }));
-	assert.equal(calls[1]?.[1], params.name);
-	assert.ok(
-		"error" in (await f.request("events/subscribe", params, "another-chat")),
-	);
 });

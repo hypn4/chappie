@@ -5,17 +5,70 @@ import {
 	serveStdio,
 } from "@modelcontextprotocol/server/stdio";
 import { Broker } from "./broker.ts";
-import { createServer } from "./server.ts";
+import { createServer, type ResponseCommit } from "./server.ts";
 
 /** All callers, including protocol tests, use the same modern-only boundary. */
 export function serveMcp(
 	broker: Broker,
 	options: Pick<ServeStdioOptions, "transport" | "onerror"> = {},
 ) {
-	return serveStdio(() => createServer(broker), {
+	const transport = options.transport ?? new StdioServerTransport();
+	const commits = new Map<string | number, ResponseCommit[]>();
+	const stageResponseCommit = (
+		requestId: string | number,
+		commit: ResponseCommit,
+	) => {
+		const pending = commits.get(requestId) ?? [];
+		pending.push(commit);
+		commits.set(requestId, pending);
+	};
+	const originalSend = transport.send;
+	transport.send = async (message, sendOptions) => {
+		const responseId =
+			"id" in message &&
+			("result" in message || "error" in message) &&
+			(typeof message.id === "string" || typeof message.id === "number")
+				? message.id
+				: undefined;
+		let sent = false;
+		try {
+			await originalSend.call(transport, message, sendOptions);
+			sent = true;
+		} finally {
+			if (responseId !== undefined) {
+				const pending = commits.get(responseId) ?? [];
+				commits.delete(responseId);
+				if (sent) {
+					for (const commit of pending) {
+						try {
+							await commit();
+						} catch (error) {
+							try {
+								options.onerror?.(
+									error instanceof Error ? error : new Error(String(error)),
+								);
+							} catch {}
+						}
+					}
+				}
+			}
+		}
+	};
+	const handle = serveStdio(() => createServer(broker, stageResponseCommit), {
 		...options,
+		transport,
 		legacy: "reject",
 	});
+	return {
+		async close() {
+			commits.clear();
+			try {
+				await handle.close();
+			} finally {
+				transport.send = originalSend;
+			}
+		},
+	};
 }
 const terminationSignals =
 	process.platform === "win32"

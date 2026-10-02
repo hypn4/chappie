@@ -5,10 +5,10 @@ Legacy MCP handshakes and the standalone Pi host are not supported.
 
 | Tool | Purpose |
 |---|---|
-| `init` | Select this ChatGPT conversation's default OMP session and read its environment. |
+| `init` | Select this ChatGPT conversation's default OMP session and return compact native-tool and Skill shortlists. |
 | `history` | Read the current OMP branch with timestamps and entry IDs. |
 | `sessions` | List connected OMP sessions and the current default. |
-| `tools` | Read full definitions of active OMP tools for `call`. |
+| `tools` | Read current full definitions of selected active OMP tools, including registered MCP-backed tools. |
 | `chat` | Send an assistant message to OMP. |
 | `ask` | Create a persistent question in ChatGPT. |
 | `ask_assert` | Confirm that an `ask` widget loaded. |
@@ -55,13 +55,17 @@ History includes saved messages, tool calls and results, summaries, images, file
 
 The executing assistant uses `chat` to share progress and completion in OMP. When initialization directs an assistant to observe, it follows that work through `history` with `observer: true` and `wait: true`, thinks independently, and leaves the completion response to the original execution. Observers must not repeat exports or post a second completion response.
 
-## OMP tools
+## OMP Skills and tools
 
 ChatGPT truncates tool responses exceeding 10,000 tokens.
 
-`init` returns names and short descriptions of active OMP tools. Choose the capability appropriate to the task, then request only the full definitions needed with `tools({ names: [...] })`. Omit `names` only when the entire catalog is needed. A requested inactive name is an explicit error, not an empty success. Definitions are read from the current session on every discovery request, including extension-provided schemas and prompt guidelines; there is no broker-side native schema cache or duplicate read/bash/edit/write implementation.
+`init` returns two compact discovery catalogs. `tools` contains names and first-line descriptions of active OMP tools. `skills` contains normalized Skill names, first-line descriptions and stable `skill://` URIs; it never exposes filesystem paths or full Skill contents. Treat both as shortlists. When a Skill description materially matches the task, read only that task-relevant Skill through its URI before acting; do not preload unrelated Skills.
 
-Use `call` or `start_call` for every native coding tool. Chappie validates only the shared bounded JSON batch envelope; OMP owns each tool's arguments, validation, permissions and execution. `read` may use path selectors and `edit` may require hashline `input`: copy their current native definitions and anchors, not old examples. `transfer` remains directly exposed because ChatGPT supplies its file objects and handles exported resources. Unsupported schema conversion is reported as `schemaError`; never guess a replacement schema or encode a rejected command to change approval behavior.
+Before first use of a native tool whose full definition is not already available for the current session, request it with `tools({ names: [...] })`; request several candidate definitions together when choosing between tools. Registered OMP MCP tools appear in the same native catalog and are first-class capabilities. Prefer a specialized native/MCP capability over reproducing it with `bash`, `eval`, generic text search, manual HTTP calls, or a generic web path when the specialized integration materially matches the task. Explicit user/project instructions take precedence over Skill/tool guidance.
+
+Skills guide workflows; native definitions govern execution. Reuse a full definition while the target session and native toolset remain unchanged. Refresh after changing sessions/toolsets or after an unavailable/schema error. Definitions are read from the current session on every discovery request; there is no broker-side native schema cache. Never infer arguments from the shortlist, guess old aliases, or switch to a broader tool solely to bypass validation or approval.
+
+Use `call` or `start_call` for every native coding tool. Chappie validates only the bounded JSON batch envelope; OMP owns each tool's arguments, validation, permissions, anchors and execution. Batch only calls whose arguments are already known and belong to the same native turn. If a later call needs an earlier result (for example, discover a path, then read it, then edit using returned anchors), use separate `call` requests. Inspect every native result before continuing; `isError` or native failure details mean the batch did not fully succeed. `transfer` remains directly exposed because ChatGPT supplies its file objects and handles exported resources. Unsupported schema conversion is reported as `schemaError`; refresh the definition instead of guessing a replacement schema or encoding a rejected command.
 
 Chappie is a ChatGPT-controlled transport, not a general-purpose inference API.
 OMP provider requests must belong to a live session through its request hook and
@@ -97,7 +101,7 @@ OMP controls execution inside that batch. Separate requests run in order within 
 
 When OMP is waiting for a recognized compaction or branch-summary reply, a new `call` or ordinary `chat` returns `execution: { status: "needs_input", executed: false, reason: "model_request_pending" }` and the `modelRequest` input. The native `remote_call` and `remote_chat` relay paths preserve exactly the same nonterminal state; an empty tool-results list is not completion. Reply with `chat({ sessionId, replyTo: modelRequest, text })` (or native `remote_chat`), then retry only that unexecuted batch with its original identity and unchanged arguments. Calls queued before a model request begins receive the same feedback. Reading or acknowledging input does not discharge OMP's reply obligation.
 
-For `start_call`, this feedback persists as `waiting_input`; `get_operation` returns the saved model inputs. Subscribe to `operation.input_required` as well as `operation.finished` for event-driven continuation. Answer the current request and explicitly repeat the same `start_call` ID and arguments. Simultaneous identical retries dispatch one batch; conflicting arguments are rejected even during acceptance. A saved model input can be stale after a reply, reconnection, or session switch: inspect current `tools`/inputs before replying. A retry stays on its original session. Waiting emits only the input-required event, never a false completion.
+For `start_call`, this feedback persists as `waiting_input`; `get_operation` returns the saved model inputs. Answer the current request and explicitly repeat the same `start_call` ID and arguments. Simultaneous identical retries dispatch one batch; conflicting arguments are rejected even during acceptance. A saved model input can be stale after a reply, reconnection, or session switch: inspect current `tools`/inputs before replying. A retry stays on its original session.
 
 ### Long-running operations
 
@@ -122,29 +126,17 @@ Read the state later with:
 
 `get_operation` returns `running`, `waiting_input`, `completed`, `failed`, `cancelled`, or `uncertain`. `completed` means the native OMP batch returned, not that every result succeeded: inspect native `isError` and tool details. If a tool starts a separate background job or supervised process, use the host's native facilities to observe that child job. Batch completion is not child-job completion.
 
-Full detached results remain available through `get_operation` after their first deferred delivery is acknowledged. They are retained for at least 24 hours after completion and while an associated subscription remains active; execution receipts are kept separately to prevent re-execution after result expiry. Retained results are bounded to 2,048 entries and the complete state file to 32 MiB. A source resource reference does not make the broker the owner of its file bytes.
+Full detached results remain available through `get_operation` after their first pending delivery is acknowledged. Terminal operation receipts and retained results are kept for 24 hours after completion; within that window identical IDs prevent re-execution and conflicting arguments are rejected. After expiry the ID is no longer reserved, so retry recovery must happen within the retention window. Unresolved running, waiting_input and uncertain receipts are not evicted automatically. Retained results are bounded to 2,048 entries and the complete state file to 32 MiB. A source resource reference does not make the broker the owner of its file bytes.
 
 `cancel_operation` owns cancellation from the start of initial acceptance or a `waiting_input` reclaim, including while the receipt is being persisted. Cancellation before dispatch prevents later native execution. Cancelling a waiting operation does not abort its independent model request. Ending the original MCP request does not cancel accepted detached work. Cancellation cannot undo side effects or promise to stop independent child processes. Broker recovery marks interrupted running receipts `uncertain`; known-unexecuted waits stay resumable. Reconcile uncertain work rather than re-executing it.
 
 Do not send heartbeat or rapidly poll to extend a ChatGPT tool request. Detach the native batch, and use persistent process supervision separately when the process itself must survive the agent or broker exiting.
 
-### ChatGPT operation events
+### Chat continuation
 
-Chappie implements the [OpenAI MCP Events webhook profile](https://developers.openai.com/plugins/build/mcp-events), requiring MCP 2.0 (`2026-07-28`). `server/discover` advertises `events`; the same authenticated endpoint implements `events/list`, `events/subscribe`, and `events/unsubscribe`. Legacy protocol openings are rejected.
+Chappie targets ordinary ChatGPT Chat and does not advertise MCP Events or Tasks. The broker cannot proactively wake a Chat after the current turn ends. Long-running work therefore relies on durable operation receipts, retained results, pending delivery on later Chappie interactions, and explicit `get_operation`/`history` recovery.
 
-Both events filter by `{"operation_id":"<start_call operationId>"}`. `operation.finished` carries a bounded terminal-state summary; `operation.input_required` carries `waiting_input`, `wait_id`, and `input_count`, never the full model prompt. Subscribe to both for unattended workflows: completion alone cannot report an intermediate request for input. Event names are routed exactly as subscribed; the server never creates an unrequested subscription or sends input notifications under a completion name.
-
-Use `get_operation` after either event to read authoritative state. On an input notification, verify the operation is still waiting and refresh its current native model input before replying with `chat.replyTo`, then explicitly resume the same operation and arguments. A delayed event must not restart completed, cancelled, failed or uncertain work. Events may arrive out of order; `wait_id` identifies the input set and is not a `replyTo` ID.
-
-State transitions and their matching outbox entries share one persisted snapshot. First subscriptions observe the current matching state, including a wait that began before subscription. Retained per-subscription event markers deduplicate retries and refreshes; new model-request IDs generate a fresh input notification. A newer wait does not discard an older outbox entry awaiting delivery. HTTP delivery is **at least once**, not exactly once: retries retain the event ID. A `2xx` response acknowledges receipt, not ChatGPT processing.
-
-Callbacks require HTTPS, public destination validation on every connection, checked-address pinning with the original TLS hostname, and no redirects. Verification uses a signed random challenge. Standard Webhooks signatures cover exact serialized bytes; key replacement has a five-minute dual-signing window. Transient failures use bounded exponential retries with jitter. `410` stops the subscription; `413` and permanent failures are not retried and retain a delivery-failure record. The delivery pump runs only for pending events or scheduled retries, not as a heartbeat.
-
-Subscriptions default to 24 hours, grant at most 30 days for a finite `ttlMs`, and allow `ttlMs: null` without expiration. Expiry, unsubscribe, or loss of operation access stops delivery; an HTTP request whose bytes were already sent cannot be retracted. Callback secrets live only in the private host state file and must never be logged or committed.
-
-This is separate from the optional [MCP Tasks extension](https://tasks.extensions.modelcontextprotocol.io/specification/draft/tasks). The installed TypeScript SDK's actual protocol boundary rejected the attempted Tasks V2 methods/results. Chappie therefore does **not** advertise `io.modelcontextprotocol/tasks`, return a pretend Task handle, or bypass SDK validation. `start_call` is an application tool returning a normal supported MCP result; completion notification uses the documented ChatGPT Events path.
-
-After deployment, rescan the plugin and confirm both `operation.finished` and `operation.input_required`. Establish both authorized subscriptions in a supported ChatGPT host for an operation owned by that same conversation. A new conversation does not automatically own an earlier operation. Local protocol tests and callback success do not prove ChatGPT wake-up. Never invent callback URLs or signing secrets.
+If a detached operation reaches `waiting_input` after the initiating turn has ended, the next Chat interaction must retrieve the saved model input, answer it with `chat.replyTo`, and explicitly resume the unchanged operation. Never create heartbeat loops, webhook callbacks, or a new operation ID to simulate proactive continuation.
 
 `chat` creates a normal assistant message in OMP:
 
@@ -159,7 +151,7 @@ starting a normal OMP turn:
 { "text": "Compacted summary...", "replyTo": "<modelRequest-id>" }
 ```
 
-OMP user input consumed during the work accompanies later Chappie results, including images.
+OMP user input consumed during the work accompanies later Chappie results, including images. Pending OMP input, deferred results, and webpage answers are consumed only after the MCP response carrying them is successfully written to the transport. If that send fails, the same stable pending data remains available for a later Chappie response.
 
 If cancellation or a broken broker connection interrupts ordinary result delivery, late results can accompany a later response to the originating ChatGPT conversation. A broker restart reloads operation receipts, but an agent process exit cannot recover unfinished in-memory work automatically. Check history before retrying a state-changing operation. Use `start_call` for a native batch that may outlive one ChatGPT MCP request; use the environment's persistent process facilities when the underlying process itself must outlive the agent session.
 

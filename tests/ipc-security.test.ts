@@ -9,6 +9,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { Broker } from "../src/broker.ts";
 import { readConfig } from "../src/config.ts";
 import { ipcEndpoint, JsonLinePeer } from "../src/ipc.ts";
+import { validateSessionMessage } from "../src/ipc-schema.ts";
 import { until } from "./helpers/session-fixture.ts";
 
 async function fixture(t: TestContext) {
@@ -45,6 +46,37 @@ async function peer(t: TestContext, root: string) {
 		},
 	};
 }
+
+test("inspection validates optional Skill metadata at the IPC boundary", () => {
+	const message = {
+		type: "result" as const,
+		id: 1,
+		inspection: {
+			session: {
+				id: "A",
+				cwd: "/fixture",
+				device: "test",
+				host: "omp" as const,
+				status: "idle" as const,
+			},
+			tools: [],
+			skills: [
+				{ name: "skill:ok", source: "skill" as const, description: "ok" },
+			],
+		},
+		inputs: [],
+	};
+	assert.doesNotThrow(() => validateSessionMessage(message));
+	assert.throws(() =>
+		validateSessionMessage({
+			...message,
+			inspection: {
+				...message.inspection,
+				skills: [{ name: "skill:bad", source: "skill", description: 123 }],
+			},
+		}),
+	);
+});
 
 test("new agent directories are created before opening IPC", async (t) => {
 	const root = await fixture(t);

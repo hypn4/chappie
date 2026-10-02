@@ -1,23 +1,9 @@
 import { readFileSync } from "node:fs";
-import {
-	McpServer,
-	ProtocolError,
-	ProtocolErrorCode,
-	ResourceTemplate,
-} from "@modelcontextprotocol/server";
+import { McpServer, ResourceTemplate } from "@modelcontextprotocol/server";
 import * as z from "zod";
 import packageJson from "../package.json" with { type: "json" };
 import type { Broker } from "./broker.ts";
 import { deliveryContent } from "./delivery.ts";
-import {
-	EVENT_DEFINITIONS,
-	eventsListParamsSchema,
-	eventsListResultSchema,
-	eventsSubscribeParamsSchema,
-	eventsSubscribeResultSchema,
-	eventsUnsubscribeParamsSchema,
-	eventsUnsubscribeResultSchema,
-} from "./event-types.ts";
 import { historyInput } from "./history.ts";
 import { nativeCallsSchema } from "./native-calls.ts";
 import {
@@ -70,27 +56,25 @@ function toolAnnotations(name: string) {
 
 interface RequestContext {
 	mcpReq: {
+		id: string | number;
 		_meta?: Record<string, unknown>;
 		signal: AbortSignal;
 	};
 }
 
-function callbackEndpointError(error: unknown): ProtocolError {
-	const message = error instanceof Error ? error.message : String(error);
-	const lower = message.toLowerCase();
-	const reason = lower.includes("timeout")
-		? "timeout"
-		: lower.includes("challenge")
-			? "challenge_failed"
-			: lower.includes("https") || lower.includes("public")
-				? "invalid_url"
-				: "verification_failed";
-	return new ProtocolError(-32015, "Callback endpoint verification failed", {
-		reason,
-	});
-}
-export function createServer(broker: Broker): McpServer {
-	const capabilities = { tools: {}, events: {} };
+export type ResponseCommit = () => Promise<void>;
+export type StageResponseCommit = (
+	requestId: string | number,
+	commit: ResponseCommit,
+) => void;
+
+const committedSignal = new AbortController().signal;
+
+export function createServer(
+	broker: Broker,
+	stageResponseCommit: StageResponseCommit,
+): McpServer {
+	const capabilities = { tools: {} };
 	const server = new McpServer(
 		{
 			name: "chappie",
@@ -115,12 +99,30 @@ export function createServer(broker: Broker): McpServer {
 		};
 	}
 
+	function finish<
+		T extends { content: ReturnType<typeof toolResult>["content"] },
+	>(
+		context: RequestContext,
+		result: T,
+		deliverPending = true,
+		afterSend?: ResponseCommit,
+	) {
+		return finishResult(
+			broker,
+			stageResponseCommit,
+			context,
+			result,
+			deliverPending,
+			afterSend,
+		);
+	}
+
 	server.registerTool(
 		"init",
 		{
 			title: "Connect to OMP",
 			description:
-				"Select this chat's default OMP session and return its environment, tool catalog, and participation instructions. Use the task's sessionId to resume, or find it by cwd/name with sessions. For a task without a specified target, omit sessionId to reuse the default or select the first online, unbound session. Read recent history when resuming work.",
+				"Select this chat's default OMP session and return its environment, active native tool and Skill shortlists, and participation instructions. Tool shortlist entries are for capability selection only; use tools before first native use to obtain the current full definition. Read task-relevant Skills through their skill:// URI instead of preloading all Skill contents. Use the task's sessionId to resume, or find it by cwd/name with sessions. Read recent history when resuming work.",
 			outputSchema,
 			inputSchema: z.object({
 				sessionId: z
@@ -138,11 +140,13 @@ export function createServer(broker: Broker): McpServer {
 				context.mcpReq._meta?.["otunnel/requestId"],
 				context.mcpReq.signal,
 			);
-			return finishResult(
-				broker,
+			return finish(
 				context,
 				textResult(initialized, inputs),
 				initialized.initialization?.mode !== "observer",
+				initialized.initialization?.mode !== "observer" && inputs.length
+					? () => broker.acknowledgeInputs(initialized.session.id, inputs)
+					: undefined,
 			);
 		}),
 	);
@@ -181,8 +185,7 @@ export function createServer(broker: Broker): McpServer {
 				context.mcpReq.signal,
 				args.replyTo,
 			);
-			return finishResult(
-				broker,
+			return finish(
 				context,
 				toolResult(
 					[],
@@ -193,6 +196,10 @@ export function createServer(broker: Broker): McpServer {
 					result.replay,
 					result.execution,
 				),
+				true,
+				!result.execution && result.inputs.length
+					? () => broker.acknowledgeInputs(result.sessionId, result.inputs)
+					: undefined,
 			);
 		}),
 	);
@@ -224,7 +231,7 @@ export function createServer(broker: Broker): McpServer {
 					context.mcpReq._meta?.["otunnel/requestId"],
 					context.mcpReq.signal,
 				);
-				const result = await finishResult(broker, context, {
+				const result = await finish(context, {
 					content: [
 						...(initialization ? textResult({ initialization }).content : []),
 						{
@@ -258,7 +265,7 @@ export function createServer(broker: Broker): McpServer {
 					questionId,
 					context.mcpReq.signal,
 				);
-				const result = await finishResult(broker, context, {
+				const result = await finish(context, {
 					content: [{ type: "text", text: "Question widget loaded." }],
 				});
 				return {
@@ -339,7 +346,7 @@ export function createServer(broker: Broker): McpServer {
 		{
 			title: "OMP tools",
 			description:
-				"Discover current native OMP tool definitions for call and start_call. Choose names from init's short catalog and request only the definitions needed. Omit names only to inspect the entire active catalog.",
+				"Get current full definitions for selected active OMP tools, including registered MCP-backed tools. Before first use, request every candidate definition needed for the decision; reuse definitions while the session and native toolset are unchanged, and refresh after a session/toolset change or unavailable/schema error. Omit names only to inspect the entire active catalog.",
 			outputSchema,
 			inputSchema: z.object({
 				names: z
@@ -364,8 +371,7 @@ export function createServer(broker: Broker): McpServer {
 				context.mcpReq._meta?.["otunnel/requestId"],
 				context.mcpReq.signal,
 			);
-			return finishResult(
-				broker,
+			return finish(
 				context,
 				textResult(
 					{
@@ -377,6 +383,10 @@ export function createServer(broker: Broker): McpServer {
 					},
 					inputs,
 				),
+				true,
+				inputs.length
+					? () => broker.acknowledgeInputs(inspected.session.id, inputs)
+					: undefined,
 			);
 		}),
 	);
@@ -386,7 +396,7 @@ export function createServer(broker: Broker): McpServer {
 		{
 			title: "Call OMP tools",
 			description:
-				"Execute one native OMP batch with tool names and arguments from tools. Native schemas and validation belong to OMP. A pending model request returns needs_input/executed:false instead of running the batch.",
+				"Execute one discovered native OMP batch. Prefer the most specific native capability. Batch only calls whose arguments are already known; if a later call depends on an earlier result, use a separate call. Native schemas, routing guidance and validation belong to OMP. A pending model request returns needs_input/executed:false without running the batch.",
 			outputSchema,
 			inputSchema: z.strictObject({
 				calls: nativeCallsSchema,
@@ -402,8 +412,7 @@ export function createServer(broker: Broker): McpServer {
 				context.mcpReq._meta?.["otunnel/requestId"],
 				context.mcpReq.signal,
 			);
-			return finishResult(
-				broker,
+			return finish(
 				context,
 				toolResult(
 					result.toolResults,
@@ -414,6 +423,10 @@ export function createServer(broker: Broker): McpServer {
 					result.replay,
 					result.execution,
 				),
+				true,
+				!result.execution && result.inputs.length
+					? () => broker.acknowledgeInputs(result.sessionId, result.inputs)
+					: undefined,
 			);
 		}),
 	);
@@ -423,7 +436,7 @@ export function createServer(broker: Broker): McpServer {
 		{
 			title: "Start long OMP tool batch",
 			description:
-				"Start a discovered native OMP batch independently of this MCP request. Returns durable operation status, not an MCP Tasks handle. Use get_operation or an authorized operation.finished subscription. Reuse the same operationId and arguments; explicitly resume waiting_input only after handling its model request.",
+				"Start one discovered native OMP batch independently of this MCP request. Apply the same discovery and batching rules as call: use current full definitions, and do not batch calls whose arguments depend on earlier results. Returns durable operation status. Use get_operation or a later Chappie interaction to recover status and retained results. Reuse the same operationId and arguments; explicitly resume waiting_input only after handling its model request.",
 			outputSchema,
 			inputSchema: z.strictObject({
 				operationId: z
@@ -449,8 +462,7 @@ export function createServer(broker: Broker): McpServer {
 				context.mcpReq._meta?.["otunnel/requestId"],
 				context.mcpReq.signal,
 			);
-			return finishResult(
-				broker,
+			return finish(
 				context,
 				textResult({
 					operation: result.operation,
@@ -460,81 +472,6 @@ export function createServer(broker: Broker): McpServer {
 				}),
 			);
 		}),
-	);
-
-	server.server.setRequestHandler(
-		"events/list",
-		{
-			params: eventsListParamsSchema,
-			result: eventsListResultSchema,
-		},
-		async (_params, context) => {
-			requireChatId(context);
-			return eventsListResultSchema.parse({
-				events: EVENT_DEFINITIONS,
-			});
-		},
-	);
-	server.server.setRequestHandler(
-		"events/subscribe",
-		{
-			params: eventsSubscribeParamsSchema,
-			result: eventsSubscribeResultSchema,
-		},
-		async (params, context) => {
-			const chatId = requireChatId(context);
-			try {
-				broker.operation(chatId, params.arguments.operation_id);
-			} catch {
-				throw new ProtocolError(
-					ProtocolErrorCode.InvalidParams,
-					"Unknown operation_id for this conversation",
-				);
-			}
-			let subscription: Awaited<ReturnType<Broker["subscribeOperationEvent"]>>;
-			try {
-				subscription = await broker.subscribeOperationEvent(
-					chatId,
-					params.name,
-					params.arguments.operation_id,
-					params.delivery.url,
-					params.delivery.secret,
-					params.ttlMs,
-					context.mcpReq.signal,
-				);
-			} catch (error) {
-				const message = error instanceof Error ? error.message : String(error);
-				if (message.toLowerCase().includes("signing secret"))
-					throw new ProtocolError(ProtocolErrorCode.InvalidParams, message);
-				throw callbackEndpointError(error);
-			}
-			return eventsSubscribeResultSchema.parse({
-				id: subscription.id,
-				refreshBefore:
-					subscription.expiresAt === null
-						? null
-						: new Date(subscription.expiresAt).toISOString(),
-				cursor: null,
-				truncated: false,
-			});
-		},
-	);
-	server.server.setRequestHandler(
-		"events/unsubscribe",
-		{
-			params: eventsUnsubscribeParamsSchema,
-			result: eventsUnsubscribeResultSchema,
-		},
-		async (params, context) => {
-			const chatId = requireChatId(context);
-			await broker.unsubscribeOperationEvent(
-				chatId,
-				params.name,
-				params.arguments.operation_id,
-				params.delivery.url,
-			);
-			return eventsUnsubscribeResultSchema.parse({});
-		},
 	);
 
 	server.registerTool(
@@ -551,8 +488,7 @@ export function createServer(broker: Broker): McpServer {
 		},
 		handle(async ({ operationId }, context) => {
 			const result = broker.operation(requireChatId(context), operationId);
-			const formatted = await finishResult(
-				broker,
+			return finish(
 				context,
 				{
 					content: [
@@ -568,9 +504,10 @@ export function createServer(broker: Broker): McpServer {
 					],
 				},
 				false,
+				result.deliveries.length
+					? () => broker.acknowledge(result.deliveries, [], committedSignal)
+					: undefined,
 			);
-			await broker.acknowledge(result.deliveries, [], context.mcpReq.signal);
-			return formatted;
 		}),
 	);
 
@@ -591,11 +528,7 @@ export function createServer(broker: Broker): McpServer {
 				requireChatId(context),
 				operationId,
 			);
-			return finishResult(
-				broker,
-				context,
-				textResult({ operation: result.operation }),
-			);
+			return finish(context, textResult({ operation: result.operation }));
 		}),
 	);
 
@@ -626,8 +559,7 @@ export function createServer(broker: Broker): McpServer {
 				context.mcpReq.signal,
 				true,
 			);
-			return finishResult(
-				broker,
+			return finish(
 				context,
 				toolResult(
 					result.toolResults,
@@ -638,6 +570,10 @@ export function createServer(broker: Broker): McpServer {
 					result.replay,
 					result.execution,
 				),
+				true,
+				!result.execution && result.inputs.length
+					? () => broker.acknowledgeInputs(result.sessionId, result.inputs)
+					: undefined,
 			);
 		}),
 	);
@@ -699,7 +635,7 @@ export function createServer(broker: Broker): McpServer {
 				binding: chatId ? (broker.binding(chatId) ?? null) : null,
 				sessions: broker.listSessions(args.sessionId),
 			});
-			return finishResult(broker, context, result);
+			return finish(context, result);
 		}),
 	);
 
@@ -746,20 +682,36 @@ function textResult(
 
 async function finishResult<
 	T extends { content: ReturnType<typeof toolResult>["content"] },
->(broker: Broker, context: RequestContext, result: T, deliverPending = true) {
+>(
+	broker: Broker,
+	stageResponseCommit: StageResponseCommit,
+	context: RequestContext,
+	result: T,
+	deliverPending = true,
+	afterSend?: ResponseCommit,
+) {
 	context.mcpReq.signal.throwIfAborted();
 	const chatId = requestChatId(context);
-	if (!deliverPending) return formatResult(result, chatId);
-	const deliveries = chatId ? broker.deliveries(chatId) : [];
-	const answers = chatId ? broker.answers(chatId) : [];
-	const content = [
-		...result.content,
-		...deliveryContent(deliveries),
-		...answerContent(answers),
-	];
-	// Validate/serialize before consuming durable pending results.
+	const deliveries = deliverPending && chatId ? broker.deliveries(chatId) : [];
+	const answers = deliverPending && chatId ? broker.answers(chatId) : [];
+	const content = deliverPending
+		? [
+				...result.content,
+				...deliveryContent(deliveries),
+				...answerContent(answers),
+			]
+		: result.content;
 	const formatted = formatResult({ ...result, content }, chatId);
-	await broker.acknowledge(deliveries, answers, context.mcpReq.signal);
+	const commits: ResponseCommit[] = [];
+	if (deliveries.length || answers.length)
+		commits.push(() =>
+			broker.acknowledge(deliveries, answers, committedSignal),
+		);
+	if (afterSend) commits.push(afterSend);
+	if (commits.length)
+		stageResponseCommit(context.mcpReq.id, async () => {
+			for (const commit of commits) await commit();
+		});
 	return formatted;
 }
 
