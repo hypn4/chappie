@@ -6,10 +6,10 @@ import { setTimeout as delay } from "node:timers/promises";
 import { withFileMutationQueue } from "../src/file-mutation-queue.ts";
 import { IpcClient } from "../src/ipc.ts";
 import { createChappieStream } from "../src/provider-core.ts";
+import { until } from "./helpers/async.ts";
 import {
 	multiSessionFixture,
 	sessionFixture,
-	until,
 } from "./helpers/session-fixture.ts";
 
 test("switching sessions rejects queued work and unregisters the old ID", async (t) => {
@@ -134,13 +134,13 @@ test("an immediately cancelled provider stream never starts local work", async (
 		starts++;
 		output.done();
 	});
-	stream(
+	const response = stream(
 		{ api: "chappie", provider: "chappie", id: "chatgpt" },
 		{},
 		{ signal: controller.signal },
 	);
 	controller.abort();
-	await delay(0);
+	assert.equal((await response.result()).stopReason, "aborted");
 	assert.equal(starts, 0);
 });
 

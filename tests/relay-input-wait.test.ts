@@ -4,7 +4,8 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { operationIdentity } from "../src/operations.ts";
 import { ProviderOutput } from "../src/provider-core.ts";
-import { multiSessionFixture, until } from "./helpers/session-fixture.ts";
+import { until } from "./helpers/async.ts";
+import { multiSessionFixture } from "./helpers/session-fixture.ts";
 
 const model = { api: "chappie", provider: "chappie", id: "chatgpt" };
 const calls = [{ name: "read", arguments: { path: "test.txt" } }];

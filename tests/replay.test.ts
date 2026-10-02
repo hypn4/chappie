@@ -318,6 +318,7 @@ test("detached operation failures persist and late delivery cannot overwrite the
 	await state.finishOperation("detached-key", "failed", [], "native failure");
 	await state.addDelivery({
 		id: "detached-result",
+		...state.executionSource("detached-key"),
 		chatId: "chat",
 		operationKey: "detached-key",
 		sessionId: "A",

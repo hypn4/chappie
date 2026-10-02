@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
 import { test } from "node:test";
+import type { Broker } from "../src/broker.ts";
 import { mcpFixture } from "./helpers/mcp-fixture.ts";
 import { sessionFixture } from "./helpers/session-fixture.ts";
 
@@ -80,9 +80,7 @@ test("sync and detached MCP batches reject malformed envelopes before broker exe
 		},
 		startCall: async () => {
 			executions++;
-			return {
-				operation: { operationId: "invalid-envelope", status: "running" },
-			};
+			throw new Error("Malformed batch reached execution");
 		},
 	});
 	for (const name of ["call", "start_call"]) {
@@ -221,38 +219,100 @@ test("Chat init bounds pathological single-line tool and Skill summaries", async
 	assert.ok(JSON.stringify(initialized).length < 16 * 1024);
 });
 
-test("bridge metadata teaches progressive native discovery and dependency-aware batches", async (t) => {
-	const f = await mcpFixture(t);
-	const catalog = await f.request("tools/list", {});
-	const tools = catalog.tools as Array<{ name: string; description?: string }>;
-	const description = (name: string) =>
-		tools.find((tool) => tool.name === name)?.description ?? "";
-	assert.match(description("init"), /shortlist/i);
-	assert.match(description("init"), /Skill/i);
-	assert.match(description("tools"), /first use/i);
-	assert.match(description("tools"), /reuse/i);
-	assert.match(description("tools"), /MCP/i);
-	assert.match(description("call"), /arguments are already known/i);
-	assert.match(description("call"), /depends on an earlier result/i);
+test("Chat init preserves the complete compact catalog for final response pagination", async (t) => {
+	const f = await sessionFixture(t);
+	const count = 4096;
+	t.mock.method(f.api, "getActiveTools", () =>
+		Array.from({ length: count }, (_, index) => `tool-${index}`),
+	);
+	t.mock.method(f.api, "getAllTools", () =>
+		Array.from({ length: count }, (_, index) => ({
+			name: `tool-${index}`,
+			description: "x".repeat(512),
+			parameters: { type: "object", properties: {} },
+		})),
+	);
+	t.mock.method(f.api, "getCommands", () =>
+		Array.from({ length: count }, (_, index) => ({
+			name: `skill:skill-${index}`,
+			description: "y".repeat(512),
+			source: "skill",
+		})),
+	);
+	const initialized = await f.broker.initialize(
+		"test-chat",
+		"A",
+		"bounded-catalog",
+		f.controller.signal,
+	);
+	assert.equal(initialized.tools.length, count);
+	assert.equal(initialized.skills.length, count);
+	assert.equal(initialized.skills.at(-1)?.name, `skill-${count - 1}`);
 });
 
-test("controller instructions keep Skills and MCPs first-class without eager loading", async () => {
-	const instructions = await readFile(
-		new URL("../src/instructions.md", import.meta.url),
-		"utf8",
+test("selected MCP discovery preserves live schema, origin and routing guidance", async (t) => {
+	const f = await sessionFixture(t);
+	const native = {
+		name: "mcp__project_lookup",
+		description: "Search project symbols.\nRead its index before searching.",
+		parameters: {
+			type: "object",
+			properties: { query: { type: "string" } },
+			required: ["query"],
+		},
+		promptGuidelines: ["Read the project index before searching."],
+		sourceInfo: { source: "mcp", path: "<mcp:project_lookup>" },
+	};
+	t.mock.method(f.api, "getActiveTools", () => [native.name]);
+	t.mock.method(f.api, "getAllTools", () => [native]);
+	const result = await f.broker.tools(
+		"test-chat",
+		"A",
+		[native.name],
+		"mcp-guidance",
+		f.controller.signal,
 	);
-	assert.match(instructions, /skills guide workflows/i);
-	assert.match(instructions, /read only task-relevant skills/i);
-	assert.match(instructions, /skill:\/\//i);
-	assert.match(instructions, /registered OMP MCP tools.*first-class/i);
-	assert.match(instructions, /specialized.*MCP/i);
-	assert.match(instructions, /shortlist, not an argument contract/i);
-	assert.match(instructions, /native definitions remain authoritative/i);
-	assert.match(instructions, /do not preload unrelated skills/i);
+	assert.equal(result.tools.length, 1);
+	assert.deepEqual(result.tools[0], {
+		name: "mcp__project_lookup",
+		description: "Search project symbols.\nRead its index before searching.",
+		parameters: {
+			type: "object",
+			properties: { query: { type: "string" } },
+			required: ["query"],
+		},
+		promptGuidelines: ["Read the project index before searching."],
+		sourceInfo: { source: "mcp", path: "<mcp:project_lookup>" },
+	});
+});
+
+test("Skill discovery refreshes registration changes without mutating previous snapshots", async (t) => {
+	const f = await sessionFixture(t);
+	let name = "skill:review/first";
+	t.mock.method(f.api, "getCommands", () => [{ name, source: "skill" }]);
+	const first = await f.broker.initialize(
+		"test-chat",
+		"A",
+		"skills-before",
+		f.controller.signal,
+	);
+	name = "skill:review/second";
+	const second = await f.broker.initialize(
+		"test-chat",
+		"A",
+		"skills-after",
+		f.controller.signal,
+	);
+	assert.deepEqual(first.skills, [
+		{ name: "review/first", uri: "skill://review/first" },
+	]);
+	assert.deepEqual(second.skills, [
+		{ name: "review/second", uri: "skill://review/second" },
+	]);
 });
 
 test("MCP call and chat expose a model-input wait as unexecuted, not successful completion", async (t) => {
-	const wait = {
+	const wait: Awaited<ReturnType<Broker["call"]>> = {
 		sessionId: "A",
 		cwd: "/fixture",
 		toolResults: [],

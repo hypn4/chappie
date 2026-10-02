@@ -44,7 +44,12 @@ import {
 	resourceDescriptors,
 	resourceSessionId,
 } from "./resources.ts";
-import { type BindingMutation, State } from "./state.ts";
+import { ResponseStore } from "./responses.ts";
+import {
+	type BindingMutation,
+	StaleOperationDeliveryError,
+	State,
+} from "./state.ts";
 import type { ToolInput } from "./tools.ts";
 
 const observerInstructions =
@@ -151,6 +156,7 @@ export class Broker {
 	readonly #inspectionTimeoutMs: number;
 	readonly #ipc: IpcServer;
 	readonly #state: State;
+	readonly #responses: ResponseStore;
 	readonly #sessions = new Map<string, RegisteredSession>();
 	// Pending automatic selections, keyed by chat so retries do not take a second slot.
 	readonly #selectionReservations = new Map<string, string>();
@@ -173,6 +179,7 @@ export class Broker {
 		this.#inspectionTimeoutMs = options.inspectionTimeoutMs ?? 3000;
 		this.#agentDir = agentDir;
 		this.#state = new State(agentDir);
+		this.#responses = new ResponseStore(agentDir);
 		this.#ipc = new IpcServer(
 			agentDir,
 			(peer, message) => this.#receive(peer, message),
@@ -229,6 +236,14 @@ export class Broker {
 				...description,
 				bindingCount: counts.get(description.id) ?? 0,
 			}));
+	}
+
+	saveResponse(chatId: string, text: string): Promise<string> {
+		return this.#responses.save(chatId, text);
+	}
+
+	readResponse(chatId: string, resultId: string): Promise<string> {
+		return this.#responses.read(chatId, resultId);
 	}
 
 	get askEnabled(): boolean {
@@ -344,7 +359,7 @@ export class Broker {
 						type: "chat",
 						id,
 						...source(chatId, requestId),
-						...(identity ? { operationKey: identity.key } : {}),
+						...this.#state.executionSource(identity?.key),
 						sessionId: target,
 						text,
 						...(replyTo ? { replyTo } : {}),
@@ -470,7 +485,7 @@ export class Broker {
 						type: "call",
 						id,
 						...source(chatId, requestId),
-						...(identity ? { operationKey: identity.key } : {}),
+						...this.#state.executionSource(identity?.key),
 						sessionId: target,
 						calls: toolCalls,
 						...(direct ? { direct: true } : {}),
@@ -627,6 +642,10 @@ export class Broker {
 				this.#state.operation(chatId, stableId).status === "running"
 			) {
 				const toolCalls = nativeToolCalls(calls);
+				const executionSource = this.#state.executionSource(identity.key);
+				const isCurrent = () =>
+					this.#state.findOperation(chatId, stableId)?.executionId ===
+					executionSource.executionId;
 				tracked.dispatched = true;
 				const detached = this.#request(
 					target,
@@ -635,13 +654,14 @@ export class Broker {
 						id,
 						chatId,
 						requestId: stableId,
-						operationKey: identity.key,
+						...executionSource,
 						sessionId: target,
 						calls: toolCalls,
 					}),
 					execution.signal,
 				)
 					.then(async (result) => {
+						if (!isCurrent()) return;
 						if ("execution" in result) {
 							await this.#recordInputWait(identity.key, result);
 							return;
@@ -656,9 +676,9 @@ export class Broker {
 							return;
 						}
 						await this.#state.addDelivery({
-							id: `operation:${identity.key}`,
+							id: `operation:${executionSource.executionId ?? identity.key}`,
 							chatId,
-							operationKey: identity.key,
+							...executionSource,
 							sessionId: target,
 							cwd: result.cwd,
 							toolResults: result.toolResults,
@@ -666,6 +686,7 @@ export class Broker {
 						});
 					})
 					.catch(async (error: unknown) => {
+						if (!isCurrent()) return;
 						const cancelled =
 							execution.signal.aborted &&
 							execution.signal.reason instanceof Error &&
@@ -1089,7 +1110,13 @@ export class Broker {
 					)
 				)
 					throw new Error("Deferred result does not belong to this operation");
-				await this.#state.addDelivery(message.delivery);
+				try {
+					await this.#state.addDelivery(message.delivery);
+				} catch (error) {
+					// Ownership was checked above. Release a stale packet so the
+					// connected OMP does not endlessly reconnect and resend it.
+					if (!(error instanceof StaleOperationDeliveryError)) throw error;
+				}
 				await peer.send({ type: "stored", id: message.delivery.id });
 				break;
 			case "result": {
@@ -1433,7 +1460,7 @@ export class Broker {
 			(id) => ({
 				...request,
 				id,
-				...(identity ? { operationKey: identity.key } : {}),
+				...this.#state.executionSource(identity?.key),
 			}),
 			signal,
 		).catch(async (error: unknown) => {

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { setTimeout as delay } from "node:timers/promises";
-import { sessionFixture, until } from "./helpers/session-fixture.ts";
+import { until } from "./helpers/async.ts";
+import { sessionFixture } from "./helpers/session-fixture.ts";
 
 const calls = [{ name: "read", arguments: { path: "test.txt" } }];
 
@@ -20,7 +20,6 @@ test("detached calls outlive the originating MCP request and deliver completion"
 	assert.equal(started.operation.status, "running");
 
 	caller.abort(new Error("ChatGPT request ended"));
-	await delay(10);
 	const output = await f.dispatch();
 	await f.complete(output);
 

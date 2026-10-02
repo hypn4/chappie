@@ -1,5 +1,7 @@
+import { randomUUID } from "node:crypto";
 import { readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import * as z from "zod";
 import type { DeliveryRecord } from "./delivery.ts";
 import type { ModelInput } from "./ipc.ts";
@@ -61,6 +63,7 @@ const stateSchema = z.strictObject({
 		.array(
 			z.strictObject({
 				key: z.string(),
+				executionId: z.string().uuid().optional(),
 				operationId: z.string().min(1).max(128).optional(),
 				signature: z.string(),
 				chatId: z.string(),
@@ -91,6 +94,9 @@ const stateSchema = z.strictObject({
 		.max(4096)
 		.optional(),
 });
+
+/** A validated owner may discard a delayed result from an expired acceptance. */
+export class StaleOperationDeliveryError extends Error {}
 
 export class State {
 	readonly #path: string;
@@ -164,9 +170,9 @@ export class State {
 			if (receipt.status === "running") receipt.status = "uncertain";
 			this.#operations.set(receipt.key, receipt);
 		}
-		const operationsChanged = this.#pruneOperations(loadedAt);
 		for (const [id, time] of state.deliveredIds ?? [])
 			this.#deliveredIds.set(id, time);
+		const operationsChanged = this.#pruneOperations(loadedAt);
 		if (bindingsChanged || operationsChanged) await this.#save();
 	}
 
@@ -175,13 +181,28 @@ export class State {
 		chatId: string,
 		sessionId: string,
 	): boolean {
+		this.#pruneOperations();
 		const receipt = key ? this.#operations.get(key) : undefined;
 		return receipt?.chatId === chatId && receipt.sessionId === sessionId;
+	}
+
+	executionSource(key: string | undefined): {
+		operationKey?: string;
+		executionId?: string;
+	} {
+		if (!key) return {};
+		const receipt = this.#operations.get(key);
+		if (!receipt) throw new Error("Operation has no retained receipt");
+		return {
+			operationKey: key,
+			...(receipt.executionId ? { executionId: receipt.executionId } : {}),
+		};
 	}
 
 	async reserveOperation(
 		receipt: OperationReceipt,
 	): Promise<OperationReceipt | undefined> {
+		this.#pruneOperations();
 		if (receipt.operationId) {
 			const conflict = [...this.#operations.values()].find(
 				(value) =>
@@ -225,6 +246,8 @@ export class State {
 			throw new Error(
 				"Operation receipt limit reached; reconcile pending work before retrying",
 			);
+		// A fresh acceptance must never share its predecessor's delivery identity.
+		receipt = { ...receipt, executionId: randomUUID() };
 		// Reserve before yielding so two simultaneous approvals cannot both execute.
 		this.#operations.set(receipt.key, receipt);
 		try {
@@ -321,6 +344,7 @@ export class State {
 		chatId: string,
 		operationId: string,
 	): OperationReceipt | undefined {
+		this.#pruneOperations();
 		const receipt = [...this.#operations.values()].find(
 			(value) => value.chatId === chatId && value.operationId === operationId,
 		);
@@ -463,12 +487,21 @@ export class State {
 	}
 
 	async addDelivery(delivery: DeliveryRecord): Promise<void> {
-		if (this.#deliveredIds.has(delivery.id)) return;
+		this.#pruneOperations();
 		if (!this.#deliveries.has(delivery.id) && this.#deliveries.size >= 2048)
 			throw new Error("Pending delivery limit reached");
 		const receipt = delivery.operationKey
 			? this.#operations.get(delivery.operationKey)
 			: undefined;
+		if (delivery.operationKey && !receipt)
+			throw new StaleOperationDeliveryError(
+				"Operation delivery has no retained operation receipt",
+			);
+		if (receipt && receipt.executionId !== delivery.executionId)
+			throw new StaleOperationDeliveryError(
+				"Operation delivery belongs to a different execution",
+			);
+		if (this.#deliveredIds.has(delivery.id)) return;
 		if (
 			receipt &&
 			(receipt.chatId !== delivery.chatId ||
@@ -575,7 +608,14 @@ export class State {
 			const delivered = new Map(
 				answers.map((question) => [question, { ...question, delivered: true }]),
 			);
-			for (const delivery of deliveries) {
+			const consumed = deliveries.filter((delivery) => {
+				const current = this.#deliveries.get(delivery.id);
+				return (
+					current === delivery ||
+					(current !== undefined && isDeepStrictEqual(current, delivery))
+				);
+			});
+			for (const delivery of consumed) {
 				this.#deliveries.delete(delivery.id);
 				this.#deliveredIds.set(delivery.id, Date.now());
 			}
@@ -587,7 +627,8 @@ export class State {
 				await this.#save();
 				signal.throwIfAborted();
 			} catch (error) {
-				for (const delivery of deliveries) {
+				for (const delivery of consumed) {
+					if (this.#deliveries.has(delivery.id)) continue;
 					this.#deliveries.set(delivery.id, delivery);
 					this.#deliveredIds.delete(delivery.id);
 				}
@@ -703,7 +744,15 @@ export class State {
 				receipt.updatedAt < cutoff
 			) {
 				this.#operations.delete(key);
+				const retained = this.#operationResults.get(key);
+				if (retained) this.#deliveredIds.delete(retained.id);
 				this.#operationResults.delete(key);
+				for (const [id, delivery] of this.#deliveries) {
+					if (delivery.operationKey !== key) continue;
+					this.#deliveries.delete(id);
+					this.#deliveredIds.delete(id);
+				}
+				this.#deliveredIds.delete(`operation:${key}`);
 				changed = true;
 			}
 		}

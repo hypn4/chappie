@@ -1448,7 +1448,12 @@ export class LocalSession {
 			complete: active.completed,
 			...source(active.request.chatId, active.request.requestId),
 			...(active.request.operationKey
-				? { operationKey: active.request.operationKey }
+				? {
+						operationKey: active.request.operationKey,
+						...(active.request.executionId
+							? { executionId: active.request.executionId }
+							: {}),
+					}
 				: {}),
 			sessionId: active.session.id,
 			cwd: active.session.cwd,

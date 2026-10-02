@@ -25,6 +25,7 @@ const required = [
 	"dist/src/instructions.md",
 	"dist/src/question.html",
 	"dist/src/native-calls.js",
+	"dist/src/responses.js",
 	"src/index.omp.ts",
 	"LICENSE",
 ];

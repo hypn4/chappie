@@ -14,7 +14,7 @@ Legacy MCP handshakes and the standalone Pi host are not supported.
 | `ask_assert` | Confirm that an `ask` widget loaded. |
 | `call` | Run one or more OMP tools as one native batch and wait for completion. |
 | `start_call` | Durably start a native OMP tool batch without keeping the ChatGPT MCP request open. |
-| `get_operation` | Read durable operation status and the retained native result, including after acknowledgement. |
+| `get_operation` | Read operation status with `operationId`, or losslessly page a retained tool response with `resultId` and `offset`. |
 | `cancel_operation` | Explicitly request cancellation of a detached native batch. |
 | `transfer` | Move files between ChatGPT and OMP, copy between OMP sessions, or export a OMP image. |
 
@@ -49,7 +49,7 @@ To follow progress, pass `after` with `wait: true`. Available entries return imm
 
 Set `observer: true` to read as an observer. New messages and work activity wake waiting readers; idle status alone does not indicate task completion.
 
-History includes saved messages, tool calls and results, summaries, images, file references, and work activity. File references are records, not new attachments; reading history does not re-export files. Truncation notices and full-output paths are included so complete output can be read when needed. Reading history leaves new input and pending results available for normal delivery.
+History includes saved messages, tool results, summaries, image/file references and work activity. It never cuts an entry in half. A native page can stop between entries; `hasMore` means there are other entries addressable by `before`/`after`. An oversized single entry is retained intact by the final response layer and is read using `resultId` pages, whose own `hasMore` and `nextOffset` describe text-fragment continuation. Reading history does not acknowledge pending inputs or re-export files.
 
 ## Participation
 
@@ -57,9 +57,9 @@ The executing assistant uses `chat` to share progress and completion in OMP. Whe
 
 ## OMP Skills and tools
 
-ChatGPT truncates tool responses exceeding 10,000 tokens.
+Chappie applies a 32 KiB UTF-8 byte budget to final tool-result JSON, including text mirrored into `structuredContent`. This is an application policy, not a guarantee about any host/model token limit or final rendering.
 
-`init` returns two compact discovery catalogs. `tools` contains names and first-line descriptions of active OMP tools. `skills` contains normalized Skill names, first-line descriptions and stable `skill://` URIs; it never exposes filesystem paths or full Skill contents. Treat both as shortlists. When a Skill description materially matches the task, read only that task-relevant Skill through its URI before acting; do not preload unrelated Skills.
+`init` returns every active tool and Skill in compact form. Tool summaries and Skill descriptions contain at most 512 characters; Skills expose a normalized name and `skill://` URI rather than filesystem paths. Large catalogs are not prefix-truncated: they use the same lossless `resultId` continuation described below. This makes every name discoverable without already knowing it. Read only relevant Skills, then obtain selected live tool definitions through `tools(names)`.
 
 Before first use of a native tool whose full definition is not already available for the current session, request it with `tools({ names: [...] })`; request several candidate definitions together when choosing between tools. Registered OMP MCP tools appear in the same native catalog and are first-class capabilities. Prefer a specialized native/MCP capability over reproducing it with `bash`, `eval`, generic text search, manual HTTP calls, or a generic web path when the specialized integration materially matches the task. Explicit user/project instructions take precedence over Skill/tool guidance.
 
@@ -116,7 +116,7 @@ For `start_call`, this feedback persists as `waiting_input`; `get_operation` ret
 }
 ```
 
-`operationId` is stable within the ChatGPT conversation. The broker persists its receipt before native execution begins, detaches execution from the originating MCP request signal, and returns without waiting for the native batch. Repeating the same ID with identical arguments returns the existing operation, even when its original session is offline, except that a known-unexecuted `waiting_input` attempt may be explicitly resumed on its original online session. Changing arguments or target is rejected. Explicit operation IDs are not automatically forgotten: a full receipt store rejects new work rather than allowing a side effect to run twice.
+`operationId` is stable within the ChatGPT conversation while its receipt is retained. The broker persists the receipt before native execution begins, detaches execution from the originating MCP request signal, and returns without waiting for the native batch. Repeating the same ID with identical arguments returns the existing operation, even when its original session is offline, except that a known-unexecuted `waiting_input` attempt may be explicitly resumed on its original online session. Changing arguments or target is rejected. Terminal receipts retire as described below; unresolved receipts are not evicted, and a full store rejects new work instead of discarding unresolved execution state.
 
 Read the state later with:
 
@@ -126,7 +126,7 @@ Read the state later with:
 
 `get_operation` returns `running`, `waiting_input`, `completed`, `failed`, `cancelled`, or `uncertain`. `completed` means the native OMP batch returned, not that every result succeeded: inspect native `isError` and tool details. If a tool starts a separate background job or supervised process, use the host's native facilities to observe that child job. Batch completion is not child-job completion.
 
-Full detached results remain available through `get_operation` after their first pending delivery is acknowledged. Terminal operation receipts and retained results are kept for 24 hours after completion; within that window identical IDs prevent re-execution and conflicting arguments are rejected. After expiry the ID is no longer reserved, so retry recovery must happen within the retention window. Unresolved running, waiting_input and uncertain receipts are not evicted automatically. Retained results are bounded to 2,048 entries and the complete state file to 32 MiB. A source resource reference does not make the broker the owner of its file bytes.
+Full detached results remain available through `get_operation(operationId)` after pending-delivery acknowledgement. Terminal receipts and results are retained for 24 hours. Within that window, an identical logical ID replays the accepted operation and conflicting arguments are rejected. After retirement, a fresh acceptance gets a new persisted `executionId`; native requests and deferred results must match that execution, so delayed output cannot complete a successor with the same logical ID. `waiting_input` resumes the same acceptance rather than generating a new one. Unresolved running/waiting/uncertain receipts are not automatically evicted.
 
 `cancel_operation` owns cancellation from the start of initial acceptance or a `waiting_input` reclaim, including while the receipt is being persisted. Cancellation before dispatch prevents later native execution. Cancelling a waiting operation does not abort its independent model request. Ending the original MCP request does not cancel accepted detached work. Cancellation cannot undo side effects or promise to stop independent child processes. Broker recovery marks interrupted running receipts `uncertain`; known-unexecuted waits stay resumable. Reconcile uncertain work rather than re-executing it.
 
@@ -151,7 +151,7 @@ starting a normal OMP turn:
 { "text": "Compacted summary...", "replyTo": "<modelRequest-id>" }
 ```
 
-OMP user input consumed during the work accompanies later Chappie results, including images. Pending OMP input, deferred results, and webpage answers are consumed only after the MCP response carrying them is successfully written to the transport. If that send fails, the same stable pending data remains available for a later Chappie response.
+OMP user input, deferred results and webpage answers accompany later Chappie responses. Acknowledgement happens only after a successful bounded response write. For oversized data, the full response must first be atomically persisted; a small durable reference can then be delivered and acknowledged without losing the original content. A failed write or failed snapshot save leaves pending data unacknowledged. Transport success is not proof that a person or model inspected the content.
 
 If cancellation or a broken broker connection interrupts ordinary result delivery, late results can accompany a later response to the originating ChatGPT conversation. A broker restart reloads operation receipts, but an agent process exit cannot recover unfinished in-memory work automatically. Check history before retrying a state-changing operation. Use `start_call` for a native batch that may outlive one ChatGPT MCP request; use the environment's persistent process facilities when the underlying process itself must outlive the agent session.
 
@@ -313,3 +313,21 @@ incomplete file; successfully copied files remain available.
 `read` and OMP tool results send images directly to ChatGPT for visual inspection. Chappie also returns a `chappie://` image reference with OMP images. Pass that reference to `transfer.paths` when the same bytes are needed as a file in ChatGPT's cloud environment.
 
 Use the original local path with `transfer` when the original image file is required; OMP can resize or convert images used only for display.
+
+## Bounded result continuation
+
+A large response from any core tool returns a reference rather than losing text:
+
+```json
+{ "resultId": "<64-hex-id>", "next": { "resultId": "<64-hex-id>", "offset": 0 } }
+```
+
+Call `get_operation({ resultId, offset: 0 })`, then use each returned `nextOffset` while `hasMore` is true. Concatenate the `text` fragments in order and parse the resulting JSON to recover the original tool result, including its original content blocks and native resource references. Offsets count JavaScript string code units, not bytes; follow the returned offsets rather than calculating them. Pages do not execute OMP tools, change session ownership, acknowledge new input, or recreate attachments. The same page is repeatably readable.
+
+Snapshots live in the broker's private `chappie.results` directory, are scoped to the originating Chat conversation, and are checked against their content hash. They expire 24 hours after first creation; re-reading does not renew them. Capacity is 128 snapshots / 256 MiB total, with a 128 MiB per-snapshot ceiling. New saves remove expired snapshots, never unexpired ones to make room. Capacity or persistence errors fail without acknowledging pending data. These bounds do not imply survival of a power failure or receipt by ChatGPT's UI.
+
+Large image blocks are preserved in the saved JSON rather than silently discarded, but a JSON-fragment page is not an inline image renderer. Use the recovered original `piImage`/resource URI with the existing `transfer` path when the host needs the original attachment. Resource lifetimes and source-session ownership remain separate from response-snapshot retention. Small widget state remains inline when unrelated pending text is paged; oversized widget metadata fails clearly rather than exceeding the response limit.
+
+## Contributor quality standard
+
+Review/test coverage, completion stages, decision records and cold-start recovery are maintained in the repository's [quality standard](quality.md). The [maintainer architecture](architecture.md) records why the execution, ownership and response boundaries exist. This tool guide remains the source for observable product behavior, not a second task ledger.

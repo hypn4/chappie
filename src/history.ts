@@ -7,7 +7,7 @@ import { contentWithImageReferences, rememberImages } from "./resources.ts";
 
 export const MAX_HISTORY_ENTRIES = 200;
 const MAX_HISTORY_CONTENT_BLOCKS = 4096;
-
+const MAX_HISTORY_CONTENT_CHARS = 48 * 1024;
 export const historyInput = z.object({
 	limit: z
 		.number()
@@ -86,40 +86,34 @@ export function historyResult(
 	}
 	const chunks: ReturnType<typeof toolResultsContent>[] = [];
 	let usedBlocks = 0;
-	let included = 0;
-	let truncated = false;
+	let usedChars = 0;
 	const candidates = after ? selected : [...selected].reverse();
 	for (const entry of candidates) {
-		const blocks = entryContent(entry, sessionId, sources);
-		if (usedBlocks + blocks.length <= MAX_HISTORY_CONTENT_BLOCKS) {
-			chunks.push(blocks);
-			usedBlocks += blocks.length;
-			included++;
-			continue;
+		let blocks = entryContent(entry, sessionId, sources);
+		// Preserve a single large entry intact. The final MCP boundary saves and
+		// pages oversized responses; no native history text is discarded here.
+		if (blocks.length > MAX_HISTORY_CONTENT_BLOCKS) {
+			blocks = [
+				{
+					type: "text",
+					text: JSON.stringify({ historyEntryId: entry.id, blocks }),
+				},
+			];
 		}
-		const available = MAX_HISTORY_CONTENT_BLOCKS - usedBlocks;
-		if (available > 0) {
-			const retained = Math.max(0, available - 1);
-			const chunk: ReturnType<typeof toolResultsContent> = [];
-			if (retained > 0) {
-				chunk.push(...blocks.slice(0, retained));
-				included++;
-			}
-			chunk.push({
-				type: "text",
-				text: JSON.stringify({
-					historyTruncated: true,
-					reason: "content block limit",
-				}),
-			});
-			chunks.push(chunk);
-		}
-		truncated = true;
-		break;
+		const size = JSON.stringify(blocks).length;
+		if (
+			chunks.length &&
+			(usedBlocks + blocks.length > MAX_HISTORY_CONTENT_BLOCKS ||
+				usedChars + size > MAX_HISTORY_CONTENT_CHARS)
+		)
+			break;
+		chunks.push(blocks);
+		usedBlocks += blocks.length;
+		usedChars += size;
 	}
 	return {
-		count: included,
-		hasMore: entries.length > selected.length || truncated,
+		count: chunks.length,
+		hasMore: entries.length > chunks.length,
 		content: (after ? chunks : chunks.reverse()).flat(),
 	};
 }

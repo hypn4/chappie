@@ -12,17 +12,7 @@ import type {
 import { Broker } from "../../src/broker.ts";
 import { ProviderOutput } from "../../src/provider-core.ts";
 import { createOmpHostApi, LocalSession } from "../../src/session.ts";
-
-export async function until(
-	condition: () => boolean | Promise<boolean>,
-	milliseconds = 2500,
-): Promise<void> {
-	const deadline = Date.now() + milliseconds;
-	while (!(await condition())) {
-		if (Date.now() >= deadline) throw new Error("Fixture condition timed out");
-		await delay(5);
-	}
-}
+import { until } from "./async.ts";
 
 function fixtureWireSchema(tool: OmpToolInfo): Record<string, unknown> {
 	const parameters = tool.parameters;

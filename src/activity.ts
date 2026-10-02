@@ -3,6 +3,7 @@ export interface Source {
 	requestId?: string;
 	invocationId?: string;
 	operationKey?: string;
+	executionId?: string | undefined;
 }
 
 export interface Activity extends Partial<Source> {

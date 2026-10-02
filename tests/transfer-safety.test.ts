@@ -15,7 +15,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { setTimeout as delay } from "node:timers/promises";
+import { setImmediate } from "node:timers/promises";
 import { withFileMutationQueue } from "../src/file-mutation-queue.ts";
 import {
 	describeResource,
@@ -23,6 +23,7 @@ import {
 	registerFile,
 } from "../src/resources.ts";
 import { copyFiles, executeTransfer } from "../src/transfer.ts";
+import { within } from "./helpers/async.ts";
 
 async function fixture(t: { after(fn: () => Promise<void>): void }) {
 	const root = await mkdtemp(join(tmpdir(), "chappie-transfer-"));
@@ -69,14 +70,14 @@ test("host downloads reject local addresses and oversized responses", async (t) 
 	assert.equal(fetches, 1);
 });
 
-test("host file imports are bounded instead of starting every download at once", async (t) => {
+test("host file imports finish one download before starting the next", async (t) => {
 	const cwd = await fixture(t);
 	let active = 0;
 	let maximum = 0;
 	t.mock.method(globalThis, "fetch", async () => {
 		active++;
 		maximum = Math.max(maximum, active);
-		await delay(5);
+		await setImmediate();
 		active--;
 		return new Response("x");
 	});
@@ -94,10 +95,13 @@ test("host file imports are bounded instead of starting every download at once",
 		{ sessionId: cwd, cwd },
 	);
 	assert.equal(result.isError, false);
-	assert.ok(maximum <= 4, `observed ${maximum} concurrent downloads`);
+	assert.equal(maximum, 1);
+	assert.equal(result.details.files.length, count);
+	for (let index = 0; index < count; index++)
+		assert.equal(await readFile(join(cwd, `file-${index}`), "utf8"), "x");
 });
 
-test("session copies do not fan out every resource at once", async (t) => {
+test("session copies finish one resource before starting the next", async (t) => {
 	const cwd = await fixture(t);
 	let active = 0;
 	let maximum = 0;
@@ -116,7 +120,7 @@ test("session copies do not fan out every resource at once", async (t) => {
 		async function* () {
 			active++;
 			maximum = Math.max(maximum, active);
-			await delay(5);
+			await setImmediate();
 			yield new Uint8Array([120]);
 			active--;
 		},
@@ -124,6 +128,7 @@ test("session copies do not fan out every resource at once", async (t) => {
 	);
 	assert.equal(files.length, count);
 	assert.equal(maximum, 1);
+	assert.ok(files.every((file) => "bytes" in file && file.bytes === 1));
 });
 
 test("failed download preserves an existing destination and cleans staging", async (t) => {
@@ -150,6 +155,7 @@ test("cancelled download preserves an existing destination", async (t) => {
 	const cwd = await fixture(t);
 	await writeFile(join(cwd, "existing"), "ORIGINAL");
 	const controller = new AbortController();
+	const streamStarted = Promise.withResolvers<void>();
 	t.mock.method(
 		globalThis,
 		"fetch",
@@ -163,6 +169,7 @@ test("cancelled download preserves an existing destination", async (t) => {
 							() => stream.error(new Error("cancelled")),
 							{ once: true },
 						);
+						streamStarted.resolve();
 					},
 				}),
 			),
@@ -177,7 +184,7 @@ test("cancelled download preserves an existing destination", async (t) => {
 		assert.equal(result.isError, true);
 		assert.match(JSON.stringify(result.details.files), /abort|cancel/i);
 	});
-	await delay(20);
+	await within(streamStarted.promise, 2500, "Download stream did not start");
 	controller.abort();
 	await failure;
 	assert.equal(await readFile(join(cwd, "existing"), "utf8"), "ORIGINAL");
@@ -287,7 +294,12 @@ test("new destinations through a directory alias share a mutation queue", async 
 		},
 	);
 	try {
-		await delay(20);
+		// A different path is a registration barrier, not a latency guess.
+		await within(
+			withFileMutationQueue(join(cwd, "barrier"), async () => {}),
+			2500,
+			"Mutation queue did not register",
+		);
 		assert.equal(secondEntered, false);
 	} finally {
 		gate.resolve();

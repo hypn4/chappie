@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, test } from "node:test";
-import { setTimeout as delay } from "node:timers/promises";
 import { withFileMutationQueue } from "../src/file-mutation-queue.ts";
+import { within } from "./helpers/async.ts";
 
 const root = join(tmpdir(), "chappie-mutation-queue-tests");
 
@@ -77,17 +77,6 @@ describe("withFileMutationQueue", () => {
 	});
 });
 
-// This is a deadlock deadline, not an assumption about filesystem latency.
-async function bounded<T>(promise: Promise<T>): Promise<T> {
-	const controller = new AbortController();
-	try {
-		return await Promise.race([
-			promise,
-			delay(5000, undefined, { signal: controller.signal }).then(() => {
-				throw new Error("Mutation queue did not make progress");
-			}),
-		]);
-	} finally {
-		controller.abort();
-	}
+function bounded<T>(promise: Promise<T>): Promise<T> {
+	return within(promise, 5000, "Mutation queue did not make progress");
 }

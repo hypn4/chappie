@@ -11,6 +11,7 @@ const source = {
 	chatId: name,
 	requestId: name.optional(),
 	operationKey: name.optional(),
+	executionId: name.optional(),
 };
 const toolCall = nativeCallSchema.extend({
 	type: z.literal("toolCall"),

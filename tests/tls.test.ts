@@ -10,7 +10,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { connect } from "node:tls";
 import { Broker } from "../src/broker.ts";
 import { IpcClient } from "../src/ipc.ts";
-import { until } from "./helpers/session-fixture.ts";
+import { until } from "./helpers/async.ts";
 
 const opensslAvailable =
 	spawnSync("openssl", ["version"], { timeout: 3000, stdio: "ignore" })

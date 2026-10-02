@@ -5,12 +5,11 @@ import { createConnection, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type TestContext, test } from "node:test";
-import { setTimeout as delay } from "node:timers/promises";
 import { Broker } from "../src/broker.ts";
 import { readConfig } from "../src/config.ts";
 import { ipcEndpoint, JsonLinePeer } from "../src/ipc.ts";
 import { validateSessionMessage } from "../src/ipc-schema.ts";
-import { until } from "./helpers/session-fixture.ts";
+import { until, within } from "./helpers/async.ts";
 
 async function fixture(t: TestContext) {
 	const root = await mkdtemp(
@@ -22,6 +21,9 @@ async function fixture(t: TestContext) {
 async function peer(t: TestContext, root: string) {
 	const socket = createConnection(ipcEndpoint(root));
 	const messages: Record<string, unknown>[] = [];
+	const closed = new Promise<void>((resolve) =>
+		socket.once("close", () => resolve()),
+	);
 	let buffer = "";
 	socket.setEncoding("utf8");
 	socket.on("data", (chunk: string) => {
@@ -41,6 +43,7 @@ async function peer(t: TestContext, root: string) {
 	return {
 		socket,
 		messages,
+		closed: () => within(closed, 2500, "Rejected peer did not disconnect"),
 		send(value: unknown) {
 			socket.write(`${JSON.stringify(value)}\n`);
 		},
@@ -130,7 +133,7 @@ test("unregistered peers cannot relay inspect requests", async (t) => {
 		id: 9,
 		request: { type: "inspect", sessionId: "target" },
 	});
-	await delay(60);
+	await stranger.closed();
 	assert.equal(
 		target.messages.some((m) => m.type === "inspect"),
 		false,
@@ -185,7 +188,15 @@ test("registered peers cannot relay tool calls when collaboration is disabled", 
 			],
 		},
 	});
-	await delay(60);
+	await until(() =>
+		source.messages.some(
+			(message) => message.type === "response" && message.id === 9,
+		),
+	);
+	assert.match(
+		String(source.messages.find((message) => message.id === 9)?.error),
+		/not authorized/i,
+	);
 	assert.equal(
 		target.messages.some((message) => message.type === "call"),
 		false,
@@ -244,7 +255,15 @@ test("collaboration relay binds the operation identity to the source session", a
 			],
 		},
 	});
-	await delay(60);
+	await until(() =>
+		source.messages.some(
+			(message) => message.type === "response" && message.id === 10,
+		),
+	);
+	assert.match(
+		String(source.messages.find((message) => message.id === 10)?.error),
+		/not authorized/i,
+	);
 	assert.equal(
 		target.messages.some((message) => message.type === "call"),
 		false,
@@ -281,7 +300,7 @@ test("a second connection cannot replace an online session owner", async (t) => 
 			status: "idle",
 		},
 	});
-	await delay(60);
+	await impostor.closed();
 	assert.equal(broker.listSessions()[0]?.device, "original");
 });
 
@@ -296,7 +315,7 @@ test("invalid session metadata cannot enter the broker registry", async (t) => {
 		id: -1,
 		session: { id: "bad", cwd: 123, device: "test", status: "not-a-state" },
 	});
-	await delay(50);
+	await invalid.closed();
 	assert.deepEqual(broker.listSessions(), []);
 });
 
@@ -322,6 +341,6 @@ test("oversized frames are rejected before invoking handlers", async (t) => {
 	});
 	const client = await peer(t, root);
 	client.send({ data: "x".repeat(100) });
-	await delay(50);
+	await client.closed();
 	assert.equal(received, 0);
 });

@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { setTimeout as delay } from "node:timers/promises";
 import { ProviderOutput } from "../src/provider-core.ts";
 import { State } from "../src/state.ts";
-import { sessionFixture, until } from "./helpers/session-fixture.ts";
+import { until, within } from "./helpers/async.ts";
+import { sessionFixture } from "./helpers/session-fixture.ts";
 
 const calls = [{ name: "read", arguments: { path: "test.txt" } }];
 const model = { api: "chappie", provider: "chappie", id: "chatgpt" };
@@ -345,14 +345,11 @@ for (const resuming of [false, true]) {
 		await reserved.promise;
 		let cancelled: Awaited<ReturnType<typeof f.broker.cancelOperation>>;
 		try {
-			cancelled = await Promise.race([
+			cancelled = await within(
 				f.broker.cancelOperation("test-chat", operationId),
-				delay(500).then(() => {
-					throw new Error(
-						"Cancellation waited for acceptance instead of owning it",
-					);
-				}),
-			]);
+				500,
+				"Cancellation waited for acceptance instead of owning it",
+			);
 		} finally {
 			release.resolve();
 		}

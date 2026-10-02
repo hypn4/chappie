@@ -11,7 +11,8 @@ import {
 	type OmpCollaborationSession,
 } from "../src/local.omp.ts";
 import { ProviderOutput } from "../src/provider-core.ts";
-import { multiSessionFixture, until } from "./helpers/session-fixture.ts";
+import { until } from "./helpers/async.ts";
+import { multiSessionFixture } from "./helpers/session-fixture.ts";
 
 function fixtureSession() {
 	const calls: Array<{ method: string; args: unknown[] }> = [];

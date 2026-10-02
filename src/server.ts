@@ -13,6 +13,7 @@ import {
 	questionInstructions,
 	questionOutput,
 } from "./questions.ts";
+import { MAX_RESULT_BYTES } from "./responses.ts";
 import { inputContent, toolResult } from "./tools.ts";
 import { operationIdSchema, transferSchema } from "./transfer.ts";
 
@@ -25,7 +26,7 @@ const outputSchema = z.object({
 	text: z
 		.string()
 		.describe(
-			"Complete text output, including OMP user input, submitted webpage answers, and deferred results. Images and file resources accompany it as native content blocks.",
+			"Inline text, or a durable result reference/continuation page for oversized output. Images and file resources remain native content blocks when inline.",
 		),
 });
 
@@ -92,10 +93,70 @@ export function createServer(
 	function handle<Args, Result>(
 		callback: (args: Args, context: RequestContext) => Promise<Result>,
 	) {
-		return (args: Args, context: RequestContext): Promise<Result> => {
-			requireChatId(context);
+		return async (args: Args, context: RequestContext) => {
+			const chatId = requireChatId(context);
 			context.mcpReq.signal.throwIfAborted();
-			return callback(args, context);
+			const result = await callback(args, context).catch(
+				async (error: unknown) => {
+					const message =
+						error instanceof Error ? error.message : String(error);
+					if (Buffer.byteLength(message) <= MAX_RESULT_BYTES / 4) throw error;
+					const resultId = await broker.saveResponse(
+						chatId,
+						JSON.stringify({ isError: true, message }),
+					);
+					throw new Error(
+						`Tool failed. Full error is retained: get_operation(${JSON.stringify({ resultId, offset: 0 })})`,
+					);
+				},
+			);
+			if (Buffer.byteLength(JSON.stringify(result)) <= MAX_RESULT_BYTES - 1024)
+				return result;
+			const resultId = await broker.saveResponse(
+				chatId,
+				JSON.stringify(result),
+			);
+			context.mcpReq.signal.throwIfAborted();
+			const reference = formatResult(
+				textResult({
+					resultId,
+					format: "json",
+					next: { resultId, offset: 0 },
+					message:
+						"Full response retained; snapshots expire 24h after first capture. Read sequential get_operation pages without repeating the original operation.",
+				}),
+				chatId,
+			);
+			// Keep small widget state inline even when unrelated pending text is paged.
+			if (
+				typeof result === "object" &&
+				result !== null &&
+				"structuredContent" in result
+			) {
+				const structured = result.structuredContent;
+				if (
+					typeof structured === "object" &&
+					structured !== null &&
+					"question" in structured
+				) {
+					const widget = {
+						...reference,
+						structuredContent: {
+							...reference.structuredContent,
+							question: structured.question,
+						},
+					};
+					if (
+						Buffer.byteLength(JSON.stringify(widget)) >
+						MAX_RESULT_BYTES - 1024
+					)
+						throw new Error(
+							`Question metadata exceeds the inline budget; saved resultId=${resultId}. Shorten the question before opening a widget.`,
+						);
+					return widget;
+				}
+			}
+			return reference;
 		};
 	}
 
@@ -122,7 +183,7 @@ export function createServer(
 		{
 			title: "Connect to OMP",
 			description:
-				"Select this chat's default OMP session and return its environment, active native tool and Skill shortlists, and participation instructions. Tool shortlist entries are for capability selection only; use tools before first native use to obtain the current full definition. Read task-relevant Skills through their skill:// URI instead of preloading all Skill contents. Use the task's sessionId to resume, or find it by cwd/name with sessions. Read recent history when resuming work.",
+				"Select this chat's default OMP session and return its environment, active native tool and Skill shortlists, and participation instructions. Tool shortlist entries are for capability selection only; use tools before first native use to obtain the current full definition. Large catalogs return resultId; follow get_operation pages to inspect every entry. Read task-relevant Skills through their skill:// URI instead of preloading all Skill contents. Use the task's sessionId to resume, or find it by cwd/name with sessions. Read recent history when resuming work.",
 			outputSchema,
 			inputSchema: z.object({
 				sessionId: z
@@ -479,15 +540,37 @@ export function createServer(
 		{
 			title: "Get long operation status",
 			description:
-				"Read durable operation status, waiting model inputs, and retained native results without re-executing work. waiting_input is a known-unexecuted batch; completed refers to the native batch, not child jobs it may have started.",
+				"Read an operation with operationId, or recover an oversized tool response with resultId and offset. Follow nextOffset while hasMore is true; pages contain ordered JSON-fragment text. Neither path re-executes native work. waiting_input is a known-unexecuted batch; completed refers to its native batch, not child jobs.",
 			outputSchema,
-			inputSchema: z.object({
-				operationId: z.string().trim().min(1).max(128),
-			}),
+			inputSchema: z
+				.object({
+					operationId: z.string().trim().min(1).max(128).optional(),
+					resultId: z
+						.string()
+						.regex(/^[a-f0-9]{64}$/)
+						.optional(),
+					offset: z.number().int().nonnegative().safe().optional(),
+				})
+				.refine(
+					(value) =>
+						(value.operationId !== undefined) !==
+						(value.resultId !== undefined),
+					"Supply operationId or resultId, not both",
+				)
+				.refine(
+					(value) => value.offset === undefined || value.resultId !== undefined,
+					"offset requires resultId",
+				),
 			annotations: toolAnnotations("get_operation"),
 		},
-		handle(async ({ operationId }, context) => {
-			const result = broker.operation(requireChatId(context), operationId);
+		handle(async ({ operationId, resultId, offset = 0 }, context) => {
+			const chatId = requireChatId(context);
+			if (resultId) {
+				const text = await broker.readResponse(chatId, resultId);
+				return responsePage(resultId, text, offset, chatId);
+			}
+			if (!operationId) throw new Error("operationId is required");
+			const result = broker.operation(chatId, operationId);
 			return finish(
 				context,
 				{
@@ -666,6 +749,50 @@ export function createServer(
 	);
 
 	return server;
+}
+
+function responsePage(
+	resultId: string,
+	text: string,
+	offset: number,
+	chatId: string,
+) {
+	if (offset > text.length)
+		throw new Error("Result offset exceeds the snapshot length");
+	const page = (end: number) =>
+		formatResult(
+			textResult({
+				resultId,
+				format: "json-fragment",
+				offset,
+				text: text.slice(offset, end),
+				hasMore: end < text.length,
+				...(end < text.length ? { nextOffset: end } : {}),
+				totalCharacters: text.length,
+			}),
+			chatId,
+		);
+	let low = offset,
+		high = Math.min(text.length, offset + MAX_RESULT_BYTES);
+	while (low < high) {
+		const middle = Math.ceil((low + high) / 2);
+		if (
+			Buffer.byteLength(JSON.stringify(page(middle))) <=
+			MAX_RESULT_BYTES - 1024
+		)
+			low = middle;
+		else high = middle - 1;
+	}
+	// Do not split a Unicode surrogate pair across pages.
+	if (
+		low > offset &&
+		low < text.length &&
+		/[\uD800-\uDBFF]/.test(text[low - 1] ?? "")
+	)
+		low--;
+	if (low === offset && offset < text.length)
+		throw new Error("Cannot fit result page");
+	return page(low);
 }
 
 function textResult(

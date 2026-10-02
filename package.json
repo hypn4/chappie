@@ -18,7 +18,8 @@
 		"prepack": "bun scripts/build.mjs",
 		"test:omp": "bun scripts/build.mjs && bun scripts/verify-omp.mjs",
 		"test:otunnel": "bun scripts/verify-otunnel.mjs",
-		"verify:package": "bun scripts/verify-package.mjs"
+		"verify:package": "bun scripts/verify-package.mjs",
+		"quality:evidence": "bun scripts/quality-evidence.mjs"
 	},
 	"keywords": [
 		"omp",

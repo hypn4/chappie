@@ -15,17 +15,24 @@ async function temporary(t) {
 	return root;
 }
 
-test("archive policy rejects traversal and local secrets", async () => {
+test("archive policy rejects unsafe paths for the intended reason", async () => {
 	const { validateArchivePaths } = await api;
-	for (const path of [
-		"package/../secret",
-		"/package/src/a",
-		"package/src/.env.local",
-		"package/src/client.key",
-		"package/.local-tracker/a",
-		"package/src/a\\b",
+	assert.doesNotThrow(() =>
+		validateArchivePaths([
+			"package/",
+			"package/src/a.ts",
+			"package/package.json",
+		]),
+	);
+	for (const [path, error] of [
+		["package/../secret", /Unsafe archive path/],
+		["/package/src/a", /Unexpected tarball root/],
+		["package/src/.env.local", /must not match|not match/i],
+		["package/src/client.key", /must not match|not match/i],
+		["package/.local-tracker/a", /must not match|not match/i],
+		["package/src/a\\b", /Unsafe archive path/],
 	])
-		assert.throws(() => validateArchivePaths([path]), undefined, path);
+		assert.throws(() => validateArchivePaths([path]), error, path);
 });
 
 test("installed verification rejects a mismatched package version", async (t) => {

@@ -18,6 +18,8 @@ export type OperationStatus =
 
 export interface OperationReceipt {
 	key: string;
+	/** Unique acceptance incarnation; unchanged by a waiting_input resume. */
+	executionId?: string | undefined;
 	/** Stable caller-visible identifier for detached operations. */
 	operationId?: string | undefined;
 	signature: string;

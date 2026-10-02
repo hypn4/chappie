@@ -142,6 +142,7 @@ export type SessionRequest =
 			chatId: string;
 			requestId?: string;
 			operationKey?: string;
+			executionId?: string | undefined;
 			text: string;
 			replyTo?: string;
 	  }
@@ -151,6 +152,7 @@ export type SessionRequest =
 			chatId: string;
 			requestId?: string;
 			operationKey?: string;
+			executionId?: string | undefined;
 			calls: ToolCall[];
 			direct?: boolean;
 	  }
@@ -182,6 +184,7 @@ export type BrokerMessage =
 			chatId: string;
 			requestId?: string;
 			operationKey?: string;
+			executionId?: string | undefined;
 	  }
 	| {
 			type: "chat";
@@ -189,6 +192,7 @@ export type BrokerMessage =
 			chatId: string;
 			requestId?: string;
 			operationKey?: string;
+			executionId?: string | undefined;
 			sessionId: string;
 			text: string;
 			replyTo?: string;
@@ -199,6 +203,7 @@ export type BrokerMessage =
 			chatId: string;
 			requestId?: string;
 			operationKey?: string;
+			executionId?: string | undefined;
 			sessionId: string;
 			calls: ToolCall[];
 			direct?: boolean;

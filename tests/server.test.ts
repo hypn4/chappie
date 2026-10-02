@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import type { DeliveryRecord } from "../src/delivery.ts";
+import type { SessionToolResult } from "../src/ipc.ts";
 import { mcpFixture } from "./helpers/mcp-fixture.ts";
 import { sessionFixture } from "./helpers/session-fixture.ts";
 
@@ -9,7 +11,7 @@ const resource = {
 	mimeType: "text/plain",
 	size: 1,
 };
-const tool = {
+const tool: SessionToolResult = {
 	role: "toolResult",
 	toolCallId: "tool-1",
 	toolName: "transfer",
@@ -18,7 +20,7 @@ const tool = {
 	content: [{ type: "text", text: "done" }],
 	details: { resources: [resource] },
 };
-const delivery = {
+const delivery: DeliveryRecord = {
 	id: "pending-1",
 	chatId: "server-test",
 	sessionId: "A",
@@ -96,6 +98,7 @@ test("get_operation delivers and acknowledges the matching detached result", asy
 				updatedAt: 1,
 			},
 			deliveries: [pending],
+			inputs: [],
 		}),
 	});
 	const result = await f.call("get_operation", { operationId: "long-read" });
@@ -148,6 +151,7 @@ test("cancel_operation returns durable cancellation state", async (t) => {
 					error: "Operation cancelled by ChatGPT",
 				},
 				deliveries: [],
+				inputs: [],
 			};
 		},
 	});
@@ -266,10 +270,8 @@ test("completed transfer replay re-exposes unread resources to the same ChatGPT 
 
 test("new sessions expose their host and agent directory", async (t) => {
 	const f = await sessionFixture(t);
-	const session = f.broker.listSessions()[0] as unknown as {
-		host?: string;
-		agentDir?: string;
-	};
+	const session = f.broker.listSessions()[0];
+	assert.ok(session);
 	assert.equal(session.host, "omp");
 	assert.equal(session.agentDir, f.root);
 });
@@ -300,7 +302,18 @@ test("native transfer failure details remain an MCP error with all member result
 				{
 					...tool,
 					toolName: "transfer",
-					content: [{ type: "text", text: "member results" }],
+					content: [
+						{
+							type: "text",
+							text: JSON.stringify({
+								failed: true,
+								files: [
+									{ path: "good", bytes: 3 },
+									{ path: "bad", error: "HTTP 404" },
+								],
+							}),
+						},
+					],
 					details: {
 						failed: true,
 						files: [
@@ -317,13 +330,40 @@ test("native transfer failure details remain an MCP error with all member result
 		operationId: "mixed",
 	});
 	assert.equal(result.isError, true);
+	const content = result.content as Array<{ type: string; text?: string }>;
+	const members = content
+		.filter((block) => block.type === "text")
+		.map((block) => {
+			try {
+				return JSON.parse(block.text ?? "");
+			} catch {
+				return undefined;
+			}
+		})
+		.find((value) => value?.files);
+	assert.deepEqual(members, {
+		failed: true,
+		files: [
+			{ path: "good", bytes: 3 },
+			{ path: "bad", error: "HTTP 404" },
+		],
+	});
 });
 
 test("observer initialization does not deliver another execution's pending result", async (t) => {
 	const f = await mcpFixture(t, {
 		deliveries: () => [delivery],
 		initialize: async () => ({
-			session: { id: "A", cwd: "/fixture" },
+			selection: "explicit",
+			tools: [],
+			skills: [],
+			session: {
+				id: "A",
+				cwd: "/fixture",
+				host: "omp",
+				device: "test",
+				status: "idle",
+			},
 			inputs: [],
 			initialization: {
 				sessionId: "A",

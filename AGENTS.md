@@ -1,35 +1,31 @@
-# Chappie
+# Chappie contributor entrypoint
 
-Chappie connects ChatGPT MCP 2.0 tools and Events to native Oh My Pi (OMP) sessions. The standalone Pi host and pre-2026 MCP protocols are not supported.
+Chappie is a Chat-only bridge from ChatGPT to native Oh My Pi (OMP), not an inference service. Work must remain recoverable after a new Chat or compaction. Store decisions and evidence outside the conversation, then verify them against current source before acting.
 
-## Architecture
+## Start or resume
 
-The only extension entry is `src/index.omp.ts`, compiled to `dist/src/index.omp.js`. The independent `chappie-omp` executable starts the MCP broker via `src/cli.omp.ts`. `serveMcp` uses the SDK's `serveStdio` with `legacy: "reject"`; every request uses MCP `2026-07-28` metadata and discovery. OMP uses its native AI message/event types, tools, and schema conversion; there are no Pi adapters, provider-host switches or cross-host stream casts. Local IPC uses Unix sockets or Windows named pipes; remote sessions use mutually authenticated TLS.
+1. Confirm the intended session/cwd and inspect current Git state. Preserve unrelated and prior uncommitted changes.
+2. Read the [quality standard](docs/quality.md) and the task-relevant [quality Skill](.agents/skills/chappie-quality/SKILL.md). With OMP, read `skill://chappie-quality` when registered; otherwise read that repository file. Newly added Skills may require the host's documented resource reload.
+3. Run `bd prime`, then `bd show <issue-id>`; without an ID inspect in-progress work before creating a duplicate. Restore its `CHECKPOINT v1`: goal, constraints, decisions/reasons, verified subject, remaining scope and next action.
+4. Revalidate evidence with `bun run quality:evidence inspect <report.json>`. A previous PASS applies only to its source, tests, lockfile, environment and exact command. A missing log or changed source is not current proof.
+5. Load only relevant OMP Skills and live native/MCP definitions. Follow executor/observer guidance and current user authorization. Read-only Git inspection is allowed; commit, push, merge, deploy, global configuration and remote sync require explicit authorization.
 
-The broker owns ChatGPT conversation bindings, initialization cooldowns, MCP request routing, deferred-result descriptors, and resource dispatch. The host extension owns provider output, native tool execution, session input, branch history, cancellation, and the bytes behind exported resources.
+## Source map
 
-The public MCP surface is a small bridge, not a replica of OMP native tools. init gives Chat compact native-tool and OMP Skill catalogs; Skill entries expose only normalized name, first-line description and stable skill:// URI, never filesystem paths or full contents. tools exposes selected current native definitions, including registered MCP-backed tools. Chappie instructions own only meta-routing: relevant-Skill discovery, progressive tool discovery, specific-capability preference, definition lifetime, batching boundaries and safe fallback. Never copy Skill contents or tool-specific syntax/routing rules into Chappie because OMP Skills and live definitions are authoritative and can change independently. call and start_call share the bounded JSON envelope and ToolCall builder in native-calls.ts; OMP owns tool-specific schemas, permissions and execution. Do not reintroduce read/bash/edit/write wrappers, a broker native-schema cache, alternate encodings or an inference router. transfer remains explicit for host-injected files and resource handling. Keep execution annotations truthful.
+| Need | Authority |
+|---|---|
+| Review, tests, evidence, checkpoint and completion | [docs/quality.md](docs/quality.md) |
+| Component boundaries and reasons for settled decisions | [docs/architecture.md](docs/architecture.md) |
+| Public/native operations, ownership and recovery | [docs/tools.md](docs/tools.md) |
+| Package identity, locked tools, CI and release procedure | [docs/publishing.md](docs/publishing.md), `package.json`, `.github/workflows/` |
+| Current task state | Beads issue; no parallel TODO/HANDOFF/MEMORY ledger |
 
-OMP's custom API registration is process-wide. Keep its dispatcher stateless: route each request through the caller's `onPayload` / `before_provider_request` hook and exact session ID, not the last registered extension instance. Native main-agent context keeps its original messages and carries an in-process, symbol-keyed provenance marker that is ignored by provider serialization; the Chappie provider requires that exact-session marker for primary requests, while recognized auxiliary generations use their explicit generation route and unrelated auxiliary inference is rejected before acquiring an output. Request-scoped provider hooks are authoritative when resume-time model state is temporarily unavailable, but explicit model switches remain authoritative and must tear down the Chappie session. Completed OMP results are delivered at `turn_end`, independently of later provider requests or TODO continuations.
+## Non-negotiable boundaries
 
-Broker and OMP must use the same agent directory. Chappie resolves `OMP_PROFILE`, `PI_CONFIG_DIR`, and `PI_CODING_AGENT_DIR`, which are current OMP launch inputs. Do not reintroduce the removed `PI_PROFILE` alias or pull the inference host into the standalone broker runtime. Optional current OMP peers describe this separate-process layout, not support for an old runtime.
+Keep OMP as the source of truth for native arguments, permissions and execution. Keep logical operation IDs separate from acceptance execution IDs; uncertain work is not automatically retried. Preserve conversation/session/file ownership, mTLS and staged writes. Do not reintroduce direct native wrappers, retired host/protocol compatibility, Events/Tasks, webhooks, heartbeat processes, schema caches or auxiliary inference routers.
 
-One accepted MCP tool request normally becomes one native host tool batch. `start_call` is the deliberate exception for long work: it persists an explicit operation receipt, detaches native execution from the originating ChatGPT request signal, and returns immediately; `get_operation` and deferred deliveries expose later completion. Durable operation receipts reject conflicting replays and prevent accepted work from being executed again. Export receipts retain inert resource references; a source read is not proof of ChatGPT file receipt. A `call` array requests native batch execution explicitly; Chappie does not combine separate MCP requests. Requests are ordered within a session, while different sessions operate independently.
+Use existing tests and fixtures rather than a second framework. Report implementation, local verification, review, CI, publication and live validation separately. Do not call inline review independent review or claim a host/UI check that was not performed. Follow the quality standard's stop conditions rather than repeatedly reopening work for speculative hardening.
 
-A recognized pending model request returns needs_input/executed:false for unexecuted work, consistently across call, chat, detached execution and native collaboration relays. Persist as waiting_input, not completed/cancelled. Initial acceptance and same-ID reclaim must install a cancellation owner before reservation can yield and check it before dispatch; concurrent submitters must also validate arguments. Retry only known-unexecuted work. Cancelling a waiting operation must not abort the independent generation.
+## Before stopping
 
-Chappie is Chat-only. Do not advertise MCP Events or Tasks, add webhook callbacks, heartbeat loops, or background wake-up protocols. Detached results and model-input waits are recovered through explicit get_operation, later Chappie interactions, and history. Pending deliveries, webpage answers, and surfaced OMP inputs are acknowledged only after the corresponding MCP response is successfully written to the transport; a failed send must leave them pending for a later response. Preserve stable execution IDs; transport retries or acknowledgement must never cause native re-execution. Full detached results remain repeatably readable after pending-delivery acknowledgement.
-
-`chat` completes one assistant turn. Remote work arriving while the agent is idle starts a new turn through an invisible custom control message that is removed from model context.
-
-File bytes belong to the originating session. Resource reads retain that ownership across conversation binding changes. Session-to-session copies use the existing broker connections so the devices only need to reach the broker.
-
-`chappie.state.json` under the selected host's agent directory stores conversation bindings, questions, operation receipts, retained detached results, and delivery markers. Bindings record their last use and are pruned after 30 idle days during normal load/count/save activity. Terminal operation receipts and retained results are kept for 24 hours; unresolved running/waiting/uncertain receipts are not evicted automatically and size limits fail closed. RC.11 eventSubscriptions/eventOutbox fields are discarded on load and never written again.
-
-Native messages, tool results, and activity records stay in the host session transcript. History reads the current branch through an independent IPC request and returns original entry IDs and timestamps. Its response remains separate from input and pending-result delivery, and file references are not emitted as fresh attachments.
-
-## Development
-
-Use `bun run format`, `bun run check`, `bun run test:omp`, and artifact verification. TypeScript targets ESNext with ESM, strict checks and native resource-management syntax. The runtime baseline is OMP 18.4.8; CI uses that pinned version rather than an old compatibility floor. Require JSON batches and native read selectors/edit input; do not recreate removed aliases. Keep platform-specific filesystem/TLS/IPC safeguards. `bunfig.toml` keeps the three-day package age policy; deliberate release-train updates follow the narrow lockfile refresh procedure in `docs/publishing.md`.
-
-Fork releases use `@hypn4/chappie`; see `docs/publishing.md`. Keep the original license and author, publish only validated tarballs, and never include local task data or credentials.
+Update the issue checkpoint with reasons, exact evidence and the next authorized action. Close only satisfied scope. Keep referenced evidence accessible; do not delete another task's logs or generated resources. Repository rules and current user instructions override generic Skill defaults; remain inline unless subagents are explicitly authorized.

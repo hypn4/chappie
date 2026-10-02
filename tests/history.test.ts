@@ -53,8 +53,12 @@ test("history pagination keeps native entry IDs stable across refreshed reads", 
 	assert.match(JSON.stringify(refreshed.content), /two updated/);
 });
 
-test("history pages have a bounded maximum size", () => {
-	assert.throws(() => historyInput.parse({ limit: 201 }), /too big|200/i);
+test("history entry limits accept both boundaries and reject invalid counts", () => {
+	assert.equal(historyInput.parse({}).limit, 20);
+	for (const limit of [1, 200])
+		assert.equal(historyInput.parse({ limit }).limit, limit);
+	for (const limit of [0, -1, 1.5, 201])
+		assert.throws(() => historyInput.parse({ limit }), { name: "ZodError" });
 });
 
 test("history output stays within the IPC content budget and keeps newest entries", () => {
@@ -86,5 +90,46 @@ test("history output stays within the IPC content budget and keeps newest entrie
 	const result = historyResult([large, latest], "A", { limit: 2 });
 	assert.ok(result.content.length <= 4096);
 	assert.match(JSON.stringify(result.content), /latest-entry/);
-	assert.match(JSON.stringify(result.content), /truncated/i);
+	assert.equal(result.hasMore, true);
+	assert.equal(result.count, 1);
+});
+
+test("history preserves oversized entries for lossless final response paging", () => {
+	const large = {
+		type: "message",
+		id: "large-text",
+		parentId: null,
+		timestamp: new Date(1).toISOString(),
+		message: {
+			role: "assistant",
+			content: [{ type: "text" as const, text: "\u0001".repeat(1024 * 1024) }],
+			api: "chappie",
+			provider: "chappie",
+			model: "chatgpt",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					total: 0,
+				},
+			},
+			stopReason: "stop",
+			timestamp: 1,
+		},
+	} as SessionEntry;
+	const result = historyResult([large], "A", { limit: 1 });
+	assert.equal(result.hasMore, false);
+	assert.equal(result.count, 1);
+	assert.equal(result.content[1]?.type, "text");
+	assert.equal(
+		(result.content[1] as { text: string }).text,
+		"\u0001".repeat(1024 * 1024),
+	);
 });

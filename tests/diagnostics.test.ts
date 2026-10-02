@@ -100,7 +100,7 @@ async function diagnosticFixture(t: TestContext) {
 									},
 								},
 							],
-						} as unknown as SessionMessage);
+						});
 					}
 					if (message.type === "ackInputs") acknowledged.resolve(message.ids);
 					if (message.type === "cancel") cancelled.resolve(message);

@@ -5,6 +5,7 @@ import {
 	serveStdio,
 } from "@modelcontextprotocol/server/stdio";
 import { Broker } from "./broker.ts";
+import { MAX_RESULT_BYTES } from "./responses.ts";
 import { createServer, type ResponseCommit } from "./server.ts";
 
 /** All callers, including protocol tests, use the same modern-only boundary. */
@@ -24,6 +25,25 @@ export function serveMcp(
 	};
 	const originalSend = transport.send;
 	transport.send = async (message, sendOptions) => {
+		// Defense at the actual wire boundary, including SDK-generated tool errors.
+		if (
+			("error" in message ||
+				("result" in message &&
+					typeof message.result === "object" &&
+					message.result !== null &&
+					"content" in message.result)) &&
+			Buffer.byteLength(JSON.stringify(message)) > MAX_RESULT_BYTES
+		) {
+			message = {
+				jsonrpc: "2.0",
+				id: message.id,
+				error: {
+					code: -32603,
+					message:
+						"Response exceeds the bridge byte budget; pending data was not acknowledged. Recover the original result instead of repeating execution.",
+				},
+			};
+		}
 		const responseId =
 			"id" in message &&
 			("result" in message || "error" in message) &&
@@ -38,7 +58,16 @@ export function serveMcp(
 			if (responseId !== undefined) {
 				const pending = commits.get(responseId) ?? [];
 				commits.delete(responseId);
-				if (sent) {
+				if (
+					sent &&
+					"result" in message &&
+					!(
+						typeof message.result === "object" &&
+						message.result !== null &&
+						"isError" in message.result &&
+						message.result.isError === true
+					)
+				) {
 					for (const commit of pending) {
 						try {
 							await commit();

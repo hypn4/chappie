@@ -184,6 +184,7 @@ test("late export results retain references even after their delivery record is 
 	};
 	const delivery = {
 		id: "late-result",
+		...state.executionSource(identity.key),
 		operationKey: identity.key,
 		chatId: "chat",
 		sessionId: "A",

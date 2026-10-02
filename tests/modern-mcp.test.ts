@@ -1,25 +1,18 @@
 import assert from "node:assert/strict";
 import { type TestContext, test } from "node:test";
-import type { JSONRPCMessage, Transport } from "@modelcontextprotocol/server";
 import type { Broker } from "../src/broker.ts";
-import { serveMcp } from "../src/stdio.ts";
+import type { OperationView } from "../src/operations.ts";
+import { mcpClient, record, resultOf } from "./helpers/mcp-client.ts";
 
 const owner = "modern-test";
-const operation = {
+const operation: OperationView = {
 	operationId: "long-op",
 	sessionId: "A",
 	cwd: "/fixture",
-	updatedAt: Date.now(),
+	updatedAt: 1,
 	status: "running",
 };
-function record(value: unknown): Record<string, unknown> {
-	assert.ok(value && typeof value === "object" && !Array.isArray(value));
-	return value as Record<string, unknown>;
-}
-async function fixture(
-	t: TestContext,
-	overrides: Record<string, unknown> = {},
-) {
+function fixture(t: TestContext, overrides: Partial<Broker> = {}) {
 	const broker = {
 		askEnabled: false,
 		deliveries: () => [],
@@ -29,76 +22,19 @@ async function fixture(
 		operation: (chatId: string, id: string) => {
 			if (id !== "long-op" || chatId !== owner)
 				throw new Error("Operation not found");
-			return { operation, deliveries: [] };
+			return { operation, deliveries: [], inputs: [] };
 		},
 		...overrides,
-	} as unknown as Broker;
-	const pending = new Map<number, (message: JSONRPCMessage) => void>();
-	const transport: Transport = {
-		async start() {},
-		async close() {
-			transport.onclose?.();
-		},
-		async send(message) {
-			if ("id" in message && typeof message.id === "number")
-				pending.get(message.id)?.(message);
-		},
+	} satisfies Partial<Broker>;
+	const client = mcpClient(t, broker as Broker);
+	return {
+		request: (
+			method: string,
+			params: Record<string, unknown> = {},
+			chatId: string | null = owner,
+			modern = true,
+		) => client.request(method, params, { chatId, modern }),
 	};
-	const errors: Error[] = [];
-	const handle = serveMcp(broker, {
-		transport,
-		onerror: (error) => errors.push(error),
-	});
-	t.after(() => handle.close());
-	let id = 0;
-	async function request(
-		method: string,
-		params: Record<string, unknown> = {},
-		chat: string | null = owner,
-		modern = true,
-	) {
-		const next = ++id;
-		const completion = Promise.withResolvers<JSONRPCMessage>();
-		pending.set(next, completion.resolve);
-		const timer = setTimeout(
-			() =>
-				completion.reject(
-					new Error(
-						`MCP ${method} timed out: ${errors.map((e) => e.message).join("; ")}`,
-					),
-				),
-			1500,
-		);
-		transport.onmessage?.({
-			jsonrpc: "2.0",
-			id: next,
-			method,
-			params: {
-				...params,
-				_meta: {
-					...(modern
-						? {
-								"io.modelcontextprotocol/protocolVersion": "2026-07-28",
-								"io.modelcontextprotocol/clientCapabilities": {},
-							}
-						: {}),
-					...(chat === null ? {} : { "openai/session": chat }),
-					"otunnel/requestId": `test-${next}`,
-				},
-			},
-		});
-		try {
-			return await completion.promise;
-		} finally {
-			clearTimeout(timer);
-			pending.delete(next);
-		}
-	}
-	return { request };
-}
-function resultOf(message: JSONRPCMessage) {
-	assert.ok("result" in message, JSON.stringify(message));
-	return record(message.result);
 }
 
 test("modern discovery stays tool-only for Chat and does not serve Events", async (t) => {
@@ -154,6 +90,7 @@ test("get_operation returns retained native output after pending delivery was ac
 		operation: () => ({
 			operation: { ...operation, status: "completed" },
 			deliveries: [],
+			inputs: [],
 			result: {
 				id: "retained",
 				chatId: owner,
@@ -163,6 +100,8 @@ test("get_operation returns retained native output after pending delivery was ac
 				complete: true,
 				toolResults: [
 					{
+						role: "toolResult",
+						timestamp: 1,
 						toolCallId: "read-result",
 						toolName: "read",
 						isError: false,

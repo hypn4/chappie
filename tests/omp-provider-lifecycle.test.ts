@@ -3,10 +3,10 @@ import { test } from "node:test";
 import { IpcClient, type SessionMessage } from "../src/ipc.ts";
 import { hasOmpPrimaryContext } from "../src/omp-primary-context.ts";
 import { ProviderOutput } from "../src/provider-core.ts";
+import { until } from "./helpers/async.ts";
 import {
 	multiSessionFixture,
 	sessionFixture,
-	until,
 } from "./helpers/session-fixture.ts";
 
 const model = { api: "chappie", provider: "chappie", id: "chatgpt" };
