@@ -64,6 +64,50 @@ test("native calls are transparent while host file provenance stays exclusive to
 	assert.equal(seen[1]?.[5], true);
 });
 
+for (const name of ["call", "start_call"]) {
+	test(`${name} preserves native text and encoded data without rewriting or clipping`, async (t) => {
+		const seen: unknown[] = [];
+		const f = await mcpFixture(t, {
+			call: async (_chat, _session, calls) => {
+				seen.push(calls);
+				return { sessionId: "A", cwd: "/fixture", inputs: [], toolResults: [] };
+			},
+			startCall: async (_chat, _session, calls, operationId) => {
+				seen.push(calls);
+				return {
+					operation: {
+						operationId,
+						sessionId: "A",
+						cwd: "/fixture",
+						status: "running",
+						updatedAt: 1,
+					},
+				};
+			},
+		});
+		const content = "const label = '한글';\r\n".repeat(800);
+		assert.ok(Buffer.byteLength(content, "utf8") > 12_192);
+		const calls = [
+			{ name: "write", arguments: { path: "문서/example.ts", content } },
+			{
+				name: "extension_data",
+				arguments: {
+					base64: "SGVsbG8=",
+					literal: "'\"\\\r\n",
+					nested: [null, true],
+				},
+			},
+		];
+		const result = await f.call(name, {
+			sessionId: "A",
+			calls,
+			...(name === "start_call" ? { operationId: "native-payload" } : {}),
+		});
+		assert.notEqual(result.isError, true);
+		assert.deepEqual(seen, [calls]);
+	});
+}
+
 test("removed wrapper names fail instead of being silently redirected", async (t) => {
 	const f = await mcpFixture(t);
 	for (const name of ["read", "bash", "edit", "write"]) {

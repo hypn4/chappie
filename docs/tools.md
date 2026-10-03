@@ -84,6 +84,35 @@ live definitions and the host's discovered native facilities for current job sta
 
 Use `call` or `start_call` for every native coding tool. Chappie validates only the bounded JSON batch envelope; OMP owns each tool's arguments, validation, permissions, anchors and execution. Batch only calls whose arguments are already known and belong to the same native turn. If a later call needs an earlier result (for example, discover a path, then read it, then edit using returned anchors), use separate `call` requests. Inspect every native result before continuing; `isError` or native failure details mean the batch did not fully succeed. `transfer` remains directly exposed because ChatGPT supplies its file objects and handles exported resources. Unsupported schema conversion is reported as `schemaError`; refresh the definition instead of guessing a replacement schema or encoding a rejected command.
 
+### Focused file changes and delivery recovery
+
+For existing files, discover the active editing capability and read the target
+before editing. Prefer focused native `edit` operations with current anchors,
+or `ast_edit` when a structural transformation fits. Use `write` for new files
+or an explicitly intended whole-file replacement. These are native examples,
+not fixed broker wrappers; the selected session's definitions remain authoritative.
+Break large changes into coherent edits, inspect each result and refresh anchors.
+Dependent writes and checks must use separate batches; known arguments alone do
+not make those operations independent.
+
+Do not generate a large patch program in a separate analysis tool, print its
+Base64 representation, and copy it into a shell command. A giant heredoc or
+whole-file replacement is not a remedy for a rejected native edit. Where a real
+programmatic transformation is needed, use the discovered native `eval` or
+specialized tool with local files and focused inputs rather than an encoded
+round trip. Ordinary encoded data remains valid when the native tool supports
+it. This is controller guidance, not a new input-size limit or content filter.
+
+A message-delivery timeout alone does not establish whether a tool ran or where
+delivery failed. Recover a known operation/result ID and inspect relevant history
+and the current target before deciding what remains. Never blindly resubmit a
+possibly applied mutation or create a fresh ID around an uncertain receipt.
+Only the existing known-unexecuted input-wait path permits same-ID resume.
+Denials remain denials; smaller requests, encodings and different tools must not
+bypass them. The native wait budget does not bound host-side argument generation
+or delivery before Chappie receives a request. This guidance does not add a
+heartbeat, autonomous wake-up or forced end to a long controller turn.
+
 Chappie is a ChatGPT-controlled transport, not a general-purpose inference API.
 OMP provider requests must belong to a live session through its request hook and
 session ID. Chappie relays the recognized OMP compaction and branch-summary

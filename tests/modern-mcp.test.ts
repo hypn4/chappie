@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import { type TestContext, test } from "node:test";
 import type { Broker } from "../src/broker.ts";
 import type { OperationView } from "../src/operations.ts";
@@ -47,6 +48,17 @@ test("modern discovery stays tool-only for Chat and does not serve Events", asyn
 	assert.equal(capabilities.extensions, undefined);
 	const events = await f.request("events/list");
 	assert.ok("error" in events);
+});
+
+test("discovery delivers the complete authored instruction resource", async (t) => {
+	const authored = (
+		await readFile(new URL("../src/instructions.md", import.meta.url), "utf8")
+	).trim();
+	assert.ok(authored.length > 0);
+	const f = fixture(t);
+	const discovery = resultOf(await f.request("server/discover"));
+	// This checks delivery fidelity, not whether a model follows the prose.
+	assert.equal(discovery.instructions, authored);
 });
 
 test("modern start_call returns supported durable operation output, not a fake Task", async (t) => {

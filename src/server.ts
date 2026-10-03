@@ -474,7 +474,7 @@ export function createServer(
 		{
 			title: "Call OMP tools",
 			description:
-				"Execute one discovered native OMP batch. Fast results return inline; after a 25-second native wait budget, a durably accepted batch yields operation.operationId without cancelling execution. Recover with get_operation; cancel explicitly with cancel_operation. Prefer start_call for known long work. Neither result form completes the user goal: inspect continuation/work and continue authorized scope. Use the most specific native capability. Batch only independent calls; dependent steps require separate calls. Native schemas and permissions remain OMP-owned. needs_input/executed:false means no work ran.",
+				"Execute one discovered native OMP batch. Fast results return inline; after a 25-second native wait budget, a durably accepted batch yields operation.operationId without cancelling execution. Recover with get_operation; cancel explicitly with cancel_operation. Prefer start_call for known long work. Neither result form completes the user goal: inspect continuation/work and continue authorized scope. Use the most specific native capability; prefer focused native edits over encoded shell mutation scripts. Batch only independent calls; dependent edits and checks require separate batches. Native schemas and permissions remain OMP-owned. needs_input/executed:false means no work ran.",
 			outputSchema,
 			inputSchema: z.strictObject({
 				calls: nativeCallsSchema,
@@ -515,7 +515,7 @@ export function createServer(
 		{
 			title: "Start long OMP tool batch",
 			description:
-				"Start one discovered native OMP batch independently of this MCP request. Apply the same discovery and batching rules as call: use current full definitions, and do not batch calls whose arguments depend on earlier results. Returns one batch's durable operation status, not completion of all TODOs. Use get_operation or a later Chappie interaction to recover status and retained results. Reuse the same operationId and arguments; explicitly resume waiting_input only after handling its model request.",
+				"Start one discovered native OMP batch independently of this MCP request. Apply the same discovery, focused native editing and independent-batch rules as call; do not replace native edits with encoded shell mutation scripts. Returns one batch's durable operation status, not completion of all TODOs. Use get_operation or a later Chappie interaction to recover status and retained results. Reuse the same operationId and arguments; explicitly resume waiting_input only after handling its model request.",
 			outputSchema,
 			inputSchema: z.strictObject({
 				operationId: z
