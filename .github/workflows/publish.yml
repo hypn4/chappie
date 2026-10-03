@@ -1,8 +1,9 @@
 name: publish
 
 on:
-  release:
-    types: [published]
+  workflow_run:
+    workflows: [release]
+    types: [completed]
   workflow_dispatch:
     inputs:
       tag:
@@ -22,23 +23,35 @@ concurrency:
 
 jobs:
   npm:
-    if: github.repository == 'hypn4/chappie' && (vars.NPM_TRUSTED_PUBLISHING == 'true' || inputs.dry_run == true)
+    if: >-
+      github.repository == 'hypn4/chappie' &&
+      (vars.NPM_TRUSTED_PUBLISHING == 'true' || inputs.dry_run == true) &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.head_repository.full_name == github.repository))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: release
     permissions:
       actions: read
-      contents: read
+      contents: write
       id-token: write
     env:
-      RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
+      RELEASE_TAG: ${{ inputs.tag }}
+      SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
       GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Validate tag
-        run: '[[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]'
+      - name: Validate source identity
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = workflow_run ]; then
+            [[ "$SOURCE_SHA" =~ ^[a-f0-9]{40}$ ]]
+          else
+            [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]
+          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ github.event.workflow_run.head_sha || inputs.tag }}
           fetch-depth: 0
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
@@ -52,8 +65,13 @@ jobs:
       - name: Validate release identity
         id: metadata
         run: |
-          test "$(git rev-list -n 1 "$RELEASE_TAG")" = "$(git rev-parse HEAD)"
           git merge-base --is-ancestor HEAD origin/main
+          if [ "$GITHUB_EVENT_NAME" = workflow_run ]; then
+            test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+            RELEASE_TAG="v$(node -p "JSON.parse(require('node:fs').readFileSync('package.json', 'utf8')).version")"
+          fi
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]
+          test "$(git rev-list -n 1 "$RELEASE_TAG")" = "$(git rev-parse HEAD)"
           bun scripts/release-metadata.mjs "$RELEASE_TAG"
           echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           npm_version="$(npm --version)"
@@ -67,24 +85,34 @@ jobs:
             { test "$npm_minor" -gt 5 || { test "$npm_minor" -eq 5 && test "$npm_patch" -ge 1; }; }
           }
       - name: Recover the immutable verified artifact
+        id: recover
         env:
           RELEASE_COMMIT: ${{ steps.metadata.outputs.commit }}
+          RELEASE_TAG: ${{ steps.metadata.outputs.tag }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
         run: |
-          run_id="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/release.yml/runs?head_sha=$RELEASE_COMMIT&status=success&per_page=20" --jq '.workflow_runs | sort_by(.created_at) | last | .id')"
-          test -n "$run_id"
-          test "$run_id" != null
+          run_id="$SOURCE_RUN_ID"
+          if [ -z "$run_id" ]; then
+            run_id="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/release.yml/runs?head_sha=$RELEASE_COMMIT&status=success&per_page=20" --jq '.workflow_runs | sort_by(.created_at) | last | .id')"
+          fi
+          [[ "$run_id" =~ ^[1-9][0-9]*$ ]]
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" > run.json
+          run_id="$(bun scripts/verify-release-run.mjs run.json "$RELEASE_COMMIT")"
           mkdir verified release
           gh run download "$run_id" -R "$GITHUB_REPOSITORY" -n npm-package -D verified
           gh release download "$RELEASE_TAG" -p package.tgz -D release
           cmp verified/package.tgz release/package.tgz
           cp verified/package.tgz package.tgz
-      - run: bun scripts/verify-package.mjs package.tgz
+          echo "run-id=$run_id" >> "$GITHUB_OUTPUT"
+      - id: artifact
+        run: bun scripts/verify-package.mjs package.tgz
       - name: Dry run
         if: inputs.dry_run == true
         env:
           DIST_TAG: ${{ steps.metadata.outputs.distTag }}
         run: npm publish ./package.tgz --ignore-scripts --access public --tag "$DIST_TAG" --dry-run
       - name: Publish release artifact with npm OIDC
+        id: publish
         if: inputs.dry_run != true
         env:
           DIST_TAG: ${{ steps.metadata.outputs.distTag }}
@@ -92,3 +120,31 @@ jobs:
           test -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}"
           test -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}"
           npm publish ./package.tgz --ignore-scripts --access public --tag "$DIST_TAG"
+      - name: Verify registry version, channel and integrity
+        id: registry
+        if: inputs.dry_run != true
+        env:
+          PACKAGE_NAME: ${{ steps.metadata.outputs.name }}
+          PACKAGE_VERSION: ${{ steps.metadata.outputs.version }}
+          DIST_TAG: ${{ steps.metadata.outputs.distTag }}
+          EXPECTED_INTEGRITY: ${{ steps.artifact.outputs.integrity }}
+          NPM_CONFIG_FETCH_RETRIES: '0'
+          NPM_CONFIG_FETCH_TIMEOUT: '10000'
+        run: |
+          for attempt in {1..18}; do
+            if npm view "$PACKAGE_NAME@$PACKAGE_VERSION" version dist.integrity --json --registry=https://registry.npmjs.org > registry.json &&
+               npm view "$PACKAGE_NAME" dist-tags --json --registry=https://registry.npmjs.org > tags.json &&
+               jq -e --arg version "$PACKAGE_VERSION" --arg integrity "$EXPECTED_INTEGRITY" '.version == $version and .["dist.integrity"] == $integrity' registry.json &&
+               jq -e --arg channel "$DIST_TAG" --arg version "$PACKAGE_VERSION" '.[$channel] == $version' tags.json; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 18 ]; then sleep 10; fi
+          done
+          echo "Registry publication could not be verified" >&2
+          exit 1
+      - name: Publish the verified GitHub release
+        id: release
+        if: inputs.dry_run != true
+        env:
+          RELEASE_TAG: ${{ steps.metadata.outputs.tag }}
+        run: gh release edit "$RELEASE_TAG" --draft=false
