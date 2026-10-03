@@ -34,4 +34,8 @@ export const operationReceiptSchema = z.strictObject({
 		.optional(),
 	resources: z.array(operationResourceSchema).max(16384).optional(),
 	waitingInputs: z.array(modelInputSchema).max(4096).optional(),
+	resultId: z
+		.string()
+		.regex(/^[a-f0-9]{64}$/)
+		.optional(),
 });

@@ -79,7 +79,8 @@ test("fast calls remain inline and do not queue a duplicate deferred delivery", 
 	const result = await queued.pending;
 	assert.ok("result" in result);
 	assert.equal(result.result.toolResults.length, 1);
-	assert.equal(result.result.operation, undefined);
+	assert.equal(result.result.operation?.status, "completed");
+	assert.ok(result.result.operation?.resultId);
 	assert.equal(f.broker.deliveries("test-chat").length, 0);
 });
 
@@ -486,4 +487,53 @@ test("native failure after soft detach remains visible instead of becoming goal 
 	const text = String(record(recovered.structuredContent).text);
 	assert.match(text, /inspect_failure/);
 	assert.match(text, /native validation failed/);
+});
+
+test("the response budget can expire during fast snapshot persistence without losing either recovery path", async (t) => {
+	const clock = callClock(t);
+	const f = await sessionFixture(t);
+	const saving = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	t.after(() => release.resolve());
+	const save = f.broker.saveResponse.bind(f.broker);
+	t.mock.method(
+		f.broker,
+		"saveResponse",
+		async (chat: string, text: string) => {
+			saving.resolve();
+			await release.promise;
+			return save(chat, text);
+		},
+	);
+	const pending = f.broker.call(
+		"test-chat",
+		"A",
+		calls,
+		"snapshot-budget",
+		f.controller.signal,
+	);
+	void pending.catch(() => {});
+	await f.complete(await f.dispatch());
+	await saving.promise;
+	clock.expire();
+	const yielded = await pending;
+	assert.ok(yielded.operation);
+	const id = yielded.operation.operationId;
+	assert.equal(
+		f.broker.operation("test-chat", id).result?.toolResults.length,
+		1,
+	);
+	release.resolve();
+	await until(() =>
+		Boolean(f.broker.operation("test-chat", id).operation.resultId),
+	);
+	const completed = f.broker.operation("test-chat", id);
+	assert.ok(completed.operation.resultId);
+	assert.match(
+		await f.broker.readResponse("test-chat", completed.operation.resultId),
+		/completed/,
+	);
+	await f.broker.acknowledge(completed.deliveries, [], f.controller.signal);
+	assert.equal(f.broker.deliveries("test-chat").length, 0);
+	assert.equal(f.aborts, 0);
 });

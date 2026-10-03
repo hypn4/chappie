@@ -590,9 +590,9 @@ export function createServer(
 	server.registerTool(
 		"get_operation",
 		{
-			title: "Get long operation status",
+			title: "Recover native operation results",
 			description:
-				"Read an operation with operationId, or recover an oversized tool response with resultId and offset. Follow nextOffset while hasMore is true; pages contain ordered JSON-fragment text. Neither path re-executes native work. waiting_input is a known-unexecuted batch; completed refers to its native batch, not child jobs or the user goal. Retained work observations are historical; check the current scoped tracker before deciding the next action.",
+				"Read an operation with operationId, or read its saved public output with resultId and offset. When a response and its IDs were lost, supply sessionId to list this conversation's recent receipts (default 10, maximum 20); this does not execute or bind a session. Follow nextOffset while snapshot hasMore is true. A completed fast call exposes operation.resultId. These reads never re-execute native work or confirm model/UI receipt. waiting_input is known-unexecuted; completed refers to a batch, not child jobs or the user goal. Check current history and scoped work before continuing.",
 			outputSchema,
 			inputSchema: z
 				.object({
@@ -602,66 +602,85 @@ export function createServer(
 						.regex(/^[a-f0-9]{64}$/)
 						.optional(),
 					offset: z.number().int().nonnegative().safe().optional(),
+					sessionId: z.string().trim().min(1).max(4096).optional(),
+					limit: z.number().int().min(1).max(20).optional(),
 				})
 				.refine(
 					(value) =>
-						(value.operationId !== undefined) !==
-						(value.resultId !== undefined),
-					"Supply operationId or resultId, not both",
+						[value.operationId, value.resultId, value.sessionId].filter(
+							(selector) => selector !== undefined,
+						).length === 1,
+					"Supply exactly one of operationId, resultId, or sessionId",
 				)
 				.refine(
 					(value) => value.offset === undefined || value.resultId !== undefined,
 					"offset requires resultId",
+				)
+				.refine(
+					(value) => value.limit === undefined || value.sessionId !== undefined,
+					"limit requires sessionId",
 				),
 			annotations: toolAnnotations("get_operation"),
 		},
-		handle(async ({ operationId, resultId, offset = 0 }, context) => {
-			const chatId = requireChatId(context);
-			if (resultId) {
-				const text = await broker.readResponse(chatId, resultId);
-				return responsePage(resultId, text, offset, chatId);
-			}
-			if (!operationId) throw new Error("operationId is required");
-			const result = broker.operation(chatId, operationId);
-			return finish(
+		handle(
+			async (
+				{ operationId, resultId, sessionId, limit, offset = 0 },
 				context,
-				{
-					content: [
-						...textResult(
-							{
-								operation: result.operation,
-								...(result.result?.work ? { work: result.result.work } : {}),
-								continuation: continuationFor({
-									operationStatus: result.operation.status,
-									work: result.result?.work,
-									needsInput: result.inputs.length > 0,
-									failed:
-										Boolean(result.result?.error) ||
-										(result.result?.toolResults.some(
-											(item) =>
-												item.isError ||
-												(item.details as { failed?: boolean } | undefined)
-													?.failed === true,
-										) ??
-											false),
-								}),
-							},
-							result.inputs,
-						).content,
-						...(result.result
-							? toolResultsContent(
-									result.result.toolResults,
-									result.result.sessionId,
-								)
-							: deliveryContent(result.deliveries)),
-					],
-				},
-				false,
-				result.deliveries.length
-					? () => broker.acknowledge(result.deliveries, [], committedSignal)
-					: undefined,
-			);
-		}),
+			) => {
+				const chatId = requireChatId(context);
+				if (sessionId) {
+					return finish(
+						context,
+						textResult(broker.recentOperations(chatId, sessionId, limit)),
+						false,
+					);
+				}
+				if (resultId) {
+					const text = await broker.readResponse(chatId, resultId);
+					return responsePage(resultId, text, offset, chatId);
+				}
+				if (!operationId) throw new Error("operationId is required");
+				const result = broker.operation(chatId, operationId);
+				return finish(
+					context,
+					{
+						content: [
+							...textResult(
+								{
+									operation: result.operation,
+									...(result.result?.work ? { work: result.result.work } : {}),
+									continuation: continuationFor({
+										operationStatus: result.operation.status,
+										work: result.result?.work,
+										needsInput: result.inputs.length > 0,
+										failed:
+											Boolean(result.result?.error) ||
+											(result.result?.toolResults.some(
+												(item) =>
+													item.isError ||
+													(item.details as { failed?: boolean } | undefined)
+														?.failed === true,
+											) ??
+												false),
+									}),
+								},
+								result.inputs,
+							).content,
+							...(result.result
+								? toolResultsContent(
+										result.result.toolResults,
+										result.result.sessionId,
+									)
+								: deliveryContent(result.deliveries)),
+						],
+					},
+					false,
+					result.deliveries.length
+						? () => broker.acknowledge(result.deliveries, [], committedSignal)
+						: undefined,
+				);
+			},
+		),
 	);
 
 	server.registerTool(

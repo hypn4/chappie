@@ -11,7 +11,7 @@ import {
 	operationReceiptSchema,
 	operationResourceSchema,
 } from "./operation-schema.ts";
-import type { OperationReceipt } from "./operations.ts";
+import type { OperationReceipt, RecentOperations } from "./operations.ts";
 import type { QuestionAnswer, QuestionRecord } from "./questions.ts";
 import { questionOutput } from "./questions.ts";
 import {
@@ -299,11 +299,22 @@ export class State {
 		status: OperationReceipt["status"],
 		resources: ResourceDescriptor[] = [],
 		error?: string,
+		response?: { executionId: string; resultId: string },
 	): Promise<void> {
 		await this.#maintenance;
 		if (!key) return;
 		const archived = !this.#operations.has(key);
 		const receipt = this.#receipt(key);
+		if (response) {
+			if (!receipt || receipt.executionId !== response.executionId)
+				throw new StaleOperationDeliveryError(
+					"Response belongs to a replaced acceptance",
+				);
+			if (!/^[a-f0-9]{64}$/.test(response.resultId))
+				throw new Error("Invalid result identifier");
+			if (receipt.resultId && receipt.resultId !== response.resultId)
+				throw new Error("Operation response snapshot is immutable");
+		}
 		if (!receipt) return;
 		if (archived) this.#operations.set(key, receipt);
 		// Persist only bounded descriptors, never file bytes or signed download URLs.
@@ -325,6 +336,7 @@ export class State {
 		});
 		if (original.length > 16384)
 			throw new Error("Too many operation resource references");
+		if (response) receipt.resultId = response.resultId;
 		if (original.length && !receipt.resources?.length)
 			receipt.resources = [
 				...new Map(
@@ -387,6 +399,37 @@ export class State {
 		if (!receipt)
 			throw new Error("Operation not found in this ChatGPT conversation");
 		return receipt;
+	}
+
+	/** Bounded discovery, not a task ledger or a scan of cold replay-protection files. */
+	recentOperations(
+		chatId: string,
+		sessionId: string,
+		limit = 10,
+	): RecentOperations {
+		if (!sessionId || !Number.isSafeInteger(limit) || limit < 1 || limit > 20)
+			throw new Error(
+				"Recent operations require a sessionId and a limit from 1 to 20",
+			);
+		this.#pruneOperations();
+		const matching = [...this.#operations.values()]
+			.filter(
+				(receipt) =>
+					receipt.chatId === chatId && receipt.sessionId === sessionId,
+			)
+			.sort((a, b) => b.updatedAt - a.updatedAt || a.key.localeCompare(b.key));
+		return {
+			scope: "recent",
+			sessionId,
+			observedAt: Date.now(),
+			operations: matching.slice(0, limit).map((receipt) => ({
+				operationId: recoveryOperationId(receipt),
+				status: receipt.status,
+				updatedAt: receipt.updatedAt,
+				...(receipt.resultId ? { resultId: receipt.resultId } : {}),
+			})),
+			hasOlder: matching.length > limit,
+		};
 	}
 
 	deliveriesForOperation(chatId: string, key: string): DeliveryRecord[] {

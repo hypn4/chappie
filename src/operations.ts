@@ -32,6 +32,8 @@ export interface OperationReceipt {
 	error?: string | undefined;
 	resources?: OperationResource[] | undefined;
 	waitingInputs?: ModelInput[] | undefined;
+	/** Immutable public result snapshot; independent of transport ACK and execution status. */
+	resultId?: string | undefined;
 }
 
 export interface ReplayReceipt {
@@ -49,6 +51,18 @@ export interface OperationView {
 	updatedAt: number;
 	error?: string | undefined;
 	resources?: OperationResource[] | undefined;
+	resultId?: string | undefined;
+}
+
+export interface RecentOperations {
+	scope: "recent";
+	sessionId: string;
+	observedAt: number;
+	operations: Pick<
+		OperationView,
+		"operationId" | "status" | "updatedAt" | "resultId"
+	>[];
+	hasOlder: boolean;
 }
 
 export function validateOperationId(value: unknown): string {
@@ -149,6 +163,7 @@ export function operationView(receipt: OperationReceipt): OperationView {
 		sessionId: receipt.sessionId,
 		cwd: receipt.cwd,
 		updatedAt: receipt.updatedAt,
+		...(receipt.resultId ? { resultId: receipt.resultId } : {}),
 		...(receipt.error ? { error: receipt.error } : {}),
 		...(receipt.resources?.length
 			? { resources: structuredClone(receipt.resources) }

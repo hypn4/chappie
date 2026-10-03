@@ -150,8 +150,40 @@ const signal = controller.signal;
 async function completedCall(...args) {
 	const response = await broker.call(...args);
 	if (response.replay) return response;
-	if (!response.operation) {
+	if (!response.operation || response.toolResults.length > 0) {
 		assert.equal(response.toolResults.length, args[2].length);
+		// Direct host file transfers retain their separate delivery contract.
+		if (args[5] === true) {
+			assert.equal(response.operation, undefined);
+			return response;
+		}
+		assert.ok(
+			response.operation?.resultId,
+			"Fast native output needs a disk recovery snapshot",
+		);
+		const saved = JSON.parse(
+			await broker.readResponse(args[0], response.operation.resultId),
+		);
+		const resultIds = saved.content.flatMap((block) => {
+			if (block.type !== "text") return [];
+			try {
+				const value = JSON.parse(block.text);
+				return value.toolCallId ? [value.toolCallId] : [];
+			} catch {
+				return [];
+			}
+		});
+		assert.deepEqual(
+			resultIds,
+			response.toolResults.map((item) => item.toolCallId),
+		);
+		assert.ok(
+			broker
+				.recentOperations(args[0], response.sessionId)
+				.operations.some(
+					(item) => item.operationId === response.operation.operationId,
+				),
+		);
 		return response;
 	}
 	const [chatId] = args;

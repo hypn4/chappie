@@ -16,7 +16,7 @@ and CI verification baseline is 18.5.0. These are separate support and test poli
 | `ask_assert` | Confirm that an `ask` widget loaded. |
 | `call` | Run a native batch; return fast results inline or yield a durable operation after the wait budget. |
 | `start_call` | Durably start a native OMP tool batch without keeping the ChatGPT MCP request open. |
-| `get_operation` | Read operation status with `operationId`, or losslessly page a retained tool response with `resultId` and `offset`. |
+| `get_operation` | Read a known `operationId`, page saved output with `resultId` and `offset`, or discover the conversation's recent receipts with `sessionId`. |
 | `cancel_operation` | Explicitly request cancellation of a detached native batch. |
 | `transfer` | Move files between ChatGPT and OMP, copy between OMP sessions, or export a OMP image. |
 
@@ -151,7 +151,15 @@ For `start_call`, this feedback persists as `waiting_input`; `get_operation` ret
 
 ### Long-running operations
 
-`call` waits up to a 25-second application budget after session selection, including native queueing. Fast results remain inline. Once a receipt is durably reserved, exceeding the budget yields `operation` with its caller-visible `operationId` and current state, without cancelling or restarting the native batch. Use `get_operation` for completion or input-wait recovery and `cancel_operation` for explicit cancellation. The budget is not a documented ChatGPT deadline or a hard real-time guarantee: storage, scheduling and session selection can add latency. For work known to be long, avoid that initial wait by using `start_call`:
+`call` waits up to a 25-second application budget after session selection, including native queueing. Fast results remain inline. Once a receipt is durably reserved, exceeding the budget yields `operation` with its caller-visible `operationId` and current state, without cancelling or restarting the native batch. Use `get_operation` for completion or input-wait recovery and `cancel_operation` for explicit cancellation. The budget is not a documented ChatGPT deadline or a hard real-time guarantee: storage, scheduling and session selection can add latency.
+
+Fast ordinary calls also return `operation.operationId` and `operation.resultId`, while keeping their native output inline. The snapshot contains public native output and historical work observations, not raw private tool details or live model-input requests. An ID on a successful inline result does not require an extra fetch. If the transport response is lost, recover the saved output with `get_operation({ resultId, offset: 0 })`; this never repeats execution or queues a duplicate deferred delivery. These snapshots share the [bounded result continuation](#bounded-result-continuation) limits. If persistence fails after execution, Chappie reports that fact with the completed receipt's handle; reconcile history instead of resubmitting the batch.
+
+When the original response and all of its IDs were lost, use `get_operation({ sessionId, limit: 10 })`. Supply exactly one of `sessionId`, `operationId`, or `resultId`; `limit` is optional (1–20) and applies only to `sessionId`, while `offset` applies only to `resultId`. Recent discovery works from broker state even while OMP is offline, does not change the default binding, and neither executes work nor acknowledges pending delivery. It returns a bounded newest-first list with `scope: "recent"`, `observedAt`, and `hasOlder`; this is not a paginated or exhaustive task ledger and does not scan the cold uncertainty archive. `init.recovery` contains the same default recent summary for the selected session.
+
+Discovery is scoped to the originating ChatGPT conversation and OMP session. A different Chat must use authorized OMP history and the project checkpoint, not another Chat's result IDs. Known archived receipt IDs remain recoverable through the existing operation selector. Empty recent lists, expired snapshots and successful reads never imply that native work did not happen or that the model/UI received an earlier response. Always reconcile the current task and pending inputs before continuing.
+
+For a known long-running batch, use `start_call`:
 
 ```json
 {

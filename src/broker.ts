@@ -30,6 +30,7 @@ import {
 	type OperationView,
 	operationIdentity,
 	operationView,
+	type RecentOperations,
 	type ReplayReceipt,
 	replayReceipt,
 	validateOperationId,
@@ -52,7 +53,7 @@ import {
 	StaleOperationDeliveryError,
 	State,
 } from "./state.ts";
-import type { ToolInput } from "./tools.ts";
+import { type ToolInput, toolResult } from "./tools.ts";
 import type { ChatMode, SessionWork } from "./work.ts";
 
 const observerInstructions =
@@ -99,6 +100,7 @@ export interface InitializedSession
 	selection: "existing" | "explicit" | "automatic";
 	initialization?: Initialization;
 	globalAgents?: { path: string };
+	recovery?: RecentOperations;
 	inputs: SessionInput[];
 	tools: { name: string; description: string }[];
 	skills: { name: string; description?: string; uri: string }[];
@@ -321,6 +323,7 @@ export class Broker {
 				...(initialization ? { initialization } : {}),
 				session: inspection.session,
 				...(inspection.work ? { work: inspection.work } : {}),
+				recovery: this.recentOperations(chatId, target),
 				tools: inspection.tools.map(({ name, description }) => ({
 					name,
 					description: compactSummary(description) ?? "",
@@ -620,12 +623,51 @@ export class Broker {
 								complete: true,
 							}));
 					}
+					const resources = result.toolResults.flatMap((item) =>
+						resourceDescriptors(item.details),
+					);
+					let response: { executionId: string; resultId: string } | undefined;
+					if (recovery && !recovery.detached) {
+						const executionId = executionSource.executionId;
+						if (!executionId)
+							throw new Error("Native completion has no acceptance identity");
+						try {
+							// Store only public output, not raw tool details or live model inputs.
+							const resultId = await this.saveResponse(
+								chatId,
+								JSON.stringify(
+									toolResult(
+										result.toolResults,
+										target,
+										result.cwd,
+										[],
+										undefined,
+										undefined,
+										undefined,
+										{ work: result.work },
+									),
+								),
+							);
+							response = { executionId, resultId };
+						} catch (error) {
+							if (isCurrent())
+								await this.#state.finishOperation(
+									identity?.key,
+									"completed",
+									resources,
+								);
+							throw new Error(
+								`Native batch completed, but its recovery snapshot could not be saved. Recovery operation: ${recovery.operationId}. Inspect get_operation and OMP history; do not repeat execution.`,
+								{ cause: error },
+							);
+						}
+					}
 					await this.#state.finishOperation(
 						identity?.key,
 						"completed",
-						result.toolResults.flatMap((result) =>
-							resourceDescriptors(result.details),
-						),
+						resources,
+						undefined,
+						response,
 					);
 					await this.#confirmBindingUse(chatId, sessionId, target);
 					return {
@@ -635,6 +677,12 @@ export class Broker {
 						toolResults: result.toolResults,
 						inputs: result.inputs,
 						...(result.work ? { work: result.work } : {}),
+						...(recovery
+							? {
+									operation: this.operation(chatId, recovery.operationId)
+										.operation,
+								}
+							: {}),
 					};
 				}
 				await this.#state.finishOperation(identity?.key, "uncertain");
@@ -838,6 +886,14 @@ export class Broker {
 			result: this.#state.resultForOperation(chatId, operationId),
 			inputs: receipt.waitingInputs ?? [],
 		};
+	}
+
+	recentOperations(
+		chatId: string,
+		sessionId: string,
+		limit = 10,
+	): RecentOperations {
+		return this.#state.recentOperations(chatId, sessionId, limit);
 	}
 
 	async #recordInputWait(
