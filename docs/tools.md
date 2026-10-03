@@ -2,6 +2,8 @@
 
 Chappie targets native Oh My Pi (OMP) 18.4.8+ and MCP 2.0 (`2026-07-28`).
 Legacy MCP handshakes and the standalone Pi host are not supported.
+The supported peer minimum remains 18.4.8 within 18.x; the current development
+and CI verification baseline is 18.5.0. These are separate support and test policies.
 
 | Tool | Purpose |
 |---|---|
@@ -74,6 +76,11 @@ Chappie applies a 32 KiB UTF-8 byte budget to final tool-result JSON, including 
 Before first use of a native tool whose full definition is not already available for the current session, request it with `tools({ names: [...] })`; request several candidate definitions together when choosing between tools. Registered OMP MCP tools appear in the same native catalog and are first-class capabilities. Prefer a specialized native/MCP capability over reproducing it with `bash`, `eval`, generic text search, manual HTTP calls, or a generic web path when the specialized integration materially matches the task. Explicit user/project instructions take precedence over Skill/tool guidance.
 
 Skills guide workflows; native definitions govern execution. Reuse a full definition while the target session and native toolset remain unchanged. Refresh after changing sessions/toolsets or after an unavailable/schema error. Definitions are read from the current session on every discovery request; there is no broker-side native schema cache. Never infer arguments from the shortlist, guess old aliases, or switch to a broader tool solely to bypass validation or approval.
+
+OMP 18.5.0 displays reports such as `/tools`, `/jobs`, `/context` and selected
+`/mcp` views outside the transcript. Do not assume that invoking a report makes
+its contents recoverable through `history`. Use Chappie's `tools` discovery for
+live definitions and the host's discovered native facilities for current job state.
 
 Use `call` or `start_call` for every native coding tool. Chappie validates only the bounded JSON batch envelope; OMP owns each tool's arguments, validation, permissions, anchors and execution. Batch only calls whose arguments are already known and belong to the same native turn. If a later call needs an earlier result (for example, discover a path, then read it, then edit using returned anchors), use separate `call` requests. Inspect every native result before continuing; `isError` or native failure details mean the batch did not fully succeed. `transfer` remains directly exposed because ChatGPT supplies its file objects and handles exported resources. Unsupported schema conversion is reported as `schemaError`; refresh the definition instead of guessing a replacement schema or encoding a rejected command.
 
@@ -339,6 +346,14 @@ A large response from any core tool returns a reference rather than losing text:
 ```
 
 Call `get_operation({ resultId, offset: 0 })`, then use each returned `nextOffset` while `hasMore` is true. Concatenate the `text` fragments in order and parse the resulting JSON to recover the original tool result, including its original content blocks and native resource references. Offsets count JavaScript string code units, not bytes; follow the returned offsets rather than calculating them. Pages do not execute OMP tools, change session ownership, acknowledge new input, or recreate attachments. The same page is repeatably readable.
+
+Lossless here describes the response Chappie actually received. OMP applies its
+own retention limits before that boundary: since 18.4.9, saved bash and eval
+output artifacts are capped at 16 MB by default (`tools.artifactMaxBytes`),
+preserving their beginning and latest output. Paging a Chappie result cannot
+recover bytes already discarded by OMP. When complete command output is required,
+explicitly preserve it in an appropriately managed native file; do not silently
+disable host limits or promise that a retained result contains unlimited output.
 
 Snapshots live in the broker's private `chappie.results` directory, are scoped to the originating Chat conversation, and are checked against their content hash. They expire 24 hours after first creation; re-reading does not renew them. Capacity is 128 snapshots / 256 MiB total, with a 128 MiB per-snapshot ceiling. New saves remove expired snapshots, never unexpired ones to make room. Capacity or persistence errors fail without acknowledging pending data. These bounds do not imply survival of a power failure or receipt by ChatGPT's UI.
 

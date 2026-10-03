@@ -4,9 +4,9 @@
 	"description": "ChatGPT MCP 2.0 bridge for native Oh My Pi sessions",
 	"devDependencies": {
 		"@biomejs/biome": "2.5.15",
-		"@oh-my-pi/pi-ai": "18.4.8",
-		"@oh-my-pi/pi-coding-agent": "18.4.8",
-		"@oh-my-pi/pi-utils": "18.4.8",
+		"@oh-my-pi/pi-ai": "18.5.0",
+		"@oh-my-pi/pi-coding-agent": "18.5.0",
+		"@oh-my-pi/pi-utils": "18.5.0",
 		"@types/node": "26.6.3",
 		"typescript": "7.0.2"
 	},

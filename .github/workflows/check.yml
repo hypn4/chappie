@@ -39,6 +39,11 @@ jobs:
       - run: bun run check
       - if: matrix.os == 'windows-latest'
         run: bun run test:omp
+      - name: Verify forced native operation recovery on Windows
+        if: matrix.os == 'windows-latest'
+        env:
+          CHAPPIE_VERIFY_CALL_WAIT_MS: '1'
+        run: bun run test:omp
 
   runtime:
     runs-on: ubuntu-latest
@@ -53,9 +58,14 @@ jobs:
           bun-version-file: .bun-version
       - run: bun ci
       - run: bun audit --audit-level=high
-      - name: Verify the pinned native OMP runtime
-        run: bun -e 'const p = await Bun.file("node_modules/@oh-my-pi/pi-coding-agent/package.json").json(); console.log("OMP", p.version)'
+      - name: Verify the manifest-selected OMP runtime
+        id: omp
+        run: bun scripts/omp-version.mjs
       - run: bun run test:omp
+      - name: Verify forced native operation recovery
+        env:
+          CHAPPIE_VERIFY_CALL_WAIT_MS: '1'
+        run: bun run test:omp
       - name: Download otunnel 0.2
         env:
           GH_TOKEN: ${{ github.token }}
@@ -82,19 +92,25 @@ jobs:
         with:
           bun-version-file: .bun-version
       - run: bun ci
+      - name: Select the verified OMP version
+        id: omp
+        run: bun scripts/omp-version.mjs
       - run: bun run build
       - run: bun pm pack --ignore-scripts --filename package.tgz
       - id: inspect
         run: bun scripts/verify-package.mjs package.tgz
       - name: Verify clean consumer
+        env:
+          OMP_VERSION: ${{ steps.omp.outputs.version }}
         run: |
           consumer="${{ runner.temp }}/chappie-consumer"
           bun scripts/verify-package.mjs package.tgz --prepare "$consumer"
           cd "$consumer"
           bun add --ignore-scripts "${{ github.workspace }}/package.tgz"
-          bun add --ignore-scripts @oh-my-pi/pi-coding-agent@18.4.8
+          bun add --ignore-scripts "@oh-my-pi/pi-coding-agent@$OMP_VERSION"
           cd "${{ github.workspace }}"
           bun scripts/verify-package.mjs package.tgz --installed "$consumer" --omp
+          CHAPPIE_VERIFY_CALL_WAIT_MS=1 bun scripts/verify-package.mjs package.tgz --installed "$consumer" --omp
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: npm-package

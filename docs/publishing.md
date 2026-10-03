@@ -29,18 +29,26 @@ Bun's default-secure lifecycle policy is retained. Only dependencies whose
 installation scripts are required by this dependency graph are listed in
 `trustedDependencies`.
 
+The tested OMP baseline is 18.5.0, selected by the three exact development pins
+in `package.json` and installed through `bun.lock`. `bun scripts/omp-version.mjs`
+checks that all three pins and installed packages agree, prints that version,
+and exposes it as `version` when `GITHUB_OUTPUT` is set. Runtime CI and the clean
+consumer use this selector rather than a second version literal or a global
+`omp`. The supported peer minimum remains `^18.4.8`; updating the verification
+baseline does not raise it or add a separate minimum-version test job.
+
 ## Verification pipeline
 
 `check.yml` keeps only distinct verification paths:
 
 1. Run `bun ci` and source checks on Linux and Windows. Windows also runs
-   the current native OMP integration to cover platform-specific process and
-   path behavior.
-2. On Linux, run `bun audit --audit-level=high`, verify the pinned OMP 18.4.8
-   native runtime, and exercise the real otunnel 0.2.0 release binary.
+   current native OMP integration in normal and forced-yield mode to cover
+   platform-specific process and path behavior.
+2. On Linux, run `bun audit --audit-level=high`, verify the manifest-selected
+   OMP runtime in both modes, and exercise the real otunnel 0.2.0 release binary.
 3. Build one tarball on Linux, verify its contents and SHA-512 integrity, then
-   install those same bytes once in a clean Bun consumer with the current OMP
-   runtime.
+   install those same bytes once in a clean Bun consumer with the same selected
+   OMP runtime. Verify both normal and forced-yield execution without repacking.
 4. Upload that verified tarball as `npm-package` for the release workflow.
 
 The maintained tunnel compatibility baseline is `otunnel 0.2.x`. Local
@@ -52,6 +60,7 @@ For a local package check, choose a new, empty directory outside the checkout:
 
 ```sh
 bun ci
+omp_version="$(bun scripts/omp-version.mjs)"
 bun run check
 bun run test:omp
 bun run test:otunnel
@@ -60,9 +69,10 @@ bun pm pack --ignore-scripts --filename package.tgz
 bun scripts/verify-package.mjs package.tgz --prepare /path/to/empty-consumer
 cd /path/to/empty-consumer
 bun add --ignore-scripts /path/to/chappie/package.tgz
-bun add --ignore-scripts @oh-my-pi/pi-coding-agent@18.4.8
+bun add --ignore-scripts "@oh-my-pi/pi-coding-agent@$omp_version"
 cd /path/to/chappie
 bun scripts/verify-package.mjs package.tgz --installed /path/to/empty-consumer --omp
+CHAPPIE_VERIFY_CALL_WAIT_MS=1 bun scripts/verify-package.mjs package.tgz --installed /path/to/empty-consumer --omp
 ```
 
 Source tests and package checks serve different purposes; the package consumer

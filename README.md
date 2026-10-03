@@ -110,7 +110,11 @@ The broker and extension use `~/.omp/agent/chappie.sock` or the corresponding Wi
 
 `bun run check` runs formatting, type checks, and the Bun test suite.
 `bun run test:omp` builds the package and checks a temporary native OMP session
-without model inference. CI tests the pinned OMP 18.4.8 runtime and its packaged installation, including Windows process/path behavior. No old-runtime floor is installed.
+without model inference. The development verification baseline is OMP 18.5.0;
+CI selects it from the exact `package.json` pins and checks the installed packages
+with `bun scripts/omp-version.mjs`. Native Linux/Windows checks and the clean
+package consumer cover normal and forced operation recovery. The supported
+peer minimum remains 18.4.8 within 18.x; no separate minimum-version job runs.
 
 GitHub Actions publishes releases to npm using OIDC and the committed
 `publishConfig.tag`; routine releases do not require an npm login.
@@ -121,6 +125,9 @@ For consistent reviews and work across Chat sessions, start with [AGENTS.md](AGE
 ## Usage
 
 Chappie exposes a small session bridge rather than copying native tool schemas. `init` discovers the complete compact tool/Skill catalog; read relevant `skill://` workflows and request only the needed live definitions with `tools(names)`. Prefer task-specific OMP native/MCP capabilities. `call` runs a native batch, while `start_call` retains long-operation status and results. Oversized responses from any core tool are atomically saved and returned as `resultId`; `get_operation(resultId, offset)` reads lossless pages without repeating native execution. The final response budget counts UTF-8 bytes after formatting, not just individual descriptions.
+
+Lossless paging preserves the response received by Chappie, not output already
+trimmed by OMP's native artifact limits. See [result retention boundaries](docs/tools.md#bounded-result-continuation).
 
 Chappie is Chat-only and does not advertise MCP Events or Tasks. Detached work is durable rather than proactive: `start_call` returns an operation ID, `get_operation` recovers its status/result, and later Chappie interactions also surface pending deliveries. ChatGPT cannot be woken by the broker after the current Chat turn ends.
 
