@@ -4,6 +4,7 @@ import type { Broker } from "../src/broker.ts";
 import type { DeliveryRecord } from "../src/delivery.ts";
 import type { SessionInput } from "../src/ipc.ts";
 import { mcpClient, resultOf } from "./helpers/mcp-client.ts";
+import { quietDiagnostics } from "./helpers/mcp-fixture.ts";
 
 test("failed response send preserves pending output and input until a successful retry", async (t) => {
 	const delivery: DeliveryRecord = {
@@ -32,6 +33,7 @@ test("failed response send preserves pending output and input until a successful
 	const acknowledgedInputs: string[] = [];
 	const broker: Partial<Broker> = {
 		askEnabled: false,
+		diagnostics: quietDiagnostics(),
 		initialize: async () => ({
 			selection: "explicit",
 			session: {
@@ -75,4 +77,71 @@ test("failed response send preserves pending output and input until a successful
 	assert.deepEqual(acknowledged, ["deferred-1"]);
 	assert.deepEqual(acknowledgedInputs, ["input-1"]);
 	assert.deepEqual(pending, []);
+});
+
+test("cancelled response staging cannot acknowledge old data on a reused request id", async (t) => {
+	const saving = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const aborted = Promise.withResolvers<void>();
+	t.after(() => release.resolve());
+	let acknowledgements = 0;
+	const client = mcpClient(t, {
+		askEnabled: false,
+		diagnostics: quietDiagnostics(),
+		initialize: async (
+			_chat: string,
+			_session: string | undefined,
+			_request: unknown,
+			signal: AbortSignal,
+		) => {
+			signal.addEventListener("abort", () => aborted.resolve(), { once: true });
+			return {
+				selection: "explicit",
+				session: {
+					id: "A",
+					cwd: "/fixture",
+					device: "test",
+					host: "omp",
+					status: "idle",
+				},
+				tools: [],
+				skills: [],
+				inputs: [
+					{
+						id: "unread",
+						sessionId: "A",
+						message: {
+							role: "user",
+							timestamp: 1,
+							content: "x".repeat(40_000),
+						},
+					},
+				],
+			};
+		},
+		deliveries: () => [],
+		answers: () => [],
+		acknowledgeInputs: async () => {
+			acknowledgements++;
+		},
+		saveResponse: async () => {
+			saving.resolve();
+			await release.promise;
+			return "a".repeat(64);
+		},
+	} as unknown as Broker);
+	const request = client.call("init", { sessionId: "A" }, { id: 90 });
+	const cancelled = assert.rejects(request, /fixture cancellation/);
+	await saving.promise;
+	client.cancel(90);
+	await aborted.promise;
+	await cancelled;
+	release.resolve();
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	await client.request("server/discover", {}, { id: 90 });
+	assert.equal(
+		acknowledgements,
+		0,
+		"a discovery response did not deliver or acknowledge the cancelled input",
+	);
 });

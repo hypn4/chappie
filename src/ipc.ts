@@ -239,6 +239,8 @@ export class JsonLinePeer<Incoming, Outgoing> {
 	readonly #limits: Required<PeerLimits>;
 	#queuedBytes = 0;
 	#queuedMessages = 0;
+	#queuedWriteBytes = 0;
+	#queuedWrites = 0;
 	#buffer = "";
 	#messages = Promise.resolve();
 	#writes = Promise.resolve();
@@ -274,22 +276,38 @@ export class JsonLinePeer<Incoming, Outgoing> {
 	}
 
 	send(message: Outgoing): Promise<void> {
+		if (this.#closed)
+			return Promise.reject(new Error("Chappie IPC connection is closed"));
 		const line = `${JSON.stringify(message)}\n`;
-		if (Buffer.byteLength(line) > this.#limits.maxFrameBytes)
+		const bytes = Buffer.byteLength(line);
+		if (bytes > this.#limits.maxFrameBytes)
 			return Promise.reject(new Error("IPC frame exceeds the size limit"));
-		const sent = this.#writes.then(
-			() =>
-				new Promise<void>((resolveWrite, rejectWrite) => {
-					if (this.#closed) {
-						rejectWrite(new Error("Chappie IPC connection is closed"));
-						return;
-					}
-					this.#socket.write(line, (error) => {
-						if (error) rejectWrite(error);
-						else resolveWrite();
-					});
-				}),
-		);
+		// Socket backpressure must not become an unbounded chain of retained frames.
+		if (
+			this.#queuedWriteBytes + bytes > this.#limits.maxQueuedBytes ||
+			this.#queuedWrites >= this.#limits.maxQueuedMessages
+		)
+			return Promise.reject(new Error("IPC outbound queue exceeds its limit"));
+		this.#queuedWriteBytes += bytes;
+		this.#queuedWrites++;
+		const sent = this.#writes
+			.then(
+				() =>
+					new Promise<void>((resolveWrite, rejectWrite) => {
+						if (this.#closed) {
+							rejectWrite(new Error("Chappie IPC connection is closed"));
+							return;
+						}
+						this.#socket.write(line, (error) => {
+							if (error) rejectWrite(error);
+							else resolveWrite();
+						});
+					}),
+			)
+			.finally(() => {
+				this.#queuedWriteBytes -= bytes;
+				this.#queuedWrites--;
+			});
 		this.#writes = sent.catch(() => {});
 		return sent;
 	}

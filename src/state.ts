@@ -6,6 +6,11 @@ import * as z from "zod";
 import type { DeliveryRecord } from "./delivery.ts";
 import type { ModelInput } from "./ipc.ts";
 import { deliverySchema, modelInputSchema } from "./ipc-schema.ts";
+import { OperationArchive, recoveryOperationId } from "./operation-archive.ts";
+import {
+	operationReceiptSchema,
+	operationResourceSchema,
+} from "./operation-schema.ts";
 import type { OperationReceipt } from "./operations.ts";
 import type { QuestionAnswer, QuestionRecord } from "./questions.ts";
 import { questionOutput } from "./questions.ts";
@@ -15,14 +20,6 @@ import {
 	resourceDescriptors,
 	resourceSessionId,
 } from "./resources.ts";
-
-const operationResourceSchema = z.strictObject({
-	uri: z.string().min(1).max(4096),
-	name: z.string().min(1).max(4096),
-	mimeType: z.string().min(1).max(4096),
-	size: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
-	sourceReadAt: z.number().finite().nonnegative().optional(),
-});
 
 const BINDING_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const BINDING_TOUCH_MS = 24 * 60 * 60 * 1000;
@@ -59,36 +56,7 @@ const stateSchema = z.strictObject({
 		)
 		.max(1024)
 		.optional(),
-	operations: z
-		.array(
-			z.strictObject({
-				key: z.string(),
-				executionId: z.string().uuid().optional(),
-				operationId: z.string().min(1).max(128).optional(),
-				signature: z.string(),
-				chatId: z.string(),
-				sessionId: z.string(),
-				cwd: z.string(),
-				createdAt: z.number().nonnegative().optional(),
-				status: z.enum([
-					"running",
-					"waiting_input",
-					"completed",
-					"failed",
-					"cancelled",
-					"uncertain",
-				]),
-				updatedAt: z.number().nonnegative(),
-				error: z
-					.string()
-					.max(64 * 1024)
-					.optional(),
-				resources: z.array(operationResourceSchema).max(16384).optional(),
-				waitingInputs: z.array(modelInputSchema).max(4096).optional(),
-			}),
-		)
-		.max(16384)
-		.optional(),
+	operations: z.array(operationReceiptSchema).max(16384).optional(),
 	deliveredIds: z
 		.array(z.tuple([z.string(), z.number().nonnegative()]))
 		.max(4096)
@@ -113,10 +81,13 @@ export class State {
 	#nextBindingRevision = 1;
 	#writeError: unknown;
 	#writeRevision = 0;
+	readonly #archive: OperationArchive;
+	#maintenance = Promise.resolve();
 
 	constructor(agentDir: string) {
 		this.#path = join(agentDir, "chappie.state.json");
 		this.#temporaryPath = `${this.#path}.tmp`;
+		this.#archive = new OperationArchive(agentDir);
 	}
 
 	async load(): Promise<void> {
@@ -174,6 +145,43 @@ export class State {
 			this.#deliveredIds.set(id, time);
 		const operationsChanged = this.#pruneOperations(loadedAt);
 		if (bindingsChanged || operationsChanged) await this.#save();
+		await this.#compactUncertain();
+	}
+
+	#receipt(key: string): OperationReceipt | undefined {
+		return this.#operations.get(key) ?? this.#archive.get(key);
+	}
+
+	#compactUncertain(): Promise<void> {
+		const compacted = this.#maintenance.then(async () => {
+			const cutoff = Date.now() - TERMINAL_RETENTION_MS;
+			const pending = new Set(
+				[...this.#deliveries.values()].map((delivery) => delivery.operationKey),
+			);
+			let changed = false;
+			for (const [key, receipt] of this.#operations) {
+				if (
+					receipt.status !== "uncertain" ||
+					receipt.updatedAt >= cutoff ||
+					pending.has(key) ||
+					this.#operationResults.has(key)
+				)
+					continue;
+				const snapshot = structuredClone(receipt);
+				await this.#archive.save(snapshot);
+				// A cold record must exist before hot replay protection is removed.
+				if (
+					this.#operations.get(key) === receipt &&
+					isDeepStrictEqual(receipt, snapshot)
+				) {
+					this.#operations.delete(key);
+					changed = true;
+				}
+			}
+			if (changed) await this.#save();
+		});
+		this.#maintenance = compacted.catch(() => {});
+		return compacted;
 	}
 
 	ownsOperation(
@@ -182,7 +190,7 @@ export class State {
 		sessionId: string,
 	): boolean {
 		this.#pruneOperations();
-		const receipt = key ? this.#operations.get(key) : undefined;
+		const receipt = key ? this.#receipt(key) : undefined;
 		return receipt?.chatId === chatId && receipt.sessionId === sessionId;
 	}
 
@@ -202,20 +210,23 @@ export class State {
 	async reserveOperation(
 		receipt: OperationReceipt,
 	): Promise<OperationReceipt | undefined> {
+		await this.#compactUncertain();
 		this.#pruneOperations();
 		if (receipt.operationId) {
-			const conflict = [...this.#operations.values()].find(
-				(value) =>
-					value.chatId === receipt.chatId &&
-					value.operationId === receipt.operationId &&
-					value.key !== receipt.key,
-			);
-			if (conflict)
+			const conflict =
+				[...this.#operations.values()].find(
+					(value) =>
+						value.chatId === receipt.chatId &&
+						(recoveryOperationId(value) === receipt.operationId ||
+							value.key === receipt.operationId) &&
+						value.key !== receipt.key,
+				) ?? this.#archive.find(receipt.chatId, receipt.operationId);
+			if (conflict && conflict.key !== receipt.key)
 				throw new Error(
 					"Operation identifier already belongs to another session or operation",
 				);
 		}
-		const existing = this.#operations.get(receipt.key);
+		const existing = this.#receipt(receipt.key);
 		if (existing) {
 			if (existing.signature !== receipt.signature)
 				throw new Error("Operation identifier reused with different arguments");
@@ -268,6 +279,7 @@ export class State {
 		key: string | undefined,
 		inputs: ModelInput[],
 	): Promise<void> {
+		await this.#maintenance;
 		if (!key) return;
 		const receipt = this.#operations.get(key);
 		if (receipt?.status !== "running") return;
@@ -288,9 +300,12 @@ export class State {
 		resources: ResourceDescriptor[] = [],
 		error?: string,
 	): Promise<void> {
+		await this.#maintenance;
 		if (!key) return;
-		const receipt = this.#operations.get(key);
+		const archived = !this.#operations.has(key);
+		const receipt = this.#receipt(key);
 		if (!receipt) return;
+		if (archived) this.#operations.set(key, receipt);
 		// Persist only bounded descriptors, never file bytes or signed download URLs.
 		const original = resources.map((resource) => {
 			const value = operationResourceSchema.parse({
@@ -327,11 +342,13 @@ export class State {
 			else if (status === "completed") delete receipt.error;
 		}
 		await this.#save();
+		if (archived) await this.#archive.remove(receipt);
 	}
 
 	/** Observed source reads do not acknowledge host attachment receipt. */
 	async recordResourceRead(chatId: string, uri: string): Promise<void> {
 		const canonical = canonicalResourceUri(uri);
+		await this.#maintenance;
 		let changed = false;
 		for (const receipt of this.#operations.values()) {
 			if (receipt.chatId !== chatId) continue;
@@ -350,10 +367,19 @@ export class State {
 		operationId: string,
 	): OperationReceipt | undefined {
 		this.#pruneOperations();
-		const receipt = [...this.#operations.values()].find(
-			(value) => value.chatId === chatId && value.operationId === operationId,
-		);
-		return receipt ? structuredClone(receipt) : undefined;
+		const receipt =
+			[...this.#operations.values()].find(
+				(value) =>
+					value.chatId === chatId &&
+					(recoveryOperationId(value) === operationId ||
+						value.key === operationId),
+			) ?? this.#archive.find(chatId, operationId);
+		return receipt
+			? structuredClone({
+					...receipt,
+					operationId: recoveryOperationId(receipt),
+				})
+			: undefined;
 	}
 
 	operation(chatId: string, operationId: string): OperationReceipt {
@@ -492,11 +518,14 @@ export class State {
 	}
 
 	async addDelivery(delivery: DeliveryRecord): Promise<void> {
+		await this.#maintenance;
 		this.#pruneOperations();
 		if (!this.#deliveries.has(delivery.id) && this.#deliveries.size >= 2048)
 			throw new Error("Pending delivery limit reached");
+		const archived =
+			!!delivery.operationKey && !this.#operations.has(delivery.operationKey);
 		const receipt = delivery.operationKey
-			? this.#operations.get(delivery.operationKey)
+			? this.#receipt(delivery.operationKey)
 			: undefined;
 		if (delivery.operationKey && !receipt)
 			throw new StaleOperationDeliveryError(
@@ -515,6 +544,10 @@ export class State {
 			throw new Error(
 				"Operation result belongs to another conversation or session",
 			);
+		if (receipt) {
+			receipt.operationId ??= recoveryOperationId(receipt);
+			if (archived) this.#operations.set(receipt.key, receipt);
+		}
 		if (receipt?.operationId && delivery.complete) {
 			if (
 				!this.#operationResults.has(receipt.key) &&
@@ -532,6 +565,7 @@ export class State {
 			),
 		);
 		await this.#save();
+		if (archived && receipt) await this.#archive.remove(receipt);
 	}
 
 	question(chatId: string, id: string): QuestionRecord {
@@ -650,6 +684,7 @@ export class State {
 	}
 
 	async flush(): Promise<void> {
+		await this.#maintenance;
 		await this.#acknowledgements;
 		await this.#writes;
 		if (this.#writeError) throw this.#writeError;

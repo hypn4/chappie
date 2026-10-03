@@ -4,6 +4,7 @@ import { type TestContext, test } from "node:test";
 import type { Broker } from "../src/broker.ts";
 import type { OperationView } from "../src/operations.ts";
 import { mcpClient, record, resultOf } from "./helpers/mcp-client.ts";
+import { quietDiagnostics } from "./helpers/mcp-fixture.ts";
 
 const owner = "modern-test";
 const operation: OperationView = {
@@ -16,6 +17,7 @@ const operation: OperationView = {
 function fixture(t: TestContext, overrides: Partial<Broker> = {}) {
 	const broker = {
 		askEnabled: false,
+		diagnostics: quietDiagnostics(),
 		deliveries: () => [],
 		answers: () => [],
 		acknowledge: async () => {},

@@ -175,6 +175,10 @@ and Windows named pipes do not require certificates.
 
 Set `ask` to `false` to disable webpage questions.
 
+Local content-free diagnostic tracing is enabled by default. Set `diagnostics`
+to `false` to disable it. Recording is bounded to two 1 MiB files and does not
+contain native arguments or message bodies. See [diagnostic boundaries](docs/tools.md#bounded-local-diagnostics-and-long-sessions).
+
 Set `cooldown` to the participation cooldown in seconds. The default is `10`;
 `0` disables observer reuse for closely spaced initializations.
 

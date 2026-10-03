@@ -68,6 +68,7 @@ export type ResponseCommit = () => Promise<void>;
 export type StageResponseCommit = (
 	requestId: string | number,
 	commit: ResponseCommit,
+	signal: AbortSignal,
 ) => void;
 
 const committedSignal = new AbortController().signal;
@@ -75,6 +76,7 @@ const committedSignal = new AbortController().signal;
 export function createServer(
 	broker: Broker,
 	stageResponseCommit: StageResponseCommit,
+	traceScope = "",
 ): McpServer {
 	const capabilities = { tools: {} };
 	const server = new McpServer(
@@ -94,7 +96,7 @@ export function createServer(
 	function handle<Args, Result>(
 		callback: (args: Args, context: RequestContext) => Promise<Result>,
 	) {
-		return async (args: Args, context: RequestContext) => {
+		const execute = async (args: Args, context: RequestContext) => {
 			const chatId = requireChatId(context);
 			context.mcpReq.signal.throwIfAborted();
 			const result = await callback(args, context).catch(
@@ -158,6 +160,35 @@ export function createServer(
 				}
 			}
 			return reference;
+		};
+		return async (args: Args, context: RequestContext) => {
+			const meta = context.mcpReq._meta;
+			const fields = {
+				rpc: `${traceScope}:${context.mcpReq.id}`,
+				...(typeof meta?.["openai/session"] === "string"
+					? { chat: meta["openai/session"] }
+					: {}),
+				...(typeof meta?.["otunnel/requestId"] === "string"
+					? { request: meta["otunnel/requestId"] }
+					: {}),
+			};
+			const started = performance.now();
+			broker.diagnostics.record("rpc.received", fields);
+			try {
+				const result = await execute(args, context);
+				broker.diagnostics.record("rpc.ready", {
+					...fields,
+					bytes: Buffer.byteLength(JSON.stringify(result)),
+					durationMs: performance.now() - started,
+				});
+				return result;
+			} catch (error) {
+				broker.diagnostics.record("rpc.failed", {
+					...fields,
+					durationMs: performance.now() - started,
+				});
+				throw error;
+			}
 		};
 	}
 
@@ -876,9 +907,13 @@ async function finishResult<
 		);
 	if (afterSend) commits.push(afterSend);
 	if (commits.length)
-		stageResponseCommit(context.mcpReq.id, async () => {
-			for (const commit of commits) await commit();
-		});
+		stageResponseCommit(
+			context.mcpReq.id,
+			async () => {
+				for (const commit of commits) await commit();
+			},
+			context.mcpReq.signal,
+		);
 	return formatted;
 }
 

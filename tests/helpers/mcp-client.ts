@@ -7,6 +7,7 @@ import { serveMcp } from "../../src/stdio.ts";
 interface RequestOptions {
 	chatId?: string | null;
 	modern?: boolean;
+	id?: number;
 }
 
 /** In-process wire client; resolves only after send and response commits settle. */
@@ -70,7 +71,7 @@ export function mcpClient(t: TestContext, broker: Broker) {
 		options: RequestOptions = {},
 	) {
 		assert.equal(closed, false, "MCP fixture is closed");
-		const id = ++nextId;
+		const id = options.id ?? ++nextId;
 		const completion = Promise.withResolvers<JSONRPCMessage>();
 		pending.set(id, completion);
 		const timer = setTimeout(
@@ -118,6 +119,14 @@ export function mcpClient(t: TestContext, broker: Broker) {
 			args: Record<string, unknown> = {},
 			options?: RequestOptions,
 		) => request("tools/call", { name, arguments: args }, options),
+		cancel: (id: number) => {
+			transport.onmessage?.({
+				jsonrpc: "2.0",
+				method: "notifications/cancelled",
+				params: { requestId: id, reason: "fixture cancellation" },
+			});
+			pending.get(id)?.reject(new Error("fixture cancellation"));
+		},
 		failNextSend: (error = new Error("simulated send failure")) => {
 			sendFailure = error;
 		},

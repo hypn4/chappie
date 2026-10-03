@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { type Activity, chatLabel, source } from "./activity.ts";
 import { readConfig } from "./config.ts";
 import type { DeliveryRecord } from "./delivery.ts";
+import { Diagnostics } from "./diagnostics.ts";
 import { type HistoryRange, historyInstructions } from "./history.ts";
 import {
 	type BrokerMessage,
@@ -23,6 +24,7 @@ import {
 	nativeToolCalls,
 	validateNativeCalls,
 } from "./native-calls.ts";
+import { recoveryOperationId } from "./operation-archive.ts";
 import {
 	type OperationReceipt,
 	type OperationView,
@@ -173,6 +175,7 @@ function compactSummary(value: string | undefined): string | undefined {
 }
 
 export class Broker {
+	readonly diagnostics: Diagnostics;
 	readonly #agentDir: string;
 	readonly #sessionWaitMs: number;
 	readonly #inspectionTimeoutMs: number;
@@ -204,6 +207,7 @@ export class Broker {
 		if (!Number.isSafeInteger(this.#callWaitMs) || this.#callWaitMs < 1)
 			throw new Error("callWaitMs must be a positive integer");
 		this.#agentDir = agentDir;
+		this.diagnostics = new Diagnostics(agentDir);
 		this.#state = new State(agentDir);
 		this.#responses = new ResponseStore(agentDir);
 		this.#ipc = new IpcServer(
@@ -218,6 +222,7 @@ export class Broker {
 		this.#ask = config.ask ?? true;
 		this.#cooldownMs = (config.cooldown ?? 10) * 1000;
 		this.#localTools = config.localTools === true;
+		this.diagnostics.setEnabled(config.diagnostics !== false);
 		await this.#state.load();
 		await this.#ipc.start(config.listen ?? false, {
 			...(config.tls ? { tls: config.tls } : {}),
@@ -251,7 +256,11 @@ export class Broker {
 					(operation) => operation.promise,
 				),
 			);
-		await this.#state.flush();
+		try {
+			await this.#state.flush();
+		} finally {
+			await this.diagnostics.flush();
+		}
 	}
 
 	listSessions(sessionId?: string): SessionListItem[] {
@@ -264,8 +273,18 @@ export class Broker {
 			}));
 	}
 
-	saveResponse(chatId: string, text: string): Promise<string> {
-		return this.#responses.save(chatId, text);
+	async saveResponse(chatId: string, text: string): Promise<string> {
+		try {
+			const id = await this.#responses.save(chatId, text);
+			this.diagnostics.record("snapshot.saved", {
+				chat: chatId,
+				bytes: Buffer.byteLength(text),
+			});
+			return id;
+		} catch (error) {
+			this.diagnostics.record("snapshot.failed", { chat: chatId });
+			throw error;
+		}
 	}
 
 	readResponse(chatId: string, resultId: string): Promise<string> {
@@ -357,6 +376,7 @@ export class Broker {
 			requestId,
 			JSON.stringify({ text, replyTo, mode }),
 		);
+		const recoveryId = identity ? recoveryOperationId(identity) : undefined;
 		return this.#coalesceOperation(
 			identity,
 			signal,
@@ -366,6 +386,7 @@ export class Broker {
 					if (!session) throw new Error("Target session disconnected");
 					const replay = await this.#state.reserveOperation({
 						...identity,
+						...(recoveryId ? { operationId: recoveryId } : {}),
 						chatId,
 						sessionId: target,
 						cwd: session.description.cwd,
@@ -425,7 +446,15 @@ export class Broker {
 				}
 				throw new Error("OMP session returned no assistant message");
 			},
-		);
+		).catch((error: unknown) => {
+			if (!recoveryId || !this.#state.findOperation(chatId, recoveryId))
+				throw error;
+			const message = error instanceof Error ? error.message : String(error);
+			throw new Error(
+				`${message}\nRecovery operation: ${recoveryId}. Inspect get_operation before retrying.`,
+				{ cause: error },
+			);
+		});
 	}
 
 	async tools(
@@ -1234,6 +1263,16 @@ export class Broker {
 		if (existing) {
 			if (existing.signature !== identity.signature)
 				throw new Error("Operation identifier reused with different arguments");
+			if (existing.controller.signal.aborted && !existing.recovery) {
+				// A retry arriving during chat cancellation must observe the durable
+				// receipt after the old owner settles, not inherit its dead waiter.
+				try {
+					return await this.#waitForOperation<T>(existing, signal);
+				} catch {
+					signal.throwIfAborted();
+					return this.#coalesceOperation(identity, signal, execute, recovery);
+				}
+			}
 			return this.#waitForOperation<T>(existing, signal);
 		}
 		const controller = new AbortController();
@@ -1680,6 +1719,18 @@ export class Broker {
 		if (this.#pending.size >= 512)
 			throw new Error("Too many pending session requests");
 		const id = this.#nextRequestId++;
+		const outgoing = message(id);
+		const started = performance.now();
+		const diagnostic = {
+			native: id,
+			session: sessionId,
+			...("requestId" in outgoing && typeof outgoing.requestId === "string"
+				? { request: outgoing.requestId }
+				: {}),
+			...("chatId" in outgoing && typeof outgoing.chatId === "string"
+				? { chat: outgoing.chatId }
+				: {}),
+		};
 		const completion = Promise.withResolvers<SessionResult>();
 		const onAbort = (): void => {
 			const pending = this.#pending.get(id);
@@ -1705,11 +1756,32 @@ export class Broker {
 		};
 		this.#pending.set(id, pending);
 		signal.addEventListener("abort", onAbort, { once: true });
-		void session.peer.send(message(id)).catch((error: unknown) => {
+		this.diagnostics.record("native.dispatch", {
+			...diagnostic,
+			pending: this.#pending.size,
+		});
+		void session.peer.send(outgoing).catch((error: unknown) => {
 			this.#finishRequest(id, pending);
 			pending.reject(error instanceof Error ? error : new Error(String(error)));
 		});
-		return completion.promise;
+		return completion.promise.then(
+			(result) => {
+				this.diagnostics.record("native.result", {
+					...diagnostic,
+					pending: this.#pending.size,
+					durationMs: performance.now() - started,
+				});
+				return result;
+			},
+			(error: unknown) => {
+				this.diagnostics.record("native.failed", {
+					...diagnostic,
+					pending: this.#pending.size,
+					durationMs: performance.now() - started,
+				});
+				throw error;
+			},
+		);
 	}
 
 	#waitForChange(signal: AbortSignal): Promise<void> {

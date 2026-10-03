@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { Writable } from "node:stream";
 import {
 	type ServeStdioOptions,
@@ -14,14 +15,51 @@ export function serveMcp(
 	options: Pick<ServeStdioOptions, "transport" | "onerror"> = {},
 ) {
 	const transport = options.transport ?? new StdioServerTransport();
-	const commits = new Map<string | number, ResponseCommit[]>();
+	const traceScope = randomUUID();
+	const traceRpc = (id: string | number) => ({ rpc: `${traceScope}:${id}` });
+	const commits = new Map<
+		string | number,
+		{
+			callbacks: ResponseCommit[];
+			signal: AbortSignal;
+			dispose(): void;
+		}
+	>();
 	const stageResponseCommit = (
 		requestId: string | number,
 		commit: ResponseCommit,
+		signal: AbortSignal,
 	) => {
-		const pending = commits.get(requestId) ?? [];
-		pending.push(commit);
-		commits.set(requestId, pending);
+		signal.throwIfAborted();
+		let pending = commits.get(requestId);
+		if (pending && pending.signal !== signal)
+			throw new Error("Response identifier already has a pending owner");
+		if (!pending) {
+			if (commits.size >= 512)
+				throw new Error("Too many pending response acknowledgements");
+			const entry = {
+				callbacks: [] as ResponseCommit[],
+				signal,
+				dispose() {
+					if (commits.get(requestId) === entry) commits.delete(requestId);
+					signal.removeEventListener("abort", onAbort);
+				},
+			};
+			commits.set(requestId, entry);
+			const onAbort = () => {
+				broker.diagnostics.record("ack.cancelled", traceRpc(requestId));
+				entry.dispose();
+			};
+			signal.addEventListener("abort", onAbort, { once: true });
+			pending = entry;
+		}
+		if (pending.callbacks.length >= 16)
+			throw new Error("Too many response acknowledgement callbacks");
+		pending.callbacks.push(commit);
+		broker.diagnostics.record("ack.staged", {
+			...traceRpc(requestId),
+			pending: commits.size,
+		});
 	};
 	const originalSend = transport.send;
 	transport.send = async (message, sendOptions) => {
@@ -50,16 +88,27 @@ export function serveMcp(
 			(typeof message.id === "string" || typeof message.id === "number")
 				? message.id
 				: undefined;
+		const pending =
+			responseId === undefined ? undefined : commits.get(responseId);
 		let sent = false;
 		try {
 			await originalSend.call(transport, message, sendOptions);
 			sent = true;
+			if (responseId !== undefined)
+				broker.diagnostics.record("stdio.written", {
+					...traceRpc(responseId),
+					bytes: Buffer.byteLength(JSON.stringify(message)),
+				});
+		} catch (error) {
+			if (responseId !== undefined)
+				broker.diagnostics.record("stdio.failed", traceRpc(responseId));
+			throw error;
 		} finally {
 			if (responseId !== undefined) {
-				const pending = commits.get(responseId) ?? [];
-				commits.delete(responseId);
+				pending?.dispose();
 				if (
 					sent &&
+					!pending?.signal.aborted &&
 					"result" in message &&
 					!(
 						typeof message.result === "object" &&
@@ -68,10 +117,12 @@ export function serveMcp(
 						message.result.isError === true
 					)
 				) {
-					for (const commit of pending) {
+					for (const commit of pending?.callbacks ?? []) {
 						try {
 							await commit();
+							broker.diagnostics.record("ack.committed", traceRpc(responseId));
 						} catch (error) {
+							broker.diagnostics.record("ack.failed", traceRpc(responseId));
 							try {
 								options.onerror?.(
 									error instanceof Error ? error : new Error(String(error)),
@@ -83,14 +134,18 @@ export function serveMcp(
 			}
 		}
 	};
-	const handle = serveStdio(() => createServer(broker, stageResponseCommit), {
-		...options,
-		transport,
-		legacy: "reject",
-	});
+	const handle = serveStdio(
+		() => createServer(broker, stageResponseCommit, traceScope),
+		{
+			...options,
+			transport,
+			legacy: "reject",
+		},
+	);
 	return {
 		async close() {
-			commits.clear();
+			for (const pending of commits.values()) pending.dispose();
+			broker.diagnostics.record("transport.closed", { pending: commits.size });
 			try {
 				await handle.close();
 			} finally {

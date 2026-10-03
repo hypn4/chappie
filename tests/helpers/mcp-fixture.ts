@@ -1,6 +1,14 @@
+import { tmpdir } from "node:os";
 import type { TestContext } from "node:test";
 import type { Broker } from "../../src/broker.ts";
+import { Diagnostics } from "../../src/diagnostics.ts";
 import { mcpClient, resultOf } from "./mcp-client.ts";
+
+export function quietDiagnostics(): Diagnostics {
+	const diagnostics = new Diagnostics(tmpdir());
+	diagnostics.setEnabled(false);
+	return diagnostics;
+}
 
 export async function mcpFixture(
 	t: TestContext,
@@ -10,6 +18,7 @@ export async function mcpFixture(
 	// Only the broker boundary is substituted; the real MCP server/transport path runs.
 	const broker = {
 		askEnabled: false,
+		diagnostics: quietDiagnostics(),
 		binding: () => "A",
 		listSessions: () => [
 			{

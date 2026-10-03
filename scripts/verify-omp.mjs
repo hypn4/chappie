@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import {
 	mkdir,
 	mkdtemp,
+	readdir,
 	readFile,
 	rm,
+	stat,
 	symlink,
 	writeFile,
 } from "node:fs/promises";
@@ -17,6 +19,12 @@ import { createOmpProcessHarness } from "./omp-process-harness.mjs";
 
 // These are synthetic tool requests, not a second model/agent doing inference.
 const checkout = fileURLToPath(new URL("../", import.meta.url));
+const soakIterations = Number(process.env.CHAPPIE_VERIFY_SOAK_ITERATIONS ?? 0);
+assert.ok(
+	Number.isSafeInteger(soakIterations) &&
+		soakIterations >= 0 &&
+		soakIterations <= 2000,
+);
 const extensionRoot = process.env.CHAPPIE_PACKAGE_ROOT || checkout;
 const extensionManifest = JSON.parse(
 	await readFile(join(extensionRoot, "package.json"), "utf8"),
@@ -54,7 +62,10 @@ const collaborationFile = join(root, "collaboration-tools.txt");
 const settingsFile = join(root, "settings.yml");
 await writeFile(
 	settingsFile,
-	JSON.stringify({ todo: { reminders: true, remindersMax: 1 } }),
+	JSON.stringify({
+		todo: { reminders: true, remindersMax: 1 },
+		...(soakIterations ? { tools: { artifactMaxBytes: 1 } } : {}),
+	}),
 );
 await writeFile(
 	join(agent, "chappie.json"),
@@ -123,13 +134,14 @@ export default async function probe(api) {
 }
 `,
 );
-let broker = new Broker(agent, {
+const brokerOptions = {
 	callWaitMs: Number(process.env.CHAPPIE_VERIFY_CALL_WAIT_MS ?? 1000),
-});
+};
+let broker = new Broker(agent, brokerOptions);
 const controller = new AbortController();
 const timer = setTimeout(
 	() => controller.abort(new Error("OMP integration test timed out")),
-	25000,
+	25000 + soakIterations * 500,
 );
 const signal = controller.signal;
 
@@ -540,7 +552,7 @@ try {
 	// auxiliary because OMP's live model context was transient during resume.
 	await broker.close();
 	await delay(30);
-	broker = new Broker(agent);
+	broker = new Broker(agent, brokerOptions);
 	await broker.start();
 	while (broker.listSessions().length === 0) {
 		signal.throwIfAborted();
@@ -599,6 +611,87 @@ try {
 		firstAfterSessionResume.toolResults.every((item) => !item.isError),
 		"first Chappie request after OMP session resume must complete normally",
 	);
+	if (soakIterations) {
+		Bun.gc(true);
+		const beforeMemory = process.memoryUsage();
+		const durations = [];
+		for (let i = 0; i < soakIterations; i++) {
+			const started = performance.now();
+			const result = await completedCall(
+				"resume-integration-chat",
+				restored.id,
+				[{ name: "read", arguments: { path: "fixture.txt:1-3" } }],
+				`soak-${i}`,
+				signal,
+			);
+			assert.equal(result.toolResults.length, 1);
+			assert.ok(result.toolResults.every((item) => !item.isError));
+			durations.push(performance.now() - started);
+		}
+		const large = await completedCall(
+			"resume-integration-chat",
+			restored.id,
+			[
+				{
+					name: "bash",
+					arguments: {
+						command: `bun -e 'process.stdout.write("X".repeat(2 * 1024 * 1024))'`,
+					},
+				},
+			],
+			"soak-large-output",
+			signal,
+		);
+		assert.equal(large.toolResults.length, 1);
+		assert.ok(large.toolResults.every((item) => !item.isError));
+		const files = [];
+		async function collect(directory) {
+			for (const entry of await readdir(directory, { withFileTypes: true })) {
+				const path = join(directory, entry.name);
+				if (entry.isDirectory()) await collect(path);
+				else if (entry.isFile())
+					files.push({ path, bytes: (await stat(path)).size });
+			}
+		}
+		await collect(resumeDir);
+		const artifacts = files.filter((file) => file.path.endsWith(".log"));
+		assert.ok(artifacts.length > 0, "Native overflow must retain an artifact");
+		assert.ok(
+			artifacts.every((file) => file.bytes <= 1024 * 1024 + 4096),
+			"Native artifact cap must bound stored output",
+		);
+		await broker.diagnostics.flush();
+		assert.equal(broker.diagnostics.stats.pending, 0);
+		const trace = (
+			await readFile(join(agent, "chappie.diagnostics.jsonl"), "utf8")
+		)
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line));
+		const settled = trace.filter((event) => event.phase === "native.result");
+		assert.ok(settled.length > 0);
+		assert.equal(settled.at(-1).pending, 0);
+		durations.sort((a, b) => a - b);
+		const afterMemory = process.memoryUsage();
+		Bun.gc(true);
+		const afterGcMemory = process.memoryUsage();
+		console.log(
+			JSON.stringify({
+				stage: "native-soak",
+				iterations: soakIterations,
+				p50Ms: durations[Math.floor(durations.length * 0.5)],
+				p95Ms: durations[Math.floor(durations.length * 0.95)],
+				beforeMemory,
+				afterMemory,
+				afterGcMemory,
+				transcriptBytes: files
+					.filter((f) => f.path.endsWith(".jsonl"))
+					.reduce((sum, f) => sum + f.bytes, 0),
+				artifactBytes: artifacts.reduce((sum, f) => sum + f.bytes, 0),
+				diagnostics: broker.diagnostics.stats,
+			}),
+		);
+	}
 	await broker.chat(
 		"resume-integration-chat",
 		restored.id,

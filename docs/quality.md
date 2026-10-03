@@ -76,6 +76,8 @@ The authoritative executable commands are in `package.json` and `.github/workflo
 
 Report stages separately: implementation, local verification, review, CI, publication and live validation. A passing test count is not evidence for untested platforms or ChatGPT rendering. Never fix a flaky test by weakening its contract or hiding a failed run. Record failures even when later retries pass.
 
+For long-session retention changes, run `CHAPPIE_VERIFY_SOAK_ITERATIONS=192 bun run test:omp` and repeat with `CHAPPIE_VERIFY_CALL_WAIT_MS=1`. This extends the existing isolated OMP process harness, not a second agent: it performs the requested number of sequential native reads, checks a 2 MiB stdout sample against an isolated 1 MiB native artifact cap, verifies transient request/writer queues drain, and reports latency, transcript/artifact bytes and broker RSS. The optional count is limited to 2,000; it is off in ordinary integration runs. RSS includes retained results and allocator effects, so a delta is not alone a leak verdict. This RPC harness does not exercise cmux TUI rendering or establish a ChatGPT timeout. Preserve failing and successful evidence with the chosen mode/count in the command.
+
 ## Verification evidence
 
 Use the local runner to capture a command without changing the normal test entrypoints:

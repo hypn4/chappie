@@ -50,11 +50,15 @@ A logical operation ID identifies caller intent; a random persisted execution ID
 
 Cancellation owns preparation before persistence yields, and is checked again before dispatch. It cannot undo prior side effects or cancel an independent model generation. Missing/uncertain completion is reconciled through history, never by inventing a new intent ID. Retention details are in the tool contract.
 
+Cold replay protection is distinct from hot response state. Old uncertainty without pending output is archived before hot removal; it remains owner-checked and blocks duplicate execution. Recovery aliases cover legacy request receipts as well as new message failures. A valid late result restores that same acceptance; expiry never silently authorizes an uncertain retry.
+
 ### Chat-only durable recovery, not proactive wake-up
 
 There is no MCP Events/Tasks surface, webhook outbox, heartbeat daemon or assumed ability to wake ordinary Chat. Persist results and waits, then recover on a later authorized interaction. Never promise that the broker can resume the conversation by itself.
 
 ACK follows a successful bounded response write. Oversized output is first saved as an immutable conversation-owned response snapshot, then exposed through existing `get_operation` paging. The same mechanism preserves complete catalogs and whole history entries. A reference, source read or successful transport write does not prove human/UI receipt. Resource lifetimes remain separate from snapshot retention.
+
+ACK callbacks are owned by both the JSON-RPC ID and its original AbortSignal. Cancellation releases staged closures without consuming unread input. The snapshot store budgets both total and per-conversation usage while preserving the immutable reread window. Bounded asynchronous diagnostics record local handler/native/write/ACK boundaries without response contents; they neither heartbeat the host nor turn missing local evidence into proof of a host failure.
 
 ### Ownership remains with the byte source
 
