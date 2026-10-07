@@ -234,10 +234,16 @@ OMP provider requests must belong to a live session through its request hook and
 session ID. Chappie relays the recognized OMP compaction and branch-summary
 requests as `modelRequest` input with an independent request ID; answer those
 with `chat({ replyTo: modelRequest, ... })`. Unrecognized auxiliary prompts
-cannot borrow the session's primary response. No other model is selected
-automatically. Creating an OMP task does not create a ChatGPT conversation or
-provide autonomous child inference; each Chappie session still needs an explicit
-ChatGPT controller.
+cannot borrow the session's primary response. Chappie does not automatically
+select another model.
+
+When the parent session's current provider is `chappie`, the native
+`before_subagent_spawn` hook blocks new OMP task/eval subagents, including a
+child configured with another model. The caller receives a reason to continue
+inline with native tools. Other parent providers are unaffected.
+Instructions also prohibit OMP auxiliary inference and routing around the block;
+this is not a runtime gate for every background model call. ChatGPT-side
+subagents and independent native tool batches remain available.
 
 For example:
 

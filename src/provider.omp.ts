@@ -97,6 +97,14 @@ export function createOmpChappieProvider(
 	api.on("session_shutdown", () => {
 		disposed = true;
 	});
+	api.on("before_subagent_spawn", (_event, context) => {
+		if (context.model?.provider !== CHAPPIE_API) return;
+		return {
+			block: true,
+			reason:
+				"Chappie sessions do not run OMP subagents. Continue the current task inline with native tools.",
+		};
+	});
 	api.on("before_provider_request", (event, context) => {
 		const request = event.payload;
 		if (!isRequest(request)) return;

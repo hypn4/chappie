@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { Api, Context, Model, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
 import type {
+	BeforeSubagentSpawnEvent,
 	ExtensionAPI as OmpExtensionAPI,
 	ExtensionContext as OmpExtensionContext,
 	ProviderConfig as OmpProviderConfig,
@@ -28,14 +29,14 @@ function owner(
 	generate?: (output: ProviderOutput, kind: string) => Promise<void>,
 ) {
 	let currentId = id;
-	let provider = "chappie";
+	let provider: string | undefined = "chappie";
 	const handlers = new Map<
 		string,
 		Array<(event: unknown, ctx: OmpExtensionContext) => unknown>
 	>();
 	const context = {
 		get model() {
-			return { provider };
+			return provider === undefined ? undefined : { provider };
 		},
 		sessionManager: { getSessionId: () => currentId },
 	} as unknown as OmpExtensionContext;
@@ -66,8 +67,10 @@ function owner(
 		(ctx) => observedProviders.push(ctx.model?.provider),
 	);
 	async function emit(name: string, event: unknown) {
+		let response: unknown;
 		for (const handler of handlers.get(name) ?? [])
-			await handler(event, context);
+			response = await handler(event, context);
+		return response;
 	}
 	async function onPayload(payload: unknown) {
 		let result = payload;
@@ -90,7 +93,7 @@ function owner(
 		switchTo(value: string) {
 			currentId = value;
 		},
-		setProvider(value: string) {
+		setProvider(value: string | undefined) {
 			provider = value;
 		},
 	};
@@ -110,6 +113,58 @@ async function result(
 	assert.ok(stream);
 	return await stream.result();
 }
+
+test("Chappie parents block task and eval subagents regardless of the child model", async () => {
+	const a = owner("A");
+	for (const invocationKind of ["task", "eval"] as const) {
+		for (const patterns of [[], ["other/child-model"]]) {
+			const event: BeforeSubagentSpawnEvent = {
+				type: "before_subagent_spawn",
+				agent: "worker",
+				invocationKind,
+				patterns,
+			};
+			const decision = await a.emit(event.type, event);
+			assert.ok(decision && typeof decision === "object");
+			assert.ok("block" in decision);
+			assert.equal(decision.block, true);
+			assert.ok("reason" in decision);
+			assert.ok(typeof decision.reason === "string");
+			assert.ok(decision.reason.length > 0);
+		}
+	}
+	assert.deepEqual(a.starts, []);
+	assert.equal((await result(a.config, a.options())).stopReason, "stop");
+	assert.deepEqual(a.starts, ["A"]);
+});
+
+test("subagent blocking follows the current parent model without changing other sessions", async () => {
+	const a = owner("A");
+	const event: BeforeSubagentSpawnEvent = {
+		type: "before_subagent_spawn",
+		agent: "worker",
+		invocationKind: "task",
+		patterns: ["chappie/chatgpt"],
+	};
+	for (const [provider, blocked] of [
+		["other", false],
+		["chappie", true],
+		[undefined, false],
+		["other", false],
+		["chappie", true],
+	] as const) {
+		a.setProvider(provider);
+		const decision = await a.emit(event.type, event);
+		if (blocked) {
+			assert.ok(decision && typeof decision === "object");
+			assert.ok("block" in decision);
+			assert.equal(decision.block, true);
+		} else {
+			assert.equal(decision, undefined);
+		}
+	}
+	assert.deepEqual(a.starts, []);
+});
 
 test("the latest provider registration routes each request through its owning session hook", async () => {
 	const a = owner("A");
