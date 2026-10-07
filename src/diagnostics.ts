@@ -1,6 +1,7 @@
-import { createHmac, randomBytes, randomUUID } from "node:crypto";
+import { createHmac, randomBytes } from "node:crypto";
 import { appendFile, lstat, mkdir, rename, unlink } from "node:fs/promises";
 import { join } from "node:path";
+import { uuidV7 } from "./ids.ts";
 
 export type DiagnosticPhase =
 	| "rpc.received"
@@ -40,7 +41,7 @@ export class Diagnostics {
 	readonly #directory: string;
 	readonly #path: string;
 	readonly #salt = randomBytes(32);
-	readonly #run = randomUUID();
+	readonly #run = uuidV7();
 	readonly #limits: DiagnosticLimits;
 	#enabled = true;
 	#pending = 0;

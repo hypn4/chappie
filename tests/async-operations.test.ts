@@ -31,7 +31,18 @@ test("detached calls outlive the originating MCP request and deliver completion"
 	const completed = f.broker.operation("test-chat", "long-read");
 	assert.equal(completed.operation.status, "completed");
 	assert.equal(completed.deliveries.length, 1);
-	assert.equal(completed.deliveries[0]?.toolResults.length, 1);
+	const reference = completed.deliveries[0];
+	assert.ok(reference);
+	const saved = JSON.parse(
+		await f.broker.readResponse("test-chat", reference.resultId),
+	);
+	assert.deepEqual(
+		saved.content.filter(
+			(block: { type: string; text?: string }) =>
+				block.type === "text" && block.text === "completed",
+		),
+		[{ type: "text", text: "completed" }],
+	);
 });
 
 test("detached operation IDs are idempotent and immutable", async (t) => {
@@ -144,7 +155,21 @@ test("detached results remain retrievable after delivery acknowledgement and res
 	);
 	await f.reconnect();
 	const restored = f.broker.operation("test-chat", "retained-result");
-	assert.equal(restored.result?.toolResults.length, 1);
+	assert.ok(restored.result);
+	const saved = JSON.parse(
+		await f.broker.readResponse("test-chat", restored.result.resultId),
+	);
+	assert.deepEqual(
+		saved.content.filter(
+			(block: { type: string; text?: string }) =>
+				block.type === "text" && block.text === "completed",
+		),
+		[{ type: "text", text: "completed" }],
+	);
+	await assert.rejects(
+		f.broker.readResponse("another-chat", restored.result.resultId),
+		/not found|expired/i,
+	);
 	assert.throws(
 		() => f.broker.operation("another-chat", "retained-result"),
 		/not found/i,

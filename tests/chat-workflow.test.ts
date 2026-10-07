@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { type TestContext, test } from "node:test";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { ProviderOutput } from "../src/provider-core.ts";
+import { toolResult } from "../src/tools.ts";
 import { until } from "./helpers/async.ts";
 import { assertRpcError, mcpClient, resultOf } from "./helpers/mcp-client.ts";
 import { mcpFixture } from "./helpers/mcp-fixture.ts";
@@ -404,7 +405,25 @@ test("public MCP can continue two scoped batches around a default progress repor
 });
 
 test("recovered cancelled work cannot emit a contradictory continue cue from retained content", async (t) => {
+	const resultId = "c".repeat(64);
+	const work = {
+		source: "omp_todo" as const,
+		scope: "session" as const,
+		observedAt: 1,
+		state: "actionable" as const,
+	};
+	const output = JSON.stringify(
+		toolResult([], "A", "/fixture", [], undefined, undefined, undefined, {
+			work,
+		}),
+	);
 	const f = await mcpFixture(t, {
+		readResponse: async (chatId, requestedId) => {
+			assert.equal(chatId, "server-test");
+			assert.equal(requestedId, resultId);
+			return output;
+		},
+		markResponseRead: async () => {},
 		operation: () => ({
 			operation: {
 				operationId: "cancelled-work",
@@ -420,13 +439,10 @@ test("recovered cancelled work cannot emit a contradictory continue cue from ret
 				chatId: "server-test",
 				sessionId: "A",
 				cwd: "/fixture",
-				toolResults: [],
-				work: {
-					source: "omp_todo",
-					scope: "session",
-					observedAt: 1,
-					state: "actionable",
-				},
+				resultId,
+				bytes: Buffer.byteLength(output),
+				failed: false,
+				work,
 			},
 		}),
 	});

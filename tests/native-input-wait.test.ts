@@ -139,7 +139,17 @@ test("detached input waits preserve identity and resume without repeating accept
 			"completed",
 	);
 	const completed = f.broker.operation("test-chat", "waiting-operation");
-	assert.equal(completed.result?.toolResults.length, 1);
+	assert.ok(completed.result);
+	const saved = JSON.parse(
+		await f.broker.readResponse("test-chat", completed.result.resultId),
+	);
+	assert.deepEqual(
+		saved.content.filter(
+			(block: { type: string; text?: string }) =>
+				block.type === "text" && block.text === "completed",
+		),
+		[{ type: "text", text: "completed" }],
+	);
 	assert.equal(
 		(
 			await f.broker.startCall(

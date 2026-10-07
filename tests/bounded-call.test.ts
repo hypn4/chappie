@@ -8,6 +8,38 @@ import { sessionFixture } from "./helpers/session-fixture.ts";
 
 const calls = [{ name: "read", arguments: { path: "test.txt" } }];
 
+async function retainedOutput(
+	f: Awaited<ReturnType<typeof sessionFixture>>,
+	id: string,
+	expectedText = "completed",
+) {
+	const reference = f.broker.operation("test-chat", id).result;
+	assert.ok(reference);
+	const snapshot = record(
+		JSON.parse(await f.broker.readResponse("test-chat", reference.resultId)),
+	);
+	assert.ok(Array.isArray(snapshot.content));
+	const texts = snapshot.content.flatMap((value) => {
+		const block = record(value);
+		return block.type === "text" && typeof block.text === "string"
+			? [block.text]
+			: [];
+	});
+	assert.equal(texts.filter((text) => text === expectedText).length, 1);
+	const toolHeaders = texts.flatMap((text) => {
+		let value: unknown;
+		try {
+			value = JSON.parse(text);
+		} catch {
+			return [];
+		}
+		return value !== null && typeof value === "object" && "toolCallId" in value
+			? [record(value)]
+			: [];
+	});
+	return { snapshot, toolHeaders };
+}
+
 /** Advance only the call's soft budget; real filesystem/IPC scheduling is untouched. */
 function callClock(t: TestContext) {
 	const original = globalThis.setTimeout;
@@ -61,15 +93,12 @@ test("a slow call yields a recoverable operation without cancelling the native b
 	await until(() => Boolean(f.broker.operation("test-chat", id).result));
 	const finished = f.broker.operation("test-chat", id);
 	assert.equal(finished.operation.status, "completed");
-	assert.equal(finished.result?.toolResults[0]?.content[0]?.type, "text");
+	assert.equal((await retainedOutput(f, id)).toolHeaders.length, 1);
 	assert.equal(f.aborts, 0);
 	assert.throws(() => f.broker.operation("other-chat", id), /not found/i);
 	await f.broker.acknowledge(finished.deliveries, [], f.controller.signal);
 	await f.reconnect();
-	assert.equal(
-		f.broker.operation("test-chat", id).result?.toolResults.length,
-		1,
-	);
+	assert.equal((await retainedOutput(f, id)).toolHeaders.length, 1);
 });
 
 test("fast calls remain inline and do not queue a duplicate deferred delivery", async (t) => {
@@ -262,10 +291,7 @@ test("an auto-yielded queued call preserves model-input wait and resumes the sam
 		f.broker.operation("test-chat", id).operation.status,
 		"completed",
 	);
-	assert.equal(
-		f.broker.operation("test-chat", id).result?.toolResults.length,
-		1,
-	);
+	assert.equal((await retainedOutput(f, id)).toolHeaders.length, 1);
 });
 
 test("retry after yielding returns the original running operation without waiting for another budget", async (t) => {
@@ -369,7 +395,7 @@ test("a result racing the soft deadline is retained once even after delivery ack
 	assert.ok("result" in yielded && yielded.result.operation);
 	const id = yielded.result.operation.operationId;
 	const complete = f.broker.operation("test-chat", id);
-	assert.equal(complete.result?.toolResults.length, 1);
+	assert.equal((await retainedOutput(f, id)).toolHeaders.length, 1);
 	assert.equal(complete.deliveries.length, 1);
 	await f.broker.acknowledge(complete.deliveries, [], f.controller.signal);
 	release.resolve();
@@ -382,10 +408,7 @@ test("a result racing the soft deadline is retained once even after delivery ack
 		f.controller.signal,
 	);
 	assert.equal(f.broker.operation("test-chat", id).deliveries.length, 0);
-	assert.equal(
-		f.broker.operation("test-chat", id).result?.toolResults.length,
-		1,
-	);
+	assert.equal((await retainedOutput(f, id)).toolHeaders.length, 1);
 });
 
 test("lost soft-detach response can be recovered by the same request without another native execution", async (t) => {
@@ -415,10 +438,7 @@ test("lost soft-detach response can be recovered by the same request without ano
 	assert.ok(id);
 	await f.complete(output);
 	await until(() => Boolean(f.broker.operation("test-chat", id).result));
-	assert.equal(
-		f.broker.operation("test-chat", id).result?.toolResults.length,
-		1,
-	);
+	assert.equal((await retainedOutput(f, id)).toolHeaders.length, 1);
 	assert.equal(f.aborts, 0);
 });
 
@@ -472,10 +492,9 @@ test("native failure after soft detach remains visible instead of becoming goal 
 		],
 	});
 	await until(() => Boolean(f.broker.operation("test-chat", id).result));
-	assert.equal(
-		f.broker.operation("test-chat", id).result?.toolResults[0]?.isError,
-		true,
-	);
+	const savedFailure = await retainedOutput(f, id, "native validation failed");
+	assert.equal(savedFailure.toolHeaders[0]?.isError, true);
+	assert.equal(savedFailure.snapshot.isError, true);
 	const client = mcpClient(t, f.broker);
 	const recovered = resultOf(
 		await client.call(
@@ -519,10 +538,7 @@ test("the response budget can expire during fast snapshot persistence without lo
 	const yielded = await pending;
 	assert.ok(yielded.operation);
 	const id = yielded.operation.operationId;
-	assert.equal(
-		f.broker.operation("test-chat", id).result?.toolResults.length,
-		1,
-	);
+	assert.equal((await retainedOutput(f, id)).toolHeaders.length, 1);
 	release.resolve();
 	await until(() =>
 		Boolean(f.broker.operation("test-chat", id).operation.resultId),

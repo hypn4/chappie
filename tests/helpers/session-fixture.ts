@@ -123,13 +123,11 @@ export async function multiSessionFixture(
 				return timer;
 			},
 		} as unknown as OmpExtensionContext;
-		const local = new LocalSession(
-			createOmpHostApi(api, fixtureWireSchema),
-			root,
-			undefined,
-			undefined,
+		const local = new LocalSession(createOmpHostApi(api, fixtureWireSchema), {
+			agentDir: root,
+			storageDir: root,
 			localTools,
-		);
+		});
 		locals.push(local);
 		local.installOmp(api);
 		const emit = async (
@@ -240,11 +238,10 @@ export async function sessionFixture(t: TestContext) {
 	}
 	let current = context("A");
 	let broker = new Broker(root);
-	const local = new LocalSession(
-		createOmpHostApi(api, fixtureWireSchema),
-		root,
-		undefined,
-	);
+	const local = new LocalSession(createOmpHostApi(api, fixtureWireSchema), {
+		agentDir: root,
+		storageDir: root,
+	});
 	t.after(async () => {
 		controller.abort(new Error("fixture cleanup"));
 		for (const timer of timers) clearInterval(timer);

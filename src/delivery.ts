@@ -16,6 +16,13 @@ export interface DeliveryRecord extends Source {
 	work?: SessionWork;
 }
 
+/** Durable metadata only. Native result bodies live in immutable response files. */
+export interface DeliveryReference extends Omit<DeliveryRecord, "toolResults"> {
+	resultId: string;
+	bytes: number;
+	failed: boolean;
+}
+
 export function toolResultsContent(
 	toolResults: SessionToolResult[],
 	sessionId: string,

@@ -65,8 +65,8 @@ omp --model chappie/chatgpt
 ```
 
 Call `sessions` or `init` from ChatGPT to connect to the agent session. When using
-an OMP profile or custom `PI_CONFIG_DIR` / `PI_CODING_AGENT_DIR`, launch otunnel
-and OMP with the same environment so the broker and session resolve the same socket.
+a custom `CHAPPIE_HOME` or `CHAPPIE_STORE_ID`, launch otunnel and OMP with matching
+values so the local broker and extension select the same Chappie store and socket.
 
 ## Modern-only contract
 
@@ -74,7 +74,62 @@ This branch is a breaking update from RC.9. The server only accepts MCP `2026-07
 
 Native `read`, `bash`, `edit`, and `write` are no longer duplicated as MCP tools. Discover their active OMP definitions with `tools({ names: [...] })` and invoke them through `call` or `start_call`, both of which require a JSON `calls` array. Only the ChatGPT file boundary retains a direct `transfer` tool. Native argument names, hashline anchors, validation and execution belong to OMP. The standalone Pi host, input aliases and Base64 alternative are not supported. Preserve timestamped state and operation receipts; never discard receipts to force a retry.
 
-OMP host packages remain optional peers because the standalone MCP broker runs in a different process and does not require an inference host installation. This is process separation, not support for an older OMP runtime. Use `OMP_PROFILE`; `PI_CONFIG_DIR` and `PI_CODING_AGENT_DIR` retain their current OMP-defined names. The historical `PI_PROFILE` alias is no longer interpreted by Chappie.
+OMP host packages remain optional peers because the standalone MCP broker runs in a different process and does not require an inference host installation. OMP profiles and its `PI_CONFIG_DIR` / `PI_CODING_AGENT_DIR` settings continue to govern native OMP data. Chappie's broker storage is selected independently through `CHAPPIE_HOME` and its store manifest.
+
+## Chappie storage
+
+Chappie stores its own data under `~/.chappie` by default. Set `CHAPPIE_HOME`
+to an absolute directory or a path starting with `~/` to choose another home.
+On first use, Chappie atomically creates `manifest.json` with a UUID v7 default
+store. Later starts reuse that identity. `CHAPPIE_STORE_ID` can select another
+UUID v7 already registered in the manifest; it does not create or register a store.
+Invalid manifests and unregistered selections fail without changing the identity.
+
+| Path under the Chappie home | Contents |
+|---|---|
+| `manifest.json` | Schema version, default store ID and registered store IDs |
+| `stores/<storeId>/chappie.json` | Broker and extension configuration |
+| `stores/<storeId>/chappie.state.json` | Conversation bindings, operation receipts and result references |
+| `stores/<storeId>/chappie.results/` | Conversation-owned response snapshots and protection metadata |
+| `stores/<storeId>/chappie.uncertain/` | Cold operation receipts and replay protection |
+| `stores/<storeId>/chappie.sock` | Local Unix socket; Windows uses a named pipe derived from the store path |
+| `project-catalog.json` | Stable project UUIDs and their cwd aliases |
+| `projects/<projectId>/sessions/<sessionId>.json` | Portable public history snapshots |
+
+The broker acquires an exclusive writer lock before loading its selected store
+and keeps it until shutdown has flushed pending writes. A second broker cannot
+open that store concurrently. Native OMP transcripts, artifacts and configuration
+remain in OMP's own directories.
+
+The runtime accepts only `schemaVersion: 1` state with result references. It
+does not read an old Chappie store from `.omp`, fall back to OMP profile paths,
+or convert inline result bodies at startup. An existing installation needs a
+separate, one-time offline conversion of a verified backup before selecting the
+new store. Preserve bindings, operation/execution identities, result bodies,
+unread protection and replay receipts during that conversion. See the
+[storage contract](docs/tools.md#storage-selection-and-upgrades).
+
+### Common project history
+
+The OMP extension also publishes bounded snapshots of the current branch's
+visible messages, tool text and summaries. The project catalog associates a
+stable UUID with explicit cwd aliases; `CHAPPIE_PROJECT_ID` lets the extension
+reuse that project identity for another working-directory alias. Agent names
+are recorded in `source.agent` as provenance and do not determine storage paths.
+
+Default saved-history budgets are 16 MiB per session, 128 MiB per project and
+512 MiB across the Chappie home. Quota pressure reclaims eligible finished
+histories oldest first. Active/current history remains protected while its
+owner is alive or cannot be confirmed dead. Coverage fields report omitted
+entries and whether the newest entry is retained; native originals remain
+available according to OMP's own retention. A history publication failure is
+reported without stopping native work.
+
+`CommonHistoryStore` can list projects and sessions and read these JSON snapshots
+without importing OMP or starting the broker. This shared format does not add
+execution adapters for other agents or automatic synchronization between devices.
+See [common project history](docs/tools.md#common-project-history) for ownership,
+coverage and reader APIs.
 
 ## Development
 
@@ -106,7 +161,10 @@ Restart otunnel after changing its broker command, then use `sessions` or
 After changing tool schemas, refresh the plugin connection in ChatGPT and test
 in a new conversation. Restarting the broker alone does not refresh cached tools.
 
-The broker and extension use `~/.omp/agent/chappie.sock` or the corresponding Windows named pipe. They must use the same OMP profile and agent-directory configuration. OMP is the only accepted IPC host.
+The local broker and extension must select the same Chappie store. Its Unix
+socket is `stores/<storeId>/chappie.sock` under `CHAPPIE_HOME`; Windows derives
+the named-pipe identity from the resolved store path. OMP is the accepted native
+IPC execution host.
 
 `bun run check` runs formatting, type checks, and the Bun test suite.
 `bun run test:omp` builds the package and checks a temporary native OMP session
@@ -137,12 +195,14 @@ Ordinary `call` returns fast results inline. When native waiting exceeds the 25-
 
 ## Configuration
 
-`chappie.json` lives in the OMP agent directory, normally `~/.omp/agent/chappie.json`.
+`chappie.json` lives in the selected Chappie store, normally
+`~/.chappie/stores/<storeId>/chappie.json`. Read `manifest.json` for the default
+store ID, or use the registered ID selected by `CHAPPIE_STORE_ID`.
 
 Local-only use needs no network settings. For sessions on another device,
 configure mutual TLS with a private CA and a separate certificate/key per
 device. The server certificate must cover the broker's hostname. Certificate
-paths are relative to the agent directory; absolute paths are also accepted.
+paths are relative to that Chappie store directory; absolute paths are also accepted.
 
 Broker:
 

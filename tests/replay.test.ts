@@ -379,7 +379,11 @@ test("acknowledged deferred results are not resurrected by delivery retries", as
 		toolResults: [transferResult],
 	};
 	await state.addDelivery(delivery);
-	await state.acknowledge([delivery], [], new AbortController().signal);
+	await state.acknowledge(
+		state.deliveries("chat"),
+		[],
+		new AbortController().signal,
+	);
 	const resumed = new State(root);
 	await resumed.load();
 	await resumed.addDelivery(delivery);
@@ -429,7 +433,7 @@ test("question input is bounded and old delivered questions are pruned", async (
 	}));
 	await writeFile(
 		join(root, "chappie.state.json"),
-		JSON.stringify({ questions }),
+		JSON.stringify({ schemaVersion: 1, questions }),
 	);
 	const state = new State(root);
 	await state.load();
@@ -455,6 +459,7 @@ test("current bindings persist active touches and prune after 30 idle days", asy
 	await writeFile(
 		join(root, "chappie.state.json"),
 		JSON.stringify({
+			schemaVersion: 1,
 			bindings: {
 				recent: { sessionId: "recent-session", lastUsedAt: now },
 				stale: {

@@ -41,6 +41,8 @@ test("snapshot references keep acceptance identity, immutability and sticky canc
 	await restored.load();
 	assert.equal(restored.operation("chat", "op").resultId, "a".repeat(64));
 	now += 25 * 60 * 60 * 1000;
+	assert.equal(restored.operation("chat", "op").resultUnread, true);
+	await restored.acknowledgeResult("chat", "a".repeat(64));
 	assert.deepEqual(restored.recentOperations("chat", "A").operations, []);
 	await restored.reserveOperation({ ...base, updatedAt: now });
 	await assert.rejects(

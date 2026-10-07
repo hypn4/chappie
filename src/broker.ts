@@ -1,9 +1,10 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { type Activity, chatLabel, source } from "./activity.ts";
 import { readConfig } from "./config.ts";
-import type { DeliveryRecord } from "./delivery.ts";
+import type { DeliveryReference } from "./delivery.ts";
 import { Diagnostics } from "./diagnostics.ts";
 import { type HistoryRange, historyInstructions } from "./history.ts";
+import { uuidV7 } from "./ids.ts";
 import {
 	type BrokerMessage,
 	type ExecutionWait,
@@ -53,6 +54,7 @@ import {
 	StaleOperationDeliveryError,
 	State,
 } from "./state.ts";
+import { StorageLock } from "./storage-lock.ts";
 import { type ToolInput, toolResult } from "./tools.ts";
 import type { ChatMode, SessionWork } from "./work.ts";
 
@@ -134,8 +136,8 @@ export interface StartedOperation {
 
 export interface OperationResult {
 	operation: OperationView;
-	deliveries: DeliveryRecord[];
-	result?: DeliveryRecord | undefined;
+	deliveries: DeliveryReference[];
+	result?: DeliveryReference | undefined;
 	inputs: ModelInput[];
 }
 
@@ -178,7 +180,8 @@ function compactSummary(value: string | undefined): string | undefined {
 
 export class Broker {
 	readonly diagnostics: Diagnostics;
-	readonly #agentDir: string;
+	readonly #storageDir: string;
+	#storageLock: StorageLock | undefined;
 	readonly #sessionWaitMs: number;
 	readonly #inspectionTimeoutMs: number;
 	readonly #callWaitMs: number;
@@ -202,34 +205,46 @@ export class Broker {
 	#localTools = false;
 	#nextRequestId = 1;
 
-	constructor(agentDir: string, options: BrokerOptions = {}) {
+	constructor(storageDir: string, options: BrokerOptions = {}) {
 		this.#sessionWaitMs = options.sessionWaitMs ?? 5000;
 		this.#inspectionTimeoutMs = options.inspectionTimeoutMs ?? 3000;
 		this.#callWaitMs = options.callWaitMs ?? CALL_WAIT_MS;
 		if (!Number.isSafeInteger(this.#callWaitMs) || this.#callWaitMs < 1)
 			throw new Error("callWaitMs must be a positive integer");
-		this.#agentDir = agentDir;
-		this.diagnostics = new Diagnostics(agentDir);
-		this.#state = new State(agentDir);
-		this.#responses = new ResponseStore(agentDir);
+		this.#storageDir = storageDir;
+		this.diagnostics = new Diagnostics(storageDir);
+		this.#state = new State(storageDir);
+		this.#responses = new ResponseStore(storageDir);
 		this.#ipc = new IpcServer(
-			agentDir,
+			storageDir,
 			(peer, message) => this.#receive(peer, message),
 			(peer) => this.#removePeer(peer),
 		);
 	}
 
 	async start(): Promise<void> {
-		const config = await readConfig(this.#agentDir);
-		this.#ask = config.ask ?? true;
-		this.#cooldownMs = (config.cooldown ?? 10) * 1000;
-		this.#localTools = config.localTools === true;
-		this.diagnostics.setEnabled(config.diagnostics !== false);
-		await this.#state.load();
-		await this.#ipc.start(config.listen ?? false, {
-			...(config.tls ? { tls: config.tls } : {}),
-			...(config.listenHost ? { host: config.listenHost } : {}),
-		});
+		const lock = await StorageLock.acquire(this.#storageDir);
+		this.#storageLock = lock;
+		try {
+			const config = await readConfig(this.#storageDir);
+			this.#ask = config.ask ?? true;
+			this.#cooldownMs = (config.cooldown ?? 10) * 1000;
+			this.#localTools = config.localTools === true;
+			this.diagnostics.setEnabled(config.diagnostics !== false);
+			await this.#state.load();
+			await this.#ipc.start(config.listen ?? false, {
+				...(config.tls ? { tls: config.tls } : {}),
+				...(config.listenHost ? { host: config.listenHost } : {}),
+			});
+		} catch (error) {
+			try {
+				await this.#ipc.close();
+			} finally {
+				this.#storageLock = undefined;
+				await lock.release();
+			}
+			throw error;
+		}
 	}
 
 	async close(): Promise<void> {
@@ -261,7 +276,13 @@ export class Broker {
 		try {
 			await this.#state.flush();
 		} finally {
-			await this.diagnostics.flush();
+			try {
+				await this.diagnostics.flush();
+			} finally {
+				const lock = this.#storageLock;
+				this.#storageLock = undefined;
+				await lock?.release();
+			}
 		}
 	}
 
@@ -277,7 +298,7 @@ export class Broker {
 
 	async saveResponse(chatId: string, text: string): Promise<string> {
 		try {
-			const id = await this.#responses.save(chatId, text);
+			const id = await this.#responses.save(chatId, text, { pin: "unread" });
 			this.diagnostics.record("snapshot.saved", {
 				chat: chatId,
 				bytes: Buffer.byteLength(text),
@@ -291,6 +312,47 @@ export class Broker {
 
 	readResponse(chatId: string, resultId: string): Promise<string> {
 		return this.#responses.read(chatId, resultId);
+	}
+
+	async markResponseRead(chatId: string, resultId: string): Promise<void> {
+		await this.#responses.markRead(chatId, resultId);
+		await this.#state.acknowledgeResult(chatId, resultId);
+		await this.#responses.unpin(chatId, resultId, "unread");
+	}
+
+	async recordResponseRead(
+		chatId: string,
+		resultId: string,
+		offset: number,
+		nextOffset: number,
+		total: number,
+	): Promise<void> {
+		if (
+			await this.#responses.recordRead(
+				chatId,
+				resultId,
+				offset,
+				nextOffset,
+				total,
+				{ preserveUnreadPin: true },
+			)
+		) {
+			await this.#state.acknowledgeResult(chatId, resultId);
+			await this.#responses.unpin(chatId, resultId, "unread");
+		}
+	}
+
+	async #confirmStored(
+		peer: JsonLinePeer<SessionMessage, BrokerMessage> | undefined,
+		executionId: string | undefined,
+	): Promise<void> {
+		if (!peer) return;
+		if (!executionId)
+			throw new Error("Stored result has no execution identity");
+		// A lost ACK only causes an idempotent outbox retry; it cannot undo native completion.
+		await peer
+			.send({ type: "stored", id: `operation:${executionId}` })
+			.catch(() => {});
 	}
 
 	get askEnabled(): boolean {
@@ -515,7 +577,7 @@ export class Broker {
 			target,
 			"call",
 			!direct && (typeof requestId !== "string" || !requestId)
-				? randomUUID()
+				? uuidV7()
 				: requestId,
 			calls,
 		);
@@ -572,6 +634,7 @@ export class Broker {
 						?.executionId === executionSource.executionId;
 				if (recovery?.owner) recovery.owner.dispatched = true;
 				const toolCalls = nativeToolCalls(calls);
+				const resultPeer = this.#sessions.get(target)?.peer;
 				const result = await this.#request(
 					target,
 					(id) => ({
@@ -612,16 +675,20 @@ export class Broker {
 					if (recovery) {
 						let retained: Promise<void> | undefined;
 						recovery.retain = () =>
-							(retained ??= this.#state.addDelivery({
-								id: `operation:${executionSource.executionId ?? identity?.key}`,
-								chatId,
-								...executionSource,
-								sessionId: target,
-								cwd: result.cwd,
-								toolResults: result.toolResults,
-								...(result.work ? { work: result.work } : {}),
-								complete: true,
-							}));
+							(retained ??= this.#state
+								.addDelivery({
+									id: `operation:${executionSource.executionId}`,
+									chatId,
+									...executionSource,
+									sessionId: target,
+									cwd: result.cwd,
+									toolResults: result.toolResults,
+									...(result.work ? { work: result.work } : {}),
+									complete: true,
+								})
+								.then(() =>
+									this.#confirmStored(resultPeer, executionSource.executionId),
+								));
 					}
 					const resources = result.toolResults.flatMap((item) =>
 						resourceDescriptors(item.details),
@@ -669,6 +736,8 @@ export class Broker {
 						undefined,
 						response,
 					);
+					if (response)
+						await this.#confirmStored(resultPeer, response.executionId);
 					await this.#confirmBindingUse(chatId, sessionId, target);
 					return {
 						sessionId: target,
@@ -841,7 +910,7 @@ export class Broker {
 							return;
 						}
 						await this.#state.addDelivery({
-							id: `operation:${executionSource.executionId ?? identity.key}`,
+							id: `operation:${executionSource.executionId}`,
 							chatId,
 							...executionSource,
 							sessionId: target,
@@ -850,6 +919,10 @@ export class Broker {
 							...(result.work ? { work: result.work } : {}),
 							complete: true,
 						});
+						await this.#confirmStored(
+							session.peer,
+							executionSource.executionId,
+						);
 					})
 					.catch(async (error: unknown) => {
 						if (!isCurrent()) return;
@@ -1017,7 +1090,7 @@ export class Broker {
 		if (!session) throw new Error(`OMP session ${target} is offline`);
 		const question: QuestionRecord = {
 			...input,
-			id: randomUUID(),
+			id: uuidV7(),
 			chatId,
 			sessionId: target,
 			cwd: session.description.cwd,
@@ -1140,12 +1213,12 @@ export class Broker {
 		throw new Error("OMP session returned no resource");
 	}
 
-	deliveries(chatId: string): DeliveryRecord[] {
+	deliveries(chatId: string): DeliveryReference[] {
 		return this.#state.deliveries(chatId);
 	}
 
 	acknowledge(
-		deliveries: DeliveryRecord[],
+		deliveries: DeliveryReference[],
 		answers: QuestionRecord[],
 		signal: AbortSignal,
 	): Promise<void> {

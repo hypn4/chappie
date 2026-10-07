@@ -56,9 +56,19 @@ test("late completion after a switch retains its original session and cwd", asyn
 	);
 	await until(() => f.broker.deliveries("test-chat").length === 1);
 	const delivered = f.broker.deliveries("test-chat")[0];
-	assert.equal(delivered?.sessionId, "A");
-	assert.equal(delivered?.cwd, previous.cwd);
-	assert.equal(delivered?.toolResults.length, 1);
+	assert.ok(delivered);
+	assert.equal(delivered.sessionId, "A");
+	assert.equal(delivered.cwd, previous.cwd);
+	const saved = JSON.parse(
+		await f.broker.readResponse("test-chat", delivered.resultId),
+	);
+	assert.deepEqual(
+		saved.content.filter(
+			(block: { type: string; text?: string }) =>
+				block.type === "text" && block.text === "completed",
+		),
+		[{ type: "text", text: "completed" }],
+	);
 	assert.ok("error" in (await pending));
 });
 
@@ -70,8 +80,19 @@ test("completion after reconnect is retained exactly once", async (t) => {
 	await f.complete(output);
 	await until(() => f.broker.deliveries("test-chat").length === 1);
 	const deliveries = f.broker.deliveries("test-chat");
-	assert.equal(deliveries[0]?.toolResults.length, 1);
-	assert.equal(deliveries[0]?.sessionId, "A");
+	const delivered = deliveries[0];
+	assert.ok(delivered);
+	assert.equal(delivered.sessionId, "A");
+	const saved = JSON.parse(
+		await f.broker.readResponse("test-chat", delivered.resultId),
+	);
+	assert.deepEqual(
+		saved.content.filter(
+			(block: { type: string; text?: string }) =>
+				block.type === "text" && block.text === "completed",
+		),
+		[{ type: "text", text: "completed" }],
+	);
 	await f.complete(output);
 	await delay(10);
 	assert.equal(f.broker.deliveries("test-chat").length, 1);

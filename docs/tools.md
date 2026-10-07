@@ -20,13 +20,52 @@ and CI verification baseline is 18.5.0. These are separate support and test poli
 | `cancel_operation` | Explicitly request cancellation of a detached native batch. |
 | `transfer` | Move files between ChatGPT and OMP, copy between OMP sessions, or export a OMP image. |
 
+## Storage selection and upgrades
+
+Chappie's home defaults to `~/.chappie`. Both the standalone broker and the OMP
+extension resolve its `manifest.json`, whose strict `schemaVersion: 1` format
+records `defaultStoreId` and `storeIds`. First initialization atomically creates
+one UUID v7 store; later starts reuse it. Invalid manifests and missing registered
+store directories fail without silently selecting or creating another identity.
+
+| Setting | Effect |
+|---|---|
+| `CHAPPIE_HOME` | Select the Chappie home with an absolute path or a `~/`-prefixed path. |
+| `CHAPPIE_STORE_ID` | Select a UUID v7 already registered in the manifest; omission uses `defaultStoreId`. |
+| `CHAPPIE_PROJECT_ID` | Supply an explicit project UUID for the OMP common-history projection and its cwd alias; this does not select a broker store. |
+
+The local broker and extension must select the same store. Configuration is
+`stores/<storeId>/chappie.json`, and TLS certificate paths resolve from that
+directory. State, `chappie.results`, `chappie.uncertain` and diagnostics are also
+inside the selected store. Unix uses its `chappie.sock`; Windows derives a named
+pipe from the resolved store path. A remote extension connects using its own
+store's `connect` and mutual TLS configuration.
+
+The broker holds an exclusive writer lock from before state loading until
+shutdown finishes its writes. Another live broker cannot take over the store.
+A stale lock can be recovered only after the recorded hostname matches and the
+PID is confirmed absent; age, `EPERM` and a foreign hostname are not proof of
+termination. OMP profiles and agent-directory settings govern native OMP files
+and do not change Chappie's selected storage.
+
+The runtime accepts only version 1 state with reference-based results. It has
+no `.omp` fallback, automatic inline-result conversion or old-store merge.
+Changing `CHAPPIE_HOME` or selecting another registered store does not move
+existing receipts. Conversion from the earlier layout is a one-time offline
+maintenance operation: stop the writers, work from a verified backup, produce
+and validate a complete version 1 store, then select it through the manifest.
+Preserve conversation/session ownership, logical and execution IDs, timestamps,
+result bodies and hashes, protection metadata and cold replay receipts. Keep
+the matched pre-conversion backup for rollback; do not point an older broker
+at the converted store or discard receipts to make uncertain work retryable.
+
 ## Sessions
 
 Call `init` at the start of local work. Without `sessionId`, it reuses the conversation's saved default when that binding has been used within the last 30 days, or selects an online OMP session with no saved ChatGPT binding. Pass a OMP session ID to resume a specific task, including from another ChatGPT conversation or branch. Read recent `history` to recover progress before continuing the current task.
 
 When `globalAgents` is present, read and follow the instructions at `globalAgents.path` on the selected OMP session. Follow the participation guidance in `initialization.instructions`.
 
-`sessions` reports host `omp`, session ID, agent directory, device, cwd, name, execution status and binding count. It is a broker snapshot and does not wait for inspection. Bindings use the current timestamped object format; idle entries are pruned after 30 days. Obsolete string-only bindings are rejected without rewriting the state file. Preserve operation receipts during any offline migration; deleting them can allow duplicate side effects. An explicit `sessionId` chooses only the current operation; `init({ sessionId })` changes the saved default.
+`sessions` reports host `omp`, session ID, native agent directory, device, cwd, name, execution status and binding count. The native agent directory is host provenance, not the Chappie storage location. This is a broker snapshot and does not wait for inspection. Bindings use timestamped objects in the strict version 1 state format; idle entries are pruned after 30 days. Incompatible state is rejected without rewriting it. An explicit `sessionId` chooses only the current operation; `init({ sessionId })` changes the saved default.
 
 Several ChatGPT conversations can use the same OMP session. One conversation can also operate on several OMP sessions explicitly. Requests already assigned to a session continue there even if the conversation later changes its default.
 
@@ -52,6 +91,83 @@ To follow progress, pass `after` with `wait: true`. Available entries return imm
 Set `observer: true` to read as an observer. New messages and work activity wake waiting readers; idle status alone does not indicate task completion.
 
 History includes saved messages, tool results, summaries, image/file references and work activity. It never cuts an entry in half. A native page can stop between entries; `hasMore` means there are other entries addressable by `before`/`after`. An oversized single entry is retained intact by the final response layer and is read using `resultId` pages, whose own `hasMore` and `nextOffset` describe text-fragment continuation. Reading history does not acknowledge pending inputs or re-export files.
+
+### Common project history
+
+The OMP extension separately publishes public text snapshots of the current
+branch to `projects/<projectId>/sessions/<sessionId>.json` under the Chappie home.
+`project-catalog.json` maps stable project UUIDs to canonical cwd aliases.
+New project IDs use UUID v7. Supplying `CHAPPIE_PROJECT_ID` records that explicit
+project identity for the current cwd, or adds an alias to the same project;
+a cwd already assigned to another project is rejected without reassignment.
+
+The JSON format is independent of OMP. `source.agent` records the originating
+agent, and `source.sourceSessionId` preserves its native session identity.
+Agent names and device names do not partition the directory layout. Each
+snapshot keeps original source entry IDs and timestamps, public message/tool
+text, summaries, lifecycle times and coverage. The OMP projection omits hidden
+control messages, reasoning blocks and private tool metadata, and represents
+images with a source-session notice instead of embedding their binary data.
+Native transcripts, artifacts, images and session management remain OMP-owned.
+
+| Default saved-history budget | Limit |
+|---|---|
+| One session snapshot | 16 MiB |
+| One project's snapshots | 128 MiB / 512 sessions |
+| Snapshots across the Chappie home | 512 MiB / 4,096 sessions |
+| Generic publication queue | 64 MiB / 128 pending session snapshots |
+
+The OMP projection supplies at most 2,048 newest whole entries / 16 MiB and
+bounds large text and tool arguments before queueing. The generic writer
+coalesces progress and keeps newest whole entries that fit the saved-session
+budget, including its identity metadata. It does not split a public entry to
+make it fit. A large entry can be omitted while other whole entries remain
+readable. The coverage fields make that boundary explicit:
+
+| Coverage field | Meaning |
+|---|---|
+| `sourceEntryCount` | Source-reported number of eligible entries in the captured branch |
+| `suppliedEntries` | Entries supplied to the generic history writer |
+| `retainedEntries` | Whole entries saved in this snapshot |
+| `omittedEntries` | Source entries absent from this snapshot |
+| `oversizedEntries` | Entries reported as omitted by source projection limits, plus individually oversized entries rejected by the writer |
+| `complete` | Whether the reported source entries were all retained |
+| `newestEntryRetained` | Whether the declared newest source entry was retained; without a source ID, this refers to the newest supplied entry |
+
+The OMP publisher carries `sourceNewestEntryId` and `sourceOversizedEntries`
+through projection so omitting a large final entry cannot make an older entry
+look like the source's latest work. Independent publishers should preserve
+these fields when they omit source entries before calling the generic writer.
+
+Quota pressure reclaims eligible finished, non-current histories oldest first.
+Active/current records remain protected while the owner is alive or cannot be
+confirmed dead. A same-host `ESRCH` permits reclamation of an orphan; a foreign
+hostname or failed liveness probe does not. Commits and GC share a writer lock,
+and a failed new write preserves previous snapshots. A previous process cannot
+finish a session now owned by its successor. Taking over an active record
+requires confirmed owner death; an explicitly finished, non-current record can
+be resumed by a new writer.
+
+A full protected budget or history error is reported without stopping native
+execution. The last successful snapshot can therefore lag behind the live
+session. These history budgets are separate from conversation-owned response
+caches and operation receipts; reading common history does not acknowledge
+results, restore execution or create attachment receipts.
+
+Independent consumers can use [CommonHistoryStore](../src/common-history.ts)
+without importing OMP or starting a broker:
+
+| Read API | Result |
+|---|---|
+| `new CommonHistoryStore({ homeDir }).listProjects()` | Registered project IDs, names and cwd aliases |
+| `store.listSessions(projectId)` | Session summaries, lifecycle, coverage and saved byte counts |
+| `store.readSession(projectId, sessionId)` | Validated JSON snapshot, or `undefined` if absent |
+
+Readers reject incompatible schemas and mismatched identities rather than
+repairing them. This format and its OMP publisher provide shared project
+history; they do not add execution adapters for other native agents or automatic
+synchronization between devices. The existing MCP `history` tool continues to
+query its selected live OMP session.
 
 ## Chat control loop
 
@@ -180,13 +296,15 @@ Read the state later with:
 
 `get_operation` returns `running`, `waiting_input`, `completed`, `failed`, `cancelled`, or `uncertain`. `completed` means the native OMP batch returned, not that every result succeeded: inspect native `isError` and tool details. If a tool starts a separate background job or supervised process, use the host's native facilities to observe that child job. Batch completion is not child-job completion.
 
-Full detached results remain available through `get_operation(operationId)` after pending-delivery acknowledgement. Terminal receipts and results are retained for 24 hours. Within that window, an identical logical ID replays the accepted operation and conflicting arguments are rejected. After retirement, a fresh acceptance gets a new persisted `executionId`; native requests and deferred results must match that execution, so delayed output cannot complete a successor with the same logical ID. `waiting_input` resumes the same acceptance rather than generating a new one. Unresolved running/waiting/uncertain receipts are not automatically evicted.
+Detached results are saved as public snapshots and exposed through `get_operation(operationId)` after pending-delivery acknowledgement. Small bodies remain inline; large bodies use the existing `resultId` pages. Terminal receipts retain replay protection for 24 hours, while unread and pending result bodies stay protected. Fully transmitted result bodies may retire earlier under cache pressure; the completed receipt remains available even if its body cache was reclaimed. Within receipt retention, an identical logical ID replays the accepted operation and conflicting arguments are rejected. After retirement, a fresh acceptance gets a new UUID v7 `executionId`; native requests and deferred results must match that execution, so delayed output cannot complete a successor with the same logical ID. Existing UUIDs are still accepted and never rewritten. `waiting_input` resumes the same acceptance rather than generating a new one. Unresolved running/waiting/uncertain receipts are not automatically evicted.
 
-Uncertain receipts without pending or retained output leave the hot JSON state after 24 hours, but their replay protection is not deleted. They move atomically into the private `chappie.uncertain` archive (256 MiB / 131,072 files maximum). The original owner can query the stable `receipt-…` recovery handle or an old `replay.id`; aliases cannot be reassigned to another acceptance. A matching late result restores the original execution before the cold record is removed. Running/input-wait operations and undelivered results remain live. Archive admission fails closed when its explicit disk budget is exhausted; never delete the archive to make a possibly executed operation retryable.
+Retained receipts require `executionId`. Tracked native requests and results require both `operationKey` and `executionId`; calls without tracking carry neither. Recovery lookup accepts the canonical public `operationId`, including generated `receipt-<hash>` IDs, within the owning conversation. Internal replay keys are not implicit recovery aliases.
+
+Uncertain receipts without pending or retained output leave the hot JSON state after 24 hours, but their replay protection is not deleted. They move atomically into the private `chappie.uncertain` archive (256 MiB / 131,072 files maximum). The original owner can query the canonical `operationId`, including a generated `receipt-…` handle; aliases cannot be reassigned to another acceptance. A matching late result restores the original execution before the cold record is removed. Running/input-wait operations and undelivered results remain live. Archive admission fails closed when its explicit disk budget is exhausted; never delete the archive to make a possibly executed operation retryable.
 
 Failed intentional `chat` requests also report a deterministic recovery handle. Recover that receipt instead of assuming a delivery error means the message was never applied. This does not start another ChatGPT turn.
 
-Automatic recovery IDs are derived from the originating request identity and scoped to its conversation/session. The internal request key is preserved, so retries keep the original acceptance. A host retry without a stable request identity cannot be deduplicated by inference; prefer an explicit `start_call` ID for consequential long operations. Reuse the returned auto-ID with `start_call` only to resume its known-unexecuted `waiting_input` state after answering the model request. A pre-upgrade input wait may acquire a recovery alias without changing its execution ID; completed old receipts are not re-executed. Direct `transfer` and deliberate `chat(mode=message)` retain their separate lifetime contracts.
+Automatic recovery IDs are derived from the originating request identity and scoped to its conversation/session. The internal request key is preserved, so retries keep the original acceptance. A host retry without a stable request identity cannot be deduplicated by inference; prefer an explicit `start_call` ID for consequential long operations. Reuse the returned auto-ID with `start_call` only to resume its known-unexecuted `waiting_input` state after answering the model request. Assigning a recovery alias preserves that acceptance's execution ID; completed receipts are not re-executed. Direct `transfer` and deliberate `chat(mode=message)` retain their separate lifetime contracts.
 
 Before a call yields, aborting its last waiting request still cancels native work. After yielding, ending that transport request does not cancel the accepted operation. A failed response send does not authorize repetition: recover with the original request identity or known operation ID. Broker loss leaves unfinished work `uncertain`, not automatically resumed. Native `isError` remains a failed tool result even when the operation is `completed` as a batch.
 
@@ -220,6 +338,8 @@ OMP user input, deferred results and webpage answers accompany later Chappie res
 Staged acknowledgement callbacks belong to the request's original cancellation signal, not just its reusable JSON-RPC ID. Cancellation, failed writes and transport shutdown discard these callbacks without consuming pending data. A later response using the same request ID cannot acknowledge the cancelled request's input.
 
 If cancellation or a broken broker connection interrupts ordinary result delivery, late results can accompany a later response to the originating ChatGPT conversation. A broker restart reloads operation receipts, but an agent process exit cannot recover unfinished in-memory work automatically. Check history before retrying a state-changing operation. Use `start_call` for a native batch that may outlive one ChatGPT MCP request; use the environment's persistent process facilities when the underlying process itself must outlive the agent session.
+
+OMP now also retains ordinary completed native batches until Chappie explicitly confirms durable snapshot and receipt storage. If that confirmation is lost, the same result is resent through the existing outbox; tools are not re-executed. Storage acknowledgement is independent of ChatGPT response acknowledgement and does not stop the next native batch from running.
 
 The active model remains the current ChatGPT conversation. Starting another `chappie/chatgpt` agent inside OMP does not create another browser conversation; tools that need another model should use a separately configured provider.
 
@@ -398,7 +518,11 @@ recover bytes already discarded by OMP. When complete command output is required
 explicitly preserve it in an appropriately managed native file; do not silently
 disable host limits or promise that a retained result contains unlimited output.
 
-Snapshots live in the broker's private `chappie.results` directory, are scoped to the originating Chat conversation, and are checked against their content hash. They expire 24 hours after first creation; re-reading does not renew or delete them. Broker capacity is 4,096 snapshots / 256 MiB total; one conversation is limited to 2,048 snapshots / 128 MiB, with a 128 MiB serialized per-snapshot ceiling. This reserves capacity against a single busy owner, not an unlimited guarantee for arbitrarily many simultaneous conversations. Legacy snapshots remain readable. New saves remove expired snapshots, never unexpired ones to make room. A small metadata index avoids rereading every response body on each save. Capacity errors identify the conversation or broker budget and do not acknowledge pending data: native work may already have executed, so recover rather than repeat it. These bounds do not imply survival of a power failure or receipt by ChatGPT's UI.
+Snapshots live in the selected broker store's private `chappie.results` directory, are scoped to the originating Chat conversation, and are checked against their content hash. Unprotected snapshots expire 24 hours after first creation; re-reading does not renew that clock. Pending and unread results have named protection pins and remain available beyond that interval. Explicitly unread results also keep their operation receipt discoverable through `operationId` and recent-receipt queries until the full body is consumed. Missing consumption evidence does not make a snapshot eligible for pressure reclamation. Broker capacity is 4,096 snapshots / 256 MiB total; one conversation is limited to 2,048 snapshots / 128 MiB, with a 128 MiB serialized per-snapshot ceiling. These are conversation-owned response budgets, separate from common project history.
+
+When a new save needs space, Chappie automatically reclaims the oldest fully transmitted, unpinned snapshot cache first. It never discards pending or unread output for capacity. Successful final inline writes and contiguous `get_operation` page writes establish transport consumption; merely returning a reference, reading a file internally, or requesting the last page out of order does not. Consumption is not proof of human/UI inspection. If no sufficient reclaimable cache exists, admission fails without deleting old cache or acknowledging pending data. Native work may already have executed, so recover its original receipt rather than repeat it.
+
+Version 1 hot metadata stores result references and rejects inline deliveries; conversion of an earlier store is an offline upgrade step. The metadata limit is 128 MiB. A failed candidate is rolled back so another conversation can continue saving metadata once storage is available. Both count and serialized-byte pressure trigger metadata reclamation. If a candidate exceeds 128 MiB, acknowledged secondary references retire first, followed by the oldest safe terminal receipts moving to the cold archive, with a best-effort target of 96 MiB. Archived terminal receipts retain their original 24-hour deadline; running, input-wait, uncertain and explicitly unread work remains protected. Successful body consumption is committed to state before its unread pin is released. A model-input request is bounded at 4 MiB per operation before it can change shared state; an oversized request remains at OMP for reconciliation. Storage bounds do not promise survival of a physical disk or power failure.
 
 Large image blocks are preserved in the saved JSON rather than silently discarded, but a JSON-fragment page is not an inline image renderer. Use the recovered original `piImage`/resource URI with the existing `transfer` path when the host needs the original attachment. Resource lifetimes and source-session ownership remain separate from response-snapshot retention. Small widget state remains inline when unrelated pending text is paged; oversized widget metadata fails clearly rather than exceeding the response limit.
 

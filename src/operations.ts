@@ -19,7 +19,7 @@ export type OperationStatus =
 export interface OperationReceipt {
 	key: string;
 	/** Unique acceptance incarnation; unchanged by a waiting_input resume. */
-	executionId?: string | undefined;
+	executionId: string;
 	/** Stable caller-visible identifier for detached operations. */
 	operationId?: string | undefined;
 	signature: string;
@@ -34,7 +34,14 @@ export interface OperationReceipt {
 	waitingInputs?: ModelInput[] | undefined;
 	/** Immutable public result snapshot; independent of transport ACK and execution status. */
 	resultId?: string | undefined;
+	/** Durable acknowledgement of this acceptance's completed result reference. */
+	resultAcknowledged?: boolean | undefined;
+	/** Explicit unread snapshot protection; cleared only by completed body transmission. */
+	resultUnread?: boolean | undefined;
 }
+
+/** State assigns the execution identity when accepting a new operation. */
+export type OperationReservation = Omit<OperationReceipt, "executionId">;
 
 export interface ReplayReceipt {
 	id: string;

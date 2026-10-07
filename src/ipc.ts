@@ -219,8 +219,8 @@ export type BrokerMessage =
 	| ({ type: "response"; id: number } & SessionResult)
 	| { type: "ackInputs"; sessionId: string; ids: string[] };
 
-export function ipcEndpoint(agentDir: string): string {
-	const directory = resolve(agentDir);
+export function ipcEndpoint(storageDir: string): string {
+	const directory = resolve(storageDir);
 	if (process.platform !== "win32") return join(directory, "chappie.sock");
 	const identity = directory.replaceAll("\\", "/").toLowerCase();
 	return String.raw`\\.\pipe\chappie-${createHash("sha256").update(identity).digest("hex").slice(0, 16)}`;
@@ -357,7 +357,7 @@ export class JsonLinePeer<Incoming, Outgoing> {
 }
 
 export class IpcServer {
-	readonly #agentDir: string;
+	readonly #storageDir: string;
 	readonly #endpoint: string;
 	#socketIdentity: { dev: number; ino: number } | undefined;
 	readonly #onMessage: (
@@ -372,15 +372,15 @@ export class IpcServer {
 	readonly #sockets = new Set<Socket>();
 
 	constructor(
-		agentDir: string,
+		storageDir: string,
 		onMessage: (
 			peer: JsonLinePeer<SessionMessage, BrokerMessage>,
 			message: SessionMessage,
 		) => Promise<void> | void,
 		onClose: (peer: JsonLinePeer<SessionMessage, BrokerMessage>) => void,
 	) {
-		this.#agentDir = agentDir;
-		this.#endpoint = ipcEndpoint(agentDir);
+		this.#storageDir = storageDir;
+		this.#endpoint = ipcEndpoint(storageDir);
 		this.#onMessage = onMessage;
 		this.#onClose = onClose;
 	}
@@ -394,9 +394,9 @@ export class IpcServer {
 			throw new Error("TCP listening requires mutual TLS configuration");
 		const material =
 			network && options.tls
-				? await tlsMaterial(this.#agentDir, options.tls)
+				? await tlsMaterial(this.#storageDir, options.tls)
 				: undefined;
-		await mkdir(this.#agentDir, { recursive: true, mode: 0o700 });
+		await mkdir(this.#storageDir, { recursive: true, mode: 0o700 });
 		if (process.platform !== "win32") await prepareUnixSocket(this.#endpoint);
 		try {
 			const local = this.#createServer();
@@ -490,7 +490,7 @@ interface ConnectionCallbacks {
 }
 
 export class IpcClient {
-	readonly #agentDir: string;
+	readonly #storageDir: string;
 	readonly #tls: NetworkTlsConfig | undefined;
 	readonly #endpoint: string;
 	readonly #remote: string | undefined;
@@ -502,14 +502,14 @@ export class IpcClient {
 	#closed = false;
 
 	constructor(
-		agentDir: string,
+		storageDir: string,
 		remote: string | undefined,
 		callbacks: ConnectionCallbacks,
 		tls?: NetworkTlsConfig,
 	) {
-		this.#agentDir = agentDir;
+		this.#storageDir = storageDir;
 		this.#tls = tls;
-		this.#endpoint = ipcEndpoint(agentDir);
+		this.#endpoint = ipcEndpoint(storageDir);
 		this.#remote = remote;
 		this.#callbacks = callbacks;
 	}
@@ -568,7 +568,7 @@ export class IpcClient {
 					this.#tls.serverName ?? (isIP(target.host) ? undefined : target.host);
 				socket = connectTls({
 					...target,
-					...(await tlsMaterial(this.#agentDir, this.#tls)),
+					...(await tlsMaterial(this.#storageDir, this.#tls)),
 					...(servername ? { servername } : {}),
 					minVersion: "TLSv1.3",
 					rejectUnauthorized: true,
@@ -740,12 +740,12 @@ function endpointAcceptsConnections(endpoint: string): Promise<boolean> {
 }
 
 async function tlsMaterial(
-	agentDir: string,
+	storageDir: string,
 	config: NetworkTlsConfig,
 ): Promise<{ ca: Buffer; cert: Buffer; key: Buffer }> {
 	const [ca, cert, key] = await Promise.all(
 		[config.ca, config.cert, config.key].map((path) =>
-			readFile(resolve(agentDir, path)),
+			readFile(resolve(storageDir, path)),
 		),
 	);
 	if (!ca || !cert || !key)

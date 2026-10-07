@@ -1,9 +1,10 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import type { BigIntStats } from "node:fs";
 import { open, stat } from "node:fs/promises";
 import { basename } from "node:path";
 import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
 import mime from "mime";
+import { uuidV7 } from "./ids.ts";
 
 export interface ResourceDescriptor {
 	uri: string;
@@ -46,7 +47,7 @@ export async function registerFile(
 	const descriptor = resourceDescriptor(
 		sessionId,
 		"file",
-		randomUUID(),
+		uuidV7(),
 		name,
 		mime.getType(path) ?? "application/octet-stream",
 		Number(info.size),

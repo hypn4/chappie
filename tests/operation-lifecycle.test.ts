@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import type { DeliveryRecord } from "../src/delivery.ts";
-import type { OperationReceipt } from "../src/operations.ts";
+import type { OperationReservation } from "../src/operations.ts";
 import { State } from "../src/state.ts";
 
 for (const terminal of ["completed", "failed", "cancelled"] as const) {
@@ -14,7 +14,7 @@ for (const terminal of ["completed", "failed", "cancelled"] as const) {
 		let now = 2_000_000_000_000;
 		t.mock.method(Date, "now", () => now);
 		const state = new State(root);
-		const receipt: OperationReceipt = {
+		const receipt: OperationReservation = {
 			key: "key",
 			operationId: "id",
 			signature: "sig",
@@ -26,7 +26,10 @@ for (const terminal of ["completed", "failed", "cancelled"] as const) {
 		};
 		await state.reserveOperation(receipt);
 		const old = state.operation("chat", "id");
-		assert.equal(typeof old.executionId, "string");
+		assert.match(
+			old.executionId,
+			/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+		);
 		await state.finishOperation("key", terminal);
 		const replay = await state.reserveOperation({ ...receipt });
 		assert.equal(replay?.status, terminal);
@@ -110,7 +113,7 @@ test("concurrent waiting_input reclaims keep one acceptance identity", async (t)
 	const root = await mkdtemp(join(tmpdir(), "ch-wait-id-"));
 	t.after(() => rm(root, { recursive: true, force: true }));
 	const state = new State(root);
-	const receipt: OperationReceipt = {
+	const receipt: OperationReservation = {
 		key: "key",
 		operationId: "id",
 		signature: "sig",
@@ -131,35 +134,4 @@ test("concurrent waiting_input reclaims keep one acceptance identity", async (t)
 	]);
 	assert.equal(claims.filter((value) => value === undefined).length, 1);
 	assert.equal(state.operation("chat", "id").executionId, before.executionId);
-});
-
-test("resuming an old unaliased input wait adopts recovery identity without changing its execution", async (t) => {
-	const root = await mkdtemp(join(tmpdir(), "ch-upgrade-wait-"));
-	t.after(() => rm(root, { recursive: true, force: true }));
-	const state = new State(root);
-	const old: OperationReceipt = {
-		key: "original-request-key",
-		signature: "sig",
-		chatId: "chat",
-		sessionId: "A",
-		cwd: root,
-		status: "running",
-		updatedAt: Date.now(),
-	};
-	await state.reserveOperation(old);
-	const execution = state.executionSource(old.key).executionId;
-	await state.waitForInput(old.key, [
-		{ id: "model", sessionId: "A", request: { kind: "compaction", input: {} } },
-	]);
-	await state.reserveOperation({ ...old, operationId: "call-recovery" });
-	const resumed = state.operation("chat", "call-recovery");
-	assert.equal(resumed.key, old.key);
-	assert.equal(resumed.executionId, execution);
-	assert.equal(resumed.status, "running");
-	const restored = new State(root);
-	await restored.load();
-	assert.equal(
-		restored.operation("chat", "call-recovery").executionId,
-		execution,
-	);
 });

@@ -12,7 +12,7 @@ export const operationResourceSchema = z.strictObject({
 /** One validator for both hot state and cold replay-protection records. */
 export const operationReceiptSchema = z.strictObject({
 	key: z.string(),
-	executionId: z.string().uuid().optional(),
+	executionId: z.string().uuid(),
 	operationId: z.string().min(1).max(128).optional(),
 	signature: z.string(),
 	chatId: z.string(),
@@ -38,4 +38,6 @@ export const operationReceiptSchema = z.strictObject({
 		.string()
 		.regex(/^[a-f0-9]{64}$/)
 		.optional(),
+	resultAcknowledged: z.boolean().optional(),
+	resultUnread: z.boolean().optional(),
 });

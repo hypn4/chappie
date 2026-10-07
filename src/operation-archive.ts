@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { lstatSync, readFileSync } from "node:fs";
 import {
 	lstat,
@@ -10,12 +10,14 @@ import {
 } from "node:fs/promises";
 import { join } from "node:path";
 import { withFileMutationQueue } from "./file-mutation-queue.ts";
+import { uuidV7 } from "./ids.ts";
 import { operationReceiptSchema } from "./operation-schema.ts";
 import type { OperationReceipt } from "./operations.ts";
 
 const MAX_RECORD_BYTES = 32 * 1024 * 1024;
 const MAX_ARCHIVE_BYTES = 256 * 1024 * 1024;
 const MAX_ARCHIVE_FILES = 131_072;
+export const TERMINAL_RETENTION_MS = 24 * 60 * 60 * 1000;
 const archiveFile = /^(?:key|alias)-[a-f0-9]{64}\.json$/;
 
 function digest(value: string): string {
@@ -32,16 +34,26 @@ function missing(error: unknown): boolean {
 	return (error as NodeJS.ErrnoException)?.code === "ENOENT";
 }
 
+function terminalExpiry(receipt: OperationReceipt): number | undefined {
+	return receipt.status === "completed" ||
+		receipt.status === "failed" ||
+		receipt.status === "cancelled"
+		? receipt.updatedAt + TERMINAL_RETENTION_MS
+		: undefined;
+}
+
 /**
  * Cold, owner-checked replay protection. No response bodies or resident handles.
  * Queries read one bounded record; admission is serialized with atomic writes.
- * The broker is the only process writing its agent directory.
+ * The broker is the only process writing its neutral storage directory.
  */
 export class OperationArchive {
 	readonly #directory: string;
-	#usage: { bytes: number; files: number; stamp: string } | undefined;
-	constructor(agentDir: string) {
-		this.#directory = join(agentDir, "chappie.uncertain");
+	#usage:
+		| { bytes: number; files: number; stamp: string; nextExpiry?: number }
+		| undefined;
+	constructor(storageDir: string) {
+		this.#directory = join(storageDir, "chappie.uncertain");
 	}
 
 	#keyPath(key: string): string {
@@ -64,7 +76,7 @@ export class OperationArchive {
 			throw error;
 		}
 	}
-	get(key: string): OperationReceipt | undefined {
+	#stored(key: string): OperationReceipt | undefined {
 		const value = this.#read(this.#keyPath(key));
 		if (value === undefined) return undefined;
 		const receipt = operationReceiptSchema.parse(value);
@@ -72,26 +84,33 @@ export class OperationArchive {
 			throw new Error("Archived operation identity changed");
 		return receipt;
 	}
+	get(key: string): OperationReceipt | undefined {
+		const receipt = this.#stored(key);
+		if (!receipt) return undefined;
+		const expiresAt = terminalExpiry(receipt);
+		return expiresAt !== undefined && expiresAt < Date.now()
+			? undefined
+			: receipt;
+	}
+	#aliasKey(path: string): string | undefined {
+		const value = this.#read(path, 16 * 1024);
+		if (value === undefined) return undefined;
+		if (
+			typeof value !== "object" ||
+			value === null ||
+			!("key" in value) ||
+			typeof value.key !== "string"
+		)
+			throw new Error("Invalid archived operation alias");
+		return value.key;
+	}
 	find(chatId: string, operationId: string): OperationReceipt | undefined {
-		let receipt = this.get(operationId); // Old replay.id is also a recovery key.
-		if (!receipt) {
-			const value = this.#read(this.#aliasPath(chatId, operationId), 16 * 1024);
-			if (value !== undefined) {
-				if (
-					typeof value !== "object" ||
-					value === null ||
-					!("key" in value) ||
-					typeof value.key !== "string"
-				)
-					throw new Error("Invalid archived operation alias");
-				receipt = this.get(value.key);
-			}
-		}
+		const key = this.#aliasKey(this.#aliasPath(chatId, operationId));
+		const receipt = key === undefined ? undefined : this.get(key);
 		if (
 			!receipt ||
 			receipt.chatId !== chatId ||
-			(receipt.key !== operationId &&
-				recoveryOperationId(receipt) !== operationId)
+			recoveryOperationId(receipt) !== operationId
 		)
 			return undefined;
 		return receipt;
@@ -103,19 +122,76 @@ export class OperationArchive {
 			throw new Error("Invalid operation archive directory");
 		return `${info.ino}:${info.mtimeNs}:${info.ctimeNs}`;
 	}
-	async #refreshUsage(): Promise<void> {
+	async #removeFiles(receipt: OperationReceipt): Promise<void> {
+		// An alias can already point at a successor after an interrupted update.
+		// Remove only this record's pointer, never another acceptance's alias.
+		await unlink(this.#keyPath(receipt.key)).catch((error: unknown) => {
+			if (!missing(error)) throw error;
+		});
+		const aliasPath = this.#aliasPath(
+			receipt.chatId,
+			recoveryOperationId(receipt),
+		);
+		if (this.#aliasKey(aliasPath) === receipt.key)
+			await unlink(aliasPath).catch((error: unknown) => {
+				if (!missing(error)) throw error;
+			});
+	}
+	async #refreshUsage(now: number): Promise<void> {
 		const stamp = await this.#stamp();
-		if (this.#usage?.stamp === stamp) return;
+		if (
+			this.#usage?.stamp === stamp &&
+			(this.#usage.nextExpiry === undefined || this.#usage.nextExpiry >= now)
+		)
+			return;
+		// All callers hold the directory mutation queue. A partial cleanup must
+		// force the next admission to recount, including other store instances.
+		this.#usage = undefined;
+		const names = (await readdir(this.#directory)).filter((name) =>
+			archiveFile.test(name),
+		);
 		let bytes = 0,
 			files = 0;
-		for (const name of await readdir(this.#directory)) {
-			if (!archiveFile.test(name)) continue;
-			const info = await lstat(join(this.#directory, name));
-			if (!info.isFile()) throw new Error("Invalid archived operation file");
-			bytes += info.size;
+		let nextExpiry: number | undefined;
+		for (const name of names) {
+			if (!name.startsWith("key-")) continue;
+			const path = join(this.#directory, name);
+			const receipt = operationReceiptSchema.parse(this.#read(path));
+			if (this.#keyPath(receipt.key) !== path)
+				throw new Error("Archived operation identity changed");
+			const expiresAt = terminalExpiry(receipt);
+			if (expiresAt !== undefined && expiresAt < now) {
+				await this.#removeFiles(receipt);
+				continue;
+			}
+			if (expiresAt !== undefined)
+				nextExpiry = Math.min(nextExpiry ?? expiresAt, expiresAt);
+			bytes += (await this.#size(path)) ?? 0;
 			files++;
 		}
-		this.#usage = { bytes, files, stamp };
+		for (const name of names) {
+			if (!name.startsWith("alias-")) continue;
+			const path = join(this.#directory, name);
+			const key = this.#aliasKey(path);
+			if (key === undefined) continue;
+			const receipt = this.#stored(key);
+			if (
+				!receipt ||
+				this.#aliasPath(receipt.chatId, recoveryOperationId(receipt)) !== path
+			) {
+				// Finish alias cleanup if a previous process stopped after key removal.
+				await unlink(path);
+				continue;
+			}
+			bytes += (await this.#size(path)) ?? 0;
+			files++;
+		}
+		this.#usage = {
+			bytes,
+			files,
+			stamp: await this.#stamp(),
+			...(nextExpiry !== undefined ? { nextExpiry } : {}),
+		};
 	}
 	async #size(path: string): Promise<number | undefined> {
 		try {
@@ -128,7 +204,7 @@ export class OperationArchive {
 		}
 	}
 	async #write(path: string, contents: string): Promise<void> {
-		const temporary = `${path}.${randomUUID()}.tmp`;
+		const temporary = `${path}.${uuidV7()}.tmp`;
 		try {
 			await writeFile(temporary, contents, { flag: "wx", mode: 0o600 });
 			await rename(temporary, path);
@@ -155,21 +231,28 @@ export class OperationArchive {
 					"Operation archive record exceeds its byte limit; receipt remains live",
 				);
 			await mkdir(this.#directory, { recursive: true, mode: 0o700 });
-			await this.#refreshUsage();
+			const now = Date.now();
+			await this.#refreshUsage(now);
 			const keyPath = this.#keyPath(receipt.key);
 			const aliasPath = this.#aliasPath(
 				receipt.chatId,
 				recoveryOperationId(receipt),
 			);
-			const old = this.get(receipt.key);
+			const old = this.#stored(receipt.key);
 			if (
 				old &&
 				(old.signature !== receipt.signature ||
 					old.executionId !== receipt.executionId ||
 					old.chatId !== receipt.chatId ||
-					old.sessionId !== receipt.sessionId)
+					old.sessionId !== receipt.sessionId ||
+					recoveryOperationId(old) !== recoveryOperationId(receipt))
 			)
 				throw new Error("Archived acceptance cannot be replaced");
+			const conflict = this.find(receipt.chatId, recoveryOperationId(receipt));
+			if (conflict && conflict.key !== receipt.key)
+				throw new Error(
+					"Archived operation identifier already belongs to another acceptance",
+				);
 			const sizes = [await this.#size(keyPath), await this.#size(aliasPath)];
 			const usage = this.#usage;
 			if (!usage) throw new Error("Operation archive accounting unavailable");
@@ -187,7 +270,17 @@ export class OperationArchive {
 			try {
 				await this.#write(keyPath, body);
 				await this.#write(aliasPath, alias);
-				this.#usage = { bytes, files, stamp: await this.#stamp() };
+				const expiresAt = terminalExpiry(receipt);
+				const nextExpiry =
+					expiresAt === undefined
+						? usage.nextExpiry
+						: Math.min(usage.nextExpiry ?? expiresAt, expiresAt);
+				this.#usage = {
+					bytes,
+					files,
+					stamp: await this.#stamp(),
+					...(nextExpiry !== undefined ? { nextExpiry } : {}),
+				};
 			} catch (error) {
 				this.#usage = undefined;
 				throw error;
@@ -198,20 +291,17 @@ export class OperationArchive {
 	/** Only after the identical acceptance and any late output are durable in hot state. */
 	remove(receipt: OperationReceipt): Promise<void> {
 		return withFileMutationQueue(this.#directory, async () => {
-			const old = this.get(receipt.key);
+			const old = this.#stored(receipt.key);
 			if (!old) return;
 			if (
 				old.executionId !== receipt.executionId ||
-				old.signature !== receipt.signature
+				old.signature !== receipt.signature ||
+				old.chatId !== receipt.chatId ||
+				old.sessionId !== receipt.sessionId
 			)
 				throw new Error("Archived acceptance changed during restoration");
-			await unlink(this.#keyPath(receipt.key));
-			await unlink(this.#aliasPath(old.chatId, recoveryOperationId(old))).catch(
-				(error: unknown) => {
-					if (!missing(error)) throw error;
-				},
-			);
 			this.#usage = undefined;
+			await this.#removeFiles(old);
 		});
 	}
 }

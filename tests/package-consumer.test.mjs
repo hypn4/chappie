@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { test } from "node:test";
+import { promisify } from "node:util";
 
 const api = import(new URL("../scripts/verify-package.mjs", import.meta.url));
 const manifest = JSON.parse(
@@ -46,3 +48,23 @@ test("installed verification rejects a mismatched package version", async (t) =>
 	);
 	await assert.rejects(verifyInstalled(root, manifest), /version/i);
 });
+
+for (const retired of ["src/omp-agent-dir.ts", "dist/src/omp-agent-dir.js"]) {
+	test(`package inspection rejects the retired storage resolver ${retired}`, async (t) => {
+		const { inspectPackage } = await api;
+		const root = await temporary(t);
+		const destination = join(root, "package", retired);
+		await mkdir(dirname(destination), { recursive: true });
+		await writeFile(destination, "export {};\n");
+		await writeFile(
+			join(root, "package", "package.json"),
+			JSON.stringify(manifest),
+		);
+		const archive = join(root, "retired.tgz");
+		await promisify(execFile)("tar", ["-czf", archive, "-C", root, "package"]);
+		await assert.rejects(inspectPackage(archive), (error) => {
+			assert.equal(error.message, `Retired entry in archive: ${retired}`);
+			return true;
+		});
+	});
+}

@@ -5,18 +5,22 @@ import { readConfig } from "./config.ts";
 import { installOmpCollaborationTools } from "./local.omp.ts";
 import { createOmpChappieProvider } from "./provider.omp.ts";
 import { createOmpHostApi, LocalSession } from "./session.ts";
+import { resolveChappieStorage } from "./storage.ts";
 import { createOmpTransferTool } from "./transfer.omp.ts";
 
 export default async function chappie(pi: OmpExtensionAPI): Promise<void> {
 	const agentDir = getAgentDir();
-	const config = await readConfig(agentDir);
-	const session = new LocalSession(
-		createOmpHostApi(pi, toolWireSchema),
+	const storage = await resolveChappieStorage();
+	const config = await readConfig(storage.storeDir);
+	const session = new LocalSession(createOmpHostApi(pi, toolWireSchema), {
 		agentDir,
-		config.connect,
-		config.tls,
-		config.localTools === true,
-	);
+		storageDir: storage.storeDir,
+		historyHomeDir: storage.homeDir,
+		historyProjectId: process.env.CHAPPIE_PROJECT_ID,
+		connect: config.connect,
+		tls: config.tls,
+		localTools: config.localTools === true,
+	});
 	session.installOmp(pi);
 	pi.registerTool(createOmpTransferTool(session));
 	installOmpCollaborationTools(pi, session, config.localTools === true);

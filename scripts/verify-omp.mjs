@@ -14,7 +14,9 @@ import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { Broker } from "../src/broker.ts";
+import { CommonHistoryStore } from "../src/common-history.ts";
 import { toolResultsContent } from "../src/delivery.ts";
+import { resolveChappieStorage } from "../src/storage.ts";
 import { createOmpProcessHarness } from "./omp-process-harness.mjs";
 
 // These are synthetic tool requests, not a second model/agent doing inference.
@@ -49,6 +51,8 @@ const root = await mkdtemp(
 	join(process.platform === "win32" ? tmpdir() : "/tmp", "chomp-"),
 );
 const agent = join(root, "agent");
+const chappieHome = join(root, "chappie");
+const { storeDir } = await resolveChappieStorage({ CHAPPIE_HOME: chappieHome });
 const work = join(root, "work");
 await mkdir(agent);
 await mkdir(work);
@@ -68,7 +72,7 @@ await writeFile(
 	}),
 );
 await writeFile(
-	join(agent, "chappie.json"),
+	join(storeDir, "chappie.json"),
 	JSON.stringify({ localTools: true }),
 	"utf8",
 );
@@ -137,13 +141,95 @@ export default async function probe(api) {
 const brokerOptions = {
 	callWaitMs: Number(process.env.CHAPPIE_VERIFY_CALL_WAIT_MS ?? 1000),
 };
-let broker = new Broker(agent, brokerOptions);
+let broker = new Broker(storeDir, brokerOptions);
 const controller = new AbortController();
 const timer = setTimeout(
 	() => controller.abort(new Error("OMP integration test timed out")),
 	25000 + soakIterations * 500,
 );
 const signal = controller.signal;
+
+async function readNativeOutput(chatId, resultId, expected, calls) {
+	const text = await broker.readResponse(chatId, resultId);
+	const saved = JSON.parse(text);
+	assert.ok(Array.isArray(saved.content));
+	assert.equal(saved.content[0]?.type, "text");
+	const metadata = JSON.parse(saved.content[0].text);
+	assert.equal(metadata.sessionId, expected.sessionId);
+	assert.equal(metadata.cwd, expected.cwd);
+	assert.deepEqual(metadata.work, expected.work);
+	const content = saved.content.slice(1);
+	const toolHeaders = content.flatMap((block) => {
+		if (block.type !== "text") return [];
+		let value;
+		try {
+			value = JSON.parse(block.text);
+		} catch {
+			return [];
+		}
+		if (!value || typeof value !== "object" || !("toolCallId" in value))
+			return [];
+		assert.deepEqual(Object.keys(value).sort(), [
+			"isError",
+			"toolCallId",
+			"toolName",
+		]);
+		assert.equal(typeof value.toolCallId, "string");
+		assert.ok(value.toolCallId.length > 0);
+		assert.equal(typeof value.isError, "boolean");
+		return [value];
+	});
+	assert.equal(toolHeaders.length, calls.length);
+	assert.equal(
+		new Set(toolHeaders.map((item) => item.toolCallId)).size,
+		calls.length,
+	);
+	assert.deepEqual(
+		toolHeaders.map((item) => item.toolName),
+		calls.map((call) => call.name),
+	);
+	assert.equal(
+		saved.isError,
+		Boolean(expected.error) || toolHeaders.some((item) => item.isError),
+	);
+	assert.deepEqual(metadata.continuation, {
+		scope: "native_batch",
+		userGoal: "not_evaluated",
+		nextAction: saved.isError
+			? "inspect_failure"
+			: metadata.work?.state === "actionable"
+				? "continue_requested_work"
+				: metadata.work?.state === "blocked"
+					? "review_blockers"
+					: "verify_requested_scope",
+	});
+	return {
+		content,
+		toolHeaders,
+		isError: saved.isError,
+		work: metadata.work,
+		continuation: metadata.continuation,
+		bytes: Buffer.byteLength(text),
+	};
+}
+
+async function readRetainedNativeOutput(chatId, observed, calls) {
+	const reference = observed.result;
+	assert.ok(reference, "Completed native work must have a retained result");
+	assert.equal(reference.chatId, chatId);
+	assert.equal(reference.sessionId, observed.operation.sessionId);
+	assert.equal(reference.cwd, observed.operation.cwd);
+	assert.equal(reference.resultId, observed.operation.resultId);
+	const output = await readNativeOutput(
+		chatId,
+		reference.resultId,
+		reference,
+		calls,
+	);
+	assert.equal(output.bytes, reference.bytes);
+	assert.equal(output.isError, reference.failed);
+	return output;
+}
 
 // Assertions that require effects must follow a yielded call to its result.
 // Keep the dedicated bounded-call probe below unwrapped to test the early return.
@@ -161,21 +247,19 @@ async function completedCall(...args) {
 			response.operation?.resultId,
 			"Fast native output needs a disk recovery snapshot",
 		);
-		const saved = JSON.parse(
-			await broker.readResponse(args[0], response.operation.resultId),
+		const output = await readNativeOutput(
+			args[0],
+			response.operation.resultId,
+			response,
+			args[2],
 		);
-		const resultIds = saved.content.flatMap((block) => {
-			if (block.type !== "text") return [];
-			try {
-				const value = JSON.parse(block.text);
-				return value.toolCallId ? [value.toolCallId] : [];
-			} catch {
-				return [];
-			}
-		});
 		assert.deepEqual(
-			resultIds,
+			output.toolHeaders.map((item) => item.toolCallId),
 			response.toolResults.map((item) => item.toolCallId),
+		);
+		assert.deepEqual(
+			output.content,
+			toolResultsContent(response.toolResults, response.sessionId),
 		);
 		assert.ok(
 			broker
@@ -184,7 +268,8 @@ async function completedCall(...args) {
 					(item) => item.operationId === response.operation.operationId,
 				),
 		);
-		return response;
+		await broker.markResponseRead(args[0], response.operation.resultId);
+		return { ...response, output };
 	}
 	const [chatId] = args;
 	const id = response.operation.operationId;
@@ -202,16 +287,13 @@ async function completedCall(...args) {
 		"completed",
 		JSON.stringify(observed.operation),
 	);
-	assert.ok(
-		observed.result,
-		"Completed native work must have a retained result",
-	);
-	assert.equal(observed.result.toolResults.length, args[2].length);
+	const output = await readRetainedNativeOutput(chatId, observed, args[2]);
 	await broker.acknowledge(observed.deliveries, [], signal);
+	await broker.markResponseRead(chatId, observed.result.resultId);
 	return {
 		...response,
-		toolResults: observed.result.toolResults,
-		...(observed.result.work ? { work: observed.result.work } : {}),
+		output,
+		...(output.work ? { work: output.work } : {}),
 	};
 }
 const commonArgs = [
@@ -234,6 +316,8 @@ const commonArgs = [
 ];
 const env = {
 	...process.env,
+	CHAPPIE_HOME: chappieHome,
+	CHAPPIE_STORE_ID: undefined,
 	PI_CODING_AGENT_DIR: agent,
 	PI_CONFIG_DIR: ".chappie-integration",
 	OMP_PROFILE: "",
@@ -292,12 +376,8 @@ try {
 		"read-line",
 		signal,
 	);
-	const text = read.toolResults
-		.flatMap((result) =>
-			result.content.flatMap((block) =>
-				block.type === "text" ? [block.text] : [],
-			),
-		)
+	const text = read.output.content
+		.flatMap((block) => (block.type === "text" ? [block.text] : []))
 		.join("\n");
 	assert.match(text, /Beta/);
 	// Native OMP may include surrounding lines to provide an anchored preview.
@@ -315,7 +395,7 @@ try {
 		"edit-line",
 		signal,
 	);
-	assert.ok(edit.toolResults.every((result) => !result.isError));
+	assert.equal(edit.output.isError, false);
 	assert.equal(
 		await readFile(join(work, "fixture.txt"), "utf8"),
 		"Alpha\nBeta edited\nGamma\n",
@@ -347,8 +427,22 @@ try {
 	}
 	assert.equal(detachedResult.operation.status, "completed");
 	assert.equal(detachedResult.deliveries.length, 1);
-	assert.equal(detachedResult.deliveries[0]?.toolResults.length, 1);
+	const detachedOutput = await readRetainedNativeOutput(
+		"integration-chat",
+		detachedResult,
+		[{ name: "read", arguments: { path: "fixture.txt" } }],
+	);
+	assert.equal(
+		detachedResult.deliveries[0]?.resultId,
+		detachedResult.result.resultId,
+	);
+	assert.equal(detachedOutput.isError, false);
+	assert.match(JSON.stringify(detachedOutput.content), /Beta edited/);
 	await broker.acknowledge(detachedResult.deliveries, [], signal);
+	await broker.markResponseRead(
+		"integration-chat",
+		detachedResult.result.resultId,
+	);
 	// The read is held by a real OMP hook until after the caller receives its
 	// operation reference; no sleep is used to guess native completion.
 	const boundedCaller = new AbortController();
@@ -389,12 +483,19 @@ try {
 		);
 	}
 	assert.equal(boundedResult.operation.status, "completed");
-	assert.match(
-		JSON.stringify(boundedResult.result.toolResults),
-		/BOUNDED_NATIVE_OK/,
+	const boundedOutput = await readRetainedNativeOutput(
+		"integration-chat",
+		boundedResult,
+		[{ name: "read", arguments: { path: "bounded.txt" } }],
 	);
+	assert.equal(boundedOutput.isError, false);
+	assert.match(JSON.stringify(boundedOutput.content), /BOUNDED_NATIVE_OK/);
 	assert.equal(await readFile(boundedStarted, "utf8"), "started\n");
 	await broker.acknowledge(boundedResult.deliveries, [], signal);
+	await broker.markResponseRead(
+		"integration-chat",
+		boundedResult.result.resultId,
+	);
 	const calls = [
 		{
 			name: "transfer",
@@ -512,7 +613,7 @@ try {
 			label,
 			signal,
 		);
-		assert.ok(result.toolResults.every((item) => !item.isError));
+		assert.equal(result.output.isError, false);
 	}
 	const progress = await broker.chat(
 		"integration-chat",
@@ -546,7 +647,7 @@ try {
 		"after-reminder",
 		signal,
 	);
-	assert.ok(resumed.toolResults.every((item) => !item.isError));
+	assert.equal(resumed.output.isError, false);
 	assert.equal(await readFile(reminderFile, "utf8"), "seen");
 	const completedTodo = await completedCall(
 		"integration-chat",
@@ -555,7 +656,7 @@ try {
 		"todo-done",
 		signal,
 	);
-	assert.ok(completedTodo.toolResults.every((item) => !item.isError));
+	assert.equal(completedTodo.output.isError, false);
 	assert.equal(completedTodo.work?.state, "actionable");
 	assert.equal(completedTodo.work.counts?.completed, 1);
 	const nextReport = await broker.chat(
@@ -575,7 +676,7 @@ try {
 		"second-todo-done",
 		signal,
 	);
-	assert.ok(finalTodo.toolResults.every((item) => !item.isError));
+	assert.equal(finalTodo.output.isError, false);
 	assert.equal(finalTodo.work?.state, "settled");
 	assert.equal(finalTodo.work.counts?.completed, 2);
 	// Keep OMP alive while restarting only the broker. The first remote request
@@ -584,7 +685,7 @@ try {
 	// auxiliary because OMP's live model context was transient during resume.
 	await broker.close();
 	await delay(30);
-	broker = new Broker(agent, brokerOptions);
+	broker = new Broker(storeDir, brokerOptions);
 	await broker.start();
 	while (broker.listSessions().length === 0) {
 		signal.throwIfAborted();
@@ -600,8 +701,9 @@ try {
 		"first-after-broker-reconnect",
 		signal,
 	);
-	assert.ok(
-		firstAfterReconnect.toolResults.every((item) => !item.isError),
+	assert.equal(
+		firstAfterReconnect.output.isError,
+		false,
 		"first Chappie request after broker reconnect must complete normally",
 	);
 	// Reproduce the real failure mode: stop OMP itself, restore the same saved
@@ -622,7 +724,7 @@ try {
 		"prime-resumable-session",
 		signal,
 	);
-	assert.ok(primed.toolResults.every((item) => !item.isError));
+	assert.equal(primed.output.isError, false);
 	await omp.stop();
 	await omp.waitForNoSessions(() => broker.listSessions(), signal);
 
@@ -639,8 +741,9 @@ try {
 		"first-after-omp-session-resume",
 		signal,
 	);
-	assert.ok(
-		firstAfterSessionResume.toolResults.every((item) => !item.isError),
+	assert.equal(
+		firstAfterSessionResume.output.isError,
+		false,
 		"first Chappie request after OMP session resume must complete normally",
 	);
 	if (soakIterations) {
@@ -656,8 +759,8 @@ try {
 				`soak-${i}`,
 				signal,
 			);
-			assert.equal(result.toolResults.length, 1);
-			assert.ok(result.toolResults.every((item) => !item.isError));
+			assert.equal(result.output.toolHeaders.length, 1);
+			assert.equal(result.output.isError, false);
 			durations.push(performance.now() - started);
 		}
 		const large = await completedCall(
@@ -674,8 +777,8 @@ try {
 			"soak-large-output",
 			signal,
 		);
-		assert.equal(large.toolResults.length, 1);
-		assert.ok(large.toolResults.every((item) => !item.isError));
+		assert.equal(large.output.toolHeaders.length, 1);
+		assert.equal(large.output.isError, false);
 		const files = [];
 		async function collect(directory) {
 			for (const entry of await readdir(directory, { withFileTypes: true })) {
@@ -695,7 +798,7 @@ try {
 		await broker.diagnostics.flush();
 		assert.equal(broker.diagnostics.stats.pending, 0);
 		const trace = (
-			await readFile(join(agent, "chappie.diagnostics.jsonl"), "utf8")
+			await readFile(join(storeDir, "chappie.diagnostics.jsonl"), "utf8")
 		)
 			.trim()
 			.split("\n")
@@ -730,6 +833,47 @@ try {
 		"Integration test complete.",
 		"done",
 		signal,
+	);
+	const sharedHistory = new CommonHistoryStore({ homeDir: chappieHome });
+	let savedHistory;
+	while (
+		!savedHistory?.entries.some((entry) =>
+			entry.text.includes("Integration test complete."),
+		)
+	) {
+		signal.throwIfAborted();
+		omp.assertHealthy();
+		const projects = await sharedHistory.listProjects();
+		assert.ok(
+			projects.length <= 1,
+			"Native resume must retain the project identity",
+		);
+		if (projects[0])
+			savedHistory = await sharedHistory.readSession(
+				projects[0].projectId,
+				restored.id,
+			);
+		if (
+			!savedHistory?.entries.some((entry) =>
+				entry.text.includes("Integration test complete."),
+			)
+		)
+			await delay(25);
+	}
+	assert.equal(savedHistory.source.agent, "omp");
+	assert.equal(savedHistory.sessionId, restored.id);
+	assert.equal(savedHistory.schemaVersion, 1);
+	assert.equal(
+		savedHistory.coverage.retainedEntries,
+		savedHistory.entries.length,
+	);
+	assert.ok(
+		Buffer.byteLength(JSON.stringify(savedHistory)) <= 16 * 1024 * 1024,
+	);
+	assert.equal(
+		(await readdir(agent)).some((name) => name.startsWith("chappie.")),
+		false,
+		"Chappie must not write storage into the native agent directory",
 	);
 	console.log(
 		"OMP integration passed: native tool discovery and batch execution, provider ownership after replacement/disposal, auxiliary rejection, detached operation completion, bounded synchronous call recovery through a gated native read, broker reconnect first-turn routing, saved-session resume first-turn routing, local collaboration registration, nonterminating progress and two-step TODO continuation, exact read, native edit, resource bytes, replay and original-URI recovery.",

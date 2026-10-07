@@ -1,6 +1,6 @@
-import { randomUUID } from "node:crypto";
 import type { ToolCall } from "@oh-my-pi/pi-ai";
 import * as z from "zod";
+import { uuidV7 } from "./ids.ts";
 import type { ToolInput } from "./tools.ts";
 
 // Only the transport envelope belongs to Chappie. Each tool's arguments are
@@ -34,7 +34,7 @@ export function hasHostFileImport(calls: readonly ToolInput[]): boolean {
 export function nativeToolCalls(calls: readonly ToolInput[]): ToolCall[] {
 	return calls.map(({ name, arguments: args }) => ({
 		type: "toolCall",
-		id: `chappie-${randomUUID()}`,
+		id: `chappie-${uuidV7()}`,
 		name,
 		arguments: args,
 	}));

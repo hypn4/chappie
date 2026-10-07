@@ -8,7 +8,10 @@ import { type TestContext, test } from "node:test";
 import { Broker } from "../src/broker.ts";
 import { readConfig } from "../src/config.ts";
 import { ipcEndpoint, JsonLinePeer } from "../src/ipc.ts";
-import { validateSessionMessage } from "../src/ipc-schema.ts";
+import {
+	validateBrokerMessage,
+	validateSessionMessage,
+} from "../src/ipc-schema.ts";
 import { until, within } from "./helpers/async.ts";
 
 async function fixture(t: TestContext) {
@@ -76,6 +79,77 @@ test("inspection validates optional Skill metadata at the IPC boundary", () => {
 			inspection: {
 				...message.inspection,
 				skills: [{ name: "skill:bad", source: "skill", description: 123 }],
+			},
+		}),
+	);
+});
+
+test("execution identity is paired at the IPC boundary and required for accepted native calls", () => {
+	const identity = {
+		operationKey: "accepted-operation",
+		executionId: "8f6d6c83-98aa-4199-a95d-268d62c95db4",
+	};
+	const call = {
+		type: "call",
+		chatId: "chat",
+		sessionId: "A",
+		requestId: "remote-operation",
+		calls: [
+			{ type: "toolCall", id: "read", name: "read", arguments: { path: "a" } },
+		],
+	};
+	// The originating session has not yet received a broker acceptance.
+	assert.doesNotThrow(() =>
+		validateSessionMessage({ type: "request", id: 1, request: call }),
+	);
+	assert.throws(() => validateBrokerMessage({ ...call, id: 1 }), {
+		name: "ZodError",
+	});
+	assert.doesNotThrow(() =>
+		validateBrokerMessage({ ...call, ...identity, id: 1 }),
+	);
+	for (const source of [
+		{ operationKey: identity.operationKey },
+		{ executionId: identity.executionId },
+		{ operationKey: identity.operationKey, executionId: "not-a-uuid" },
+	]) {
+		assert.throws(() => validateBrokerMessage({ ...call, ...source, id: 1 }), {
+			name: "ZodError",
+		});
+		assert.throws(
+			() =>
+				validateSessionMessage({
+					type: "delivery",
+					delivery: {
+						id: "deferred",
+						chatId: "chat",
+						sessionId: "A",
+						cwd: "/fixture",
+						toolResults: [],
+						...source,
+					},
+				}),
+			{ name: "ZodError" },
+		);
+	}
+	assert.doesNotThrow(() =>
+		validateBrokerMessage({
+			type: "chat",
+			id: 1,
+			chatId: "chat",
+			sessionId: "A",
+			text: "continue",
+		}),
+	);
+	assert.doesNotThrow(() =>
+		validateSessionMessage({
+			type: "delivery",
+			delivery: {
+				id: "untracked-chat",
+				chatId: "chat",
+				sessionId: "A",
+				cwd: "/fixture",
+				toolResults: [],
 			},
 		}),
 	);

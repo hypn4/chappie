@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import type { DeliveryRecord } from "../src/delivery.ts";
+import type { Broker } from "../src/broker.ts";
+import type { DeliveryReference } from "../src/delivery.ts";
 import type { SessionToolResult } from "../src/ipc.ts";
+import { toolResult } from "../src/tools.ts";
 import { mcpFixture } from "./helpers/mcp-fixture.ts";
 import { sessionFixture } from "./helpers/session-fixture.ts";
 
@@ -20,18 +22,38 @@ const tool: SessionToolResult = {
 	content: [{ type: "text", text: "done" }],
 	details: { resources: [resource] },
 };
-const delivery: DeliveryRecord = {
+const deliveryOutput = JSON.stringify(
+	toolResult(
+		[
+			{
+				...tool,
+				details: {},
+				content: [{ type: "text", text: "PENDING_RESULT" }],
+			},
+		],
+		"A",
+		"/fixture",
+	),
+);
+const delivery: DeliveryReference = {
 	id: "pending-1",
 	chatId: "server-test",
 	sessionId: "A",
 	cwd: "/fixture",
-	toolResults: [
-		{
-			...tool,
-			details: {},
-			content: [{ type: "text", text: "PENDING_RESULT" }],
-		},
-	],
+	resultId: "d".repeat(64),
+	bytes: Buffer.byteLength(deliveryOutput),
+	failed: false,
+};
+const deliveryStore: Pick<Broker, "readResponse" | "markResponseRead"> = {
+	readResponse: async (chatId, resultId) => {
+		assert.equal(chatId, "server-test");
+		assert.equal(resultId, delivery.resultId);
+		return deliveryOutput;
+	},
+	markResponseRead: async (chatId, resultId) => {
+		assert.equal(chatId, "server-test");
+		assert.equal(resultId, delivery.resultId);
+	},
 };
 
 test("MCP tool annotations describe mutation and external access accurately", async (t) => {
@@ -89,6 +111,7 @@ test("get_operation delivers and acknowledges the matching detached result", asy
 		operationKey: "operation-key",
 	};
 	const f = await mcpFixture(t, {
+		...deliveryStore,
 		operation: () => ({
 			operation: {
 				operationId: "long-read",
@@ -175,6 +198,7 @@ test("sessions remains responsive when a registered session never answers inspec
 
 test("format failures do not consume pending results", async (t) => {
 	const f = await mcpFixture(t, {
+		...deliveryStore,
 		deliveries: () => [delivery],
 		call: async () => ({
 			sessionId: "A",
@@ -193,6 +217,7 @@ test("format failures do not consume pending results", async (t) => {
 
 test("completed replay still delivers and acknowledges other pending results", async (t) => {
 	const f = await mcpFixture(t, {
+		...deliveryStore,
 		deliveries: () => [delivery],
 		call: async () => ({
 			sessionId: "A",
@@ -216,6 +241,7 @@ test("completed replay still delivers and acknowledges other pending results", a
 
 test("completed chat replay still delivers and acknowledges other pending results", async (t) => {
 	const f = await mcpFixture(t, {
+		...deliveryStore,
 		deliveries: () => [delivery],
 		chat: async () => ({
 			sessionId: "A",
@@ -352,6 +378,7 @@ test("native transfer failure details remain an MCP error with all member result
 
 test("observer initialization does not deliver another execution's pending result", async (t) => {
 	const f = await mcpFixture(t, {
+		...deliveryStore,
 		deliveries: () => [delivery],
 		initialize: async () => ({
 			selection: "explicit",

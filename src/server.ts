@@ -3,7 +3,7 @@ import { McpServer, ResourceTemplate } from "@modelcontextprotocol/server";
 import * as z from "zod";
 import packageJson from "../package.json" with { type: "json" };
 import type { Broker } from "./broker.ts";
-import { deliveryContent, toolResultsContent } from "./delivery.ts";
+import type { DeliveryReference } from "./delivery.ts";
 import { historyInput } from "./history.ts";
 import { nativeCallsSchema } from "./native-calls.ts";
 import {
@@ -62,6 +62,10 @@ interface RequestContext {
 		_meta?: Record<string, unknown>;
 		signal: AbortSignal;
 	};
+	responseCommits?: {
+		durable: ResponseCommit[];
+		inline: ResponseCommit[];
+	};
 }
 
 export type ResponseCommit = () => Promise<void>;
@@ -99,22 +103,44 @@ export function createServer(
 		const execute = async (args: Args, context: RequestContext) => {
 			const chatId = requireChatId(context);
 			context.mcpReq.signal.throwIfAborted();
-			const result = await callback(args, context).catch(
-				async (error: unknown) => {
-					const message =
-						error instanceof Error ? error.message : String(error);
-					if (Buffer.byteLength(message) <= MAX_RESULT_BYTES / 4) throw error;
-					const resultId = await broker.saveResponse(
-						chatId,
-						JSON.stringify({ isError: true, message }),
+			const responseCommits = {
+				durable: [] as ResponseCommit[],
+				inline: [] as ResponseCommit[],
+			};
+			const complete = <T>(value: T, inline: boolean): T => {
+				context.mcpReq.signal.throwIfAborted();
+				// ACK protects delivered pointers with an unread pin. Confirm inline
+				// bodies afterward so that ACK cannot re-pin a body already read.
+				const commits = [
+					...responseCommits.durable,
+					...(inline ? responseCommits.inline : []),
+				];
+				if (commits.length)
+					stageResponseCommit(
+						context.mcpReq.id,
+						async () => {
+							for (const commit of commits) await commit();
+						},
+						context.mcpReq.signal,
 					);
-					throw new Error(
-						`Tool failed. Full error is retained: get_operation(${JSON.stringify({ resultId, offset: 0 })})`,
-					);
-				},
-			);
+				return value;
+			};
+			const result = await callback(args, {
+				...context,
+				responseCommits,
+			}).catch(async (error: unknown) => {
+				const message = error instanceof Error ? error.message : String(error);
+				if (Buffer.byteLength(message) <= MAX_RESULT_BYTES / 4) throw error;
+				const resultId = await broker.saveResponse(
+					chatId,
+					JSON.stringify({ isError: true, message }),
+				);
+				throw new Error(
+					`Tool failed. Full error is retained: get_operation(${JSON.stringify({ resultId, offset: 0 })})`,
+				);
+			});
 			if (Buffer.byteLength(JSON.stringify(result)) <= MAX_RESULT_BYTES - 1024)
-				return result;
+				return complete(result, true);
 			const resultId = await broker.saveResponse(
 				chatId,
 				JSON.stringify(result),
@@ -126,7 +152,7 @@ export function createServer(
 					format: "json",
 					next: { resultId, offset: 0 },
 					message:
-						"Full response retained; snapshots expire 24h after first capture. Read sequential get_operation pages without repeating the original operation.",
+						"Full response retained and protected until read. Read sequential get_operation pages without repeating the original operation.",
 				}),
 				chatId,
 			);
@@ -156,10 +182,10 @@ export function createServer(
 						throw new Error(
 							`Question metadata exceeds the inline budget; saved resultId=${resultId}. Shorten the question before opening a widget.`,
 						);
-					return widget;
+					return complete(widget, false);
 				}
 			}
-			return reference;
+			return complete(reference, false);
 		};
 		return async (args: Args, context: RequestContext) => {
 			const meta = context.mcpReq._meta;
@@ -200,14 +226,7 @@ export function createServer(
 		deliverPending = true,
 		afterSend?: ResponseCommit,
 	) {
-		return finishResult(
-			broker,
-			stageResponseCommit,
-			context,
-			result,
-			deliverPending,
-			afterSend,
-		);
+		return finishResult(broker, context, result, deliverPending, afterSend);
 	}
 
 	server.registerTool(
@@ -514,17 +533,17 @@ export function createServer(
 			annotations: toolAnnotations("call"),
 		},
 		handle(async (args, context) => {
+			const chatId = requireChatId(context);
 			const result = await broker.call(
-				requireChatId(context),
+				chatId,
 				args.sessionId,
 				args.calls,
 				context.mcpReq._meta?.["otunnel/requestId"],
 				context.mcpReq.signal,
 			);
-			return finish(
-				context,
+			const render = (results: typeof result.toolResults) =>
 				toolResult(
-					result.toolResults,
+					results,
 					result.sessionId,
 					result.cwd,
 					result.inputs,
@@ -532,7 +551,38 @@ export function createServer(
 					result.replay,
 					result.execution,
 					{ work: result.work, operation: result.operation },
-				),
+				);
+			let rendered = render(result.toolResults);
+			const publicId = result.operation?.resultId;
+			if (publicId) {
+				if (
+					Buffer.byteLength(JSON.stringify(formatResult(rendered, chatId))) >
+					MAX_RESULT_BYTES - 1024
+				) {
+					const metadata = render([]);
+					const header = rendered.content[0];
+					if (header?.type === "text")
+						metadata.content[0] = {
+							...header,
+							text: JSON.stringify({
+								...JSON.parse(header.text),
+								resultId: publicId,
+								next: { resultId: publicId, offset: 0 },
+							}),
+						};
+					metadata.isError = rendered.isError;
+					rendered = metadata;
+				} else {
+					deferResponseCommit(
+						context,
+						() => broker.markResponseRead(chatId, publicId),
+						true,
+					);
+				}
+			}
+			return finish(
+				context,
+				rendered,
 				true,
 				!result.execution && result.inputs.length
 					? () => broker.acknowledgeInputs(result.sessionId, result.inputs)
@@ -637,43 +687,53 @@ export function createServer(
 				}
 				if (resultId) {
 					const text = await broker.readResponse(chatId, resultId);
-					return responsePage(resultId, text, offset, chatId);
+					const page = responsePage(resultId, text, offset, chatId);
+					deferResponseCommit(
+						context,
+						async () => {
+							await broker.recordResponseRead(
+								chatId,
+								resultId,
+								offset,
+								page.nextOffset,
+								text.length,
+							);
+						},
+						true,
+					);
+					return page.result;
 				}
 				if (!operationId) throw new Error("operationId is required");
 				const result = broker.operation(chatId, operationId);
+				const references = result.result ? [result.result] : result.deliveries;
+				const publicId = references[0]?.resultId ?? result.operation.resultId;
+				const recovered = await appendDeliveryReferences(
+					broker,
+					context,
+					textResult(
+						{
+							operation: result.operation,
+							...(publicId ? { resultId: publicId } : {}),
+							...(publicId && !references.length
+								? { next: { resultId: publicId, offset: 0 } }
+								: {}),
+							...(result.result?.work ? { work: result.result.work } : {}),
+							continuation: continuationFor({
+								operationStatus: result.operation.status,
+								work: result.result?.work,
+								needsInput: result.inputs.length > 0,
+								failed: references.some((reference) => reference.failed),
+							}),
+						},
+						result.inputs,
+					),
+					references,
+					result.deliveries.length === 0,
+					true,
+				);
 				return finish(
 					context,
-					{
-						content: [
-							...textResult(
-								{
-									operation: result.operation,
-									...(result.result?.work ? { work: result.result.work } : {}),
-									continuation: continuationFor({
-										operationStatus: result.operation.status,
-										work: result.result?.work,
-										needsInput: result.inputs.length > 0,
-										failed:
-											Boolean(result.result?.error) ||
-											(result.result?.toolResults.some(
-												(item) =>
-													item.isError ||
-													(item.details as { failed?: boolean } | undefined)
-														?.failed === true,
-											) ??
-												false),
-									}),
-								},
-								result.inputs,
-							).content,
-							...(result.result
-								? toolResultsContent(
-										result.result.toolResults,
-										result.result.sessionId,
-									)
-								: deliveryContent(result.deliveries)),
-						],
-					},
+					recovered,
 					false,
 					result.deliveries.length
 						? () => broker.acknowledge(result.deliveries, [], committedSignal)
@@ -882,7 +942,7 @@ function responsePage(
 		low--;
 	if (low === offset && offset < text.length)
 		throw new Error("Cannot fit result page");
-	return page(low);
+	return { result: page(low), nextOffset: low };
 }
 
 function textResult(
@@ -901,7 +961,6 @@ async function finishResult<
 	T extends { content: ReturnType<typeof toolResult>["content"] },
 >(
 	broker: Broker,
-	stageResponseCommit: StageResponseCommit,
 	context: RequestContext,
 	result: T,
 	deliverPending = true,
@@ -911,29 +970,148 @@ async function finishResult<
 	const chatId = requestChatId(context);
 	const deliveries = deliverPending && chatId ? broker.deliveries(chatId) : [];
 	const answers = deliverPending && chatId ? broker.answers(chatId) : [];
-	const content = deliverPending
-		? [
-				...result.content,
-				...deliveryContent(deliveries),
-				...answerContent(answers),
-			]
-		: result.content;
-	const formatted = formatResult({ ...result, content }, chatId);
-	const commits: ResponseCommit[] = [];
+	const withAnswers = {
+		...result,
+		content: [...result.content, ...answerContent(answers)],
+	};
+	const delivered = await appendDeliveryReferences(
+		broker,
+		context,
+		withAnswers,
+		deliveries,
+	);
+	const formatted = formatResult(delivered, chatId);
 	if (deliveries.length || answers.length)
-		commits.push(() =>
+		deferResponseCommit(context, () =>
 			broker.acknowledge(deliveries, answers, committedSignal),
 		);
-	if (afterSend) commits.push(afterSend);
-	if (commits.length)
-		stageResponseCommit(
-			context.mcpReq.id,
-			async () => {
-				for (const commit of commits) await commit();
-			},
-			context.mcpReq.signal,
-		);
+	if (afterSend) deferResponseCommit(context, afterSend);
 	return formatted;
+}
+
+function deferResponseCommit(
+	context: RequestContext,
+	commit: ResponseCommit,
+	inlineOnly = false,
+) {
+	if (!context.responseCommits)
+		throw new Error("Response commit has no active request");
+	context.responseCommits[inlineOnly ? "inline" : "durable"].push(commit);
+}
+
+function snapshotContent(
+	text: string,
+): ReturnType<typeof toolResult>["content"] {
+	const value: unknown = JSON.parse(text);
+	if (
+		typeof value !== "object" ||
+		value === null ||
+		!("content" in value) ||
+		!Array.isArray(value.content)
+	)
+		throw new Error("Invalid public operation response");
+	const content = value.content as ReturnType<typeof toolResult>["content"];
+	const first = content[0];
+	if (first?.type === "text") {
+		try {
+			const header = JSON.parse(first.text);
+			if (
+				header &&
+				typeof header === "object" &&
+				"sessionId" in header &&
+				"cwd" in header &&
+				"continuation" in header
+			)
+				// Current receipt/reference metadata owns status and continuation. The
+				// stored historical header must not contradict a later cancellation.
+				return content.slice(1);
+		} catch {}
+	}
+	return content;
+}
+
+function deliveryReferenceContent(
+	reference: DeliveryReference,
+	inline = false,
+	currentOperation = false,
+) {
+	return textResult({
+		deferredResult: reference.id,
+		requestId: reference.requestId,
+		sessionId: reference.sessionId,
+		cwd: reference.cwd,
+		error: reference.error,
+		resultId: reference.resultId,
+		inline,
+		...(!inline ? { next: { resultId: reference.resultId, offset: 0 } } : {}),
+		...(reference.work ? { work: reference.work } : {}),
+		...(!currentOperation
+			? {
+					continuation: continuationFor({
+						work: reference.work,
+						failed: reference.failed,
+					}),
+				}
+			: {}),
+	}).content;
+}
+
+async function appendDeliveryReferences<
+	T extends { content: ReturnType<typeof toolResult>["content"] },
+>(
+	broker: Broker,
+	context: RequestContext,
+	result: T,
+	references: DeliveryReference[],
+	allowRetired = false,
+	currentOperation = false,
+) {
+	if (!references.length) return result;
+	const chatId = requireChatId(context);
+	const groups: ReturnType<typeof toolResult>["content"][] = references.map(
+		(reference) => deliveryReferenceContent(reference, false, currentOperation),
+	);
+	const combined = () => ({
+		...result,
+		content: [...result.content, ...groups.flat()],
+	});
+	const fits = () =>
+		Buffer.byteLength(JSON.stringify(formatResult(combined(), chatId))) <=
+		MAX_RESULT_BYTES - 1024;
+	// Check the complete metadata envelope first. Large bodies are never loaded
+	// merely to build another oversized snapshot containing the same result bytes.
+	if (fits()) {
+		for (const [index, reference] of references.entries()) {
+			if (reference.bytes > MAX_RESULT_BYTES - 1024) continue;
+			let content: ReturnType<typeof toolResult>["content"];
+			try {
+				content = snapshotContent(
+					await broker.readResponse(chatId, reference.resultId),
+				);
+			} catch (error) {
+				if (
+					allowRetired &&
+					error instanceof Error &&
+					/Result not found or expired/.test(error.message)
+				)
+					continue;
+				throw error;
+			}
+			const previous = groups[index];
+			groups[index] = [
+				...deliveryReferenceContent(reference, true, currentOperation),
+				...content,
+			];
+			if (fits()) {
+				deferResponseCommit(
+					context,
+					() => broker.markResponseRead(chatId, reference.resultId),
+					true,
+				);
+			} else if (previous) groups[index] = previous;
+		}
+	}
+	return combined();
 }
 
 function formatResult<

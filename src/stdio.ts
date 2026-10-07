@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import { Writable } from "node:stream";
 import {
 	type ServeStdioOptions,
@@ -6,6 +5,7 @@ import {
 	serveStdio,
 } from "@modelcontextprotocol/server/stdio";
 import { Broker } from "./broker.ts";
+import { uuidV7 } from "./ids.ts";
 import { MAX_RESULT_BYTES } from "./responses.ts";
 import { createServer, type ResponseCommit } from "./server.ts";
 
@@ -15,7 +15,7 @@ export function serveMcp(
 	options: Pick<ServeStdioOptions, "transport" | "onerror"> = {},
 ) {
 	const transport = options.transport ?? new StdioServerTransport();
-	const traceScope = randomUUID();
+	const traceScope = uuidV7();
 	const traceRpc = (id: string | number) => ({ rpc: `${traceScope}:${id}` });
 	const commits = new Map<
 		string | number,
@@ -106,17 +106,9 @@ export function serveMcp(
 		} finally {
 			if (responseId !== undefined) {
 				pending?.dispose();
-				if (
-					sent &&
-					!pending?.signal.aborted &&
-					"result" in message &&
-					!(
-						typeof message.result === "object" &&
-						message.result !== null &&
-						"isError" in message.result &&
-						message.result.isError === true
-					)
-				) {
+				// Native tool failures are delivered result bodies too. The server
+				// stages only complete responses; callback throws never stage commits.
+				if (sent && !pending?.signal.aborted && "result" in message) {
 					for (const commit of pending?.callbacks ?? []) {
 						try {
 							await commit();
@@ -159,8 +151,8 @@ const terminationSignals =
 		? ["SIGINT", "SIGTERM"]
 		: ["SIGHUP", "SIGINT", "SIGTERM"];
 
-export async function serveChappie(agentDir: string): Promise<never> {
-	const broker = new Broker(agentDir);
+export async function serveChappie(storageDir: string): Promise<never> {
+	const broker = new Broker(storageDir);
 	await broker.start();
 	const output = new Writable({
 		write(chunk, encoding, callback) {

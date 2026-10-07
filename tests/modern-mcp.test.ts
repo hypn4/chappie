@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import { type TestContext, test } from "node:test";
 import type { Broker } from "../src/broker.ts";
 import type { OperationView } from "../src/operations.ts";
+import { toolResult } from "../src/tools.ts";
 import { mcpClient, record, resultOf } from "./helpers/mcp-client.ts";
 import { quietDiagnostics } from "./helpers/mcp-fixture.ts";
 
@@ -105,7 +106,30 @@ test("modern operation retrieval requires the originating conversation", async (
 });
 
 test("get_operation returns retained native output after pending delivery was acknowledged", async (t) => {
+	const resultId = "b".repeat(64);
+	const output = JSON.stringify(
+		toolResult(
+			[
+				{
+					role: "toolResult",
+					timestamp: 1,
+					toolCallId: "read-result",
+					toolName: "read",
+					isError: false,
+					content: [{ type: "text", text: "RETAINED_OUTPUT" }],
+				},
+			],
+			"A",
+			"/fixture",
+		),
+	);
 	const f = await fixture(t, {
+		readResponse: async (chatId, requestedId) => {
+			assert.equal(chatId, owner);
+			assert.equal(requestedId, resultId);
+			return output;
+		},
+		markResponseRead: async () => {},
 		operation: () => ({
 			operation: { ...operation, status: "completed" },
 			deliveries: [],
@@ -117,16 +141,9 @@ test("get_operation returns retained native output after pending delivery was ac
 				sessionId: "A",
 				cwd: "/fixture",
 				complete: true,
-				toolResults: [
-					{
-						role: "toolResult",
-						timestamp: 1,
-						toolCallId: "read-result",
-						toolName: "read",
-						isError: false,
-						content: [{ type: "text", text: "RETAINED_OUTPUT" }],
-					},
-				],
+				resultId,
+				bytes: Buffer.byteLength(output),
+				failed: false,
 			},
 		}),
 	});

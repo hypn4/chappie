@@ -8,11 +8,22 @@ const id = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const text = z.string().max(64 * 1024 * 1024);
 const name = z.string().min(1).max(4096);
 const path = z.string().min(1).max(32768);
+const acceptedSourceSchema = z.object({
+	operationKey: name,
+	executionId: z.string().uuid(),
+});
+export const operationSourceSchema = acceptedSourceSchema
+	.partial()
+	.refine(
+		(value) =>
+			(value.operationKey === undefined) === (value.executionId === undefined),
+		"Operation sources require both operationKey and executionId, or neither",
+	);
 const source = {
 	chatId: name,
 	requestId: name.optional(),
 	operationKey: name.optional(),
-	executionId: name.optional(),
+	executionId: z.string().uuid().optional(),
 };
 const toolCall = nativeCallSchema.extend({
 	type: z.literal("toolCall"),
@@ -269,9 +280,19 @@ const brokerMessage = z.union([
 ]);
 
 export function validateSessionMessage(value: unknown): SessionMessage {
-	return sessionMessage.parse(value) as SessionMessage;
+	const message = sessionMessage.parse(value);
+	if (message.type === "delivery")
+		operationSourceSchema.parse(message.delivery);
+	if (message.type === "request" && "chatId" in message.request)
+		operationSourceSchema.parse(message.request);
+	return message as SessionMessage;
 }
 
 export function validateBrokerMessage(value: unknown): BrokerMessage {
-	return brokerMessage.parse(value) as BrokerMessage;
+	const message = brokerMessage.parse(value);
+	if ("chatId" in message) operationSourceSchema.parse(message);
+	if (message.type === "call" && !message.direct) {
+		acceptedSourceSchema.parse(message);
+	}
+	return message as BrokerMessage;
 }

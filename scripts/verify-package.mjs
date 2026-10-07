@@ -99,6 +99,7 @@ export async function inspectPackage(archive) {
 			`Retired dependency: ${key}`,
 		);
 	for (const removed of [
+		"src/omp-agent-dir.ts",
 		"src/index.ts",
 		"src/provider.ts",
 		"src/host-tools.ts",
@@ -106,6 +107,7 @@ export async function inspectPackage(archive) {
 		"src/events.ts",
 		"src/webhook.ts",
 		"dist/src/index.js",
+		"dist/src/omp-agent-dir.js",
 		"dist/src/provider.js",
 		"dist/src/host-tools.js",
 		"dist/src/event-types.js",
@@ -172,9 +174,8 @@ export async function verifyInstalled(directory, expected) {
 				input: "",
 				env: {
 					...process.env,
-					PI_CODING_AGENT_DIR: agent,
-					OMP_PROFILE: "",
-					PI_PROFILE: "",
+					CHAPPIE_HOME: agent,
+					CHAPPIE_STORE_ID: undefined,
 				},
 			},
 		);

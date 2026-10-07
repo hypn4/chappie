@@ -203,7 +203,11 @@ test("late export results retain references even after their delivery record is 
 		],
 	};
 	await state.addDelivery(delivery);
-	await state.acknowledge([delivery], [], new AbortController().signal);
+	await state.acknowledge(
+		state.deliveries("chat"),
+		[],
+		new AbortController().signal,
+	);
 	const loaded = new State(root);
 	await loaded.load();
 	const restored = await loaded.reserveOperation(receipt);
@@ -222,19 +226,12 @@ test("a failed acknowledgement cannot revive a delivery consumed by another resp
 		complete: true,
 		toolResults: [],
 	};
-	await writeFile(
-		join(root, "chappie.state.json"),
-		JSON.stringify({ deliveries: [delivery] }),
-	);
 	const state = new State(root);
-	await state.load();
+	await state.addDelivery(delivery);
+	const pending = state.deliveries("chat");
 	const cancelled = new AbortController();
-	const first = state.acknowledge([delivery], [], cancelled.signal);
-	const second = state.acknowledge(
-		[delivery],
-		[],
-		new AbortController().signal,
-	);
+	const first = state.acknowledge(pending, [], cancelled.signal);
+	const second = state.acknowledge(pending, [], new AbortController().signal);
 	queueMicrotask(() => cancelled.abort(new Error("first response cancelled")));
 	const [firstResult, secondResult] = await Promise.allSettled([first, second]);
 	assert.equal(firstResult.status, "rejected");
@@ -250,6 +247,7 @@ test("completion receipts without exports never fabricate host delivery or resou
 	t.after(() => rm(root, { recursive: true, force: true }));
 	const withoutResources = {
 		key: "withoutResources",
+		executionId: "8f6d6c83-98aa-4199-a95d-268d62c95db4",
 		signature: "sig",
 		chatId: "chat",
 		sessionId: "A",
@@ -259,7 +257,7 @@ test("completion receipts without exports never fabricate host delivery or resou
 	};
 	await writeFile(
 		join(root, "chappie.state.json"),
-		JSON.stringify({ operations: [withoutResources] }),
+		JSON.stringify({ schemaVersion: 1, operations: [withoutResources] }),
 	);
 	const state = new State(root);
 	await state.load();

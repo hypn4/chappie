@@ -38,10 +38,10 @@ const configSchema = z
 			});
 	});
 
-export async function readConfig(agentDir: string) {
+export async function readConfig(storageDir: string) {
 	let contents: string;
 	try {
-		contents = await readFile(join(agentDir, "chappie.json"), "utf8");
+		contents = await readFile(join(storageDir, "chappie.json"), "utf8");
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
 		throw error;

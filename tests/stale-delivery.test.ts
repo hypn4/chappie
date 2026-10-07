@@ -55,7 +55,7 @@ test("discarding a retired execution acknowledges the stale packet without disco
 			sessionId: "owner",
 			cwd: root,
 			operationKey: "retired",
-			executionId: "old",
+			executionId: "01990b72-71c0-7000-8000-000000000001",
 			toolResults: [],
 			complete: true,
 		},

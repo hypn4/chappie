@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import { access } from "node:fs/promises";
 import { hostname } from "node:os";
 import { resolve } from "node:path";
@@ -19,7 +18,9 @@ import {
 } from "./activity.ts";
 import type { NetworkTlsConfig } from "./config.ts";
 import type { DeliveryRecord } from "./delivery.ts";
+import { OmpHistoryRecorder } from "./history.omp.ts";
 import { type HistoryRange, historyResult } from "./history.ts";
+import { uuidV7 } from "./ids.ts";
 import {
 	type BrokerMessage,
 	IpcClient,
@@ -59,6 +60,7 @@ import { observeSessionWork } from "./work.omp.ts";
 import type { SessionWork } from "./work.ts";
 
 type RemoteRequest = Extract<BrokerMessage, { type: "chat" | "call" }>;
+const STORAGE_ACK_TIMEOUT_MS = 5000;
 
 interface Notice extends Activity {
 	message: string;
@@ -166,9 +168,22 @@ interface GenerationRequest {
 	connectionGeneration: number;
 }
 
+export interface LocalSessionOptions {
+	agentDir: string;
+	storageDir: string;
+	historyHomeDir?: string | undefined;
+	historyProjectId?: string | undefined;
+	connect?: string | undefined;
+	tls?: NetworkTlsConfig | undefined;
+	localTools?: boolean | undefined;
+}
+
 export class LocalSession {
 	readonly #api: OmpHostApi;
 	readonly #agentDir: string;
+	readonly #storageDir: string;
+	readonly #sharedHistory: OmpHistoryRecorder | undefined;
+	#historyWarningShown = false;
 	readonly #connect: string | undefined;
 	readonly #tls: NetworkTlsConfig | undefined;
 	readonly #localTools: boolean;
@@ -178,6 +193,7 @@ export class LocalSession {
 	readonly #pendingInputs = new Map<string, SessionInput>();
 	readonly #generations = new Map<string, GenerationRequest>();
 	readonly #deliveries = new Map<string, DeliveryRecord>();
+	readonly #deliveryTimers = new Map<string, NodeJS.Timeout>();
 	readonly #histories = new Map<number, HistoryRequest>();
 	readonly #requests = new Map<number, PendingRequest>();
 	readonly #operations = new Map<
@@ -202,18 +218,26 @@ export class LocalSession {
 	#ompSessionNameUnsubscribe: (() => void) | undefined;
 	#latestOmpContext: OmpExtensionContext | undefined;
 
-	constructor(
-		api: OmpHostApi,
-		agentDir: string,
-		connect?: string,
-		tls?: NetworkTlsConfig,
-		localTools = false,
-	) {
+	constructor(api: OmpHostApi, options: LocalSessionOptions) {
 		this.#api = api;
-		this.#agentDir = agentDir;
-		this.#connect = connect;
-		this.#tls = tls;
-		this.#localTools = localTools;
+		this.#agentDir = options.agentDir;
+		this.#storageDir = options.storageDir;
+		this.#sharedHistory = options.historyHomeDir
+			? new OmpHistoryRecorder(options.historyHomeDir, {
+					projectId: options.historyProjectId,
+					onError: (error) => {
+						if (this.#historyWarningShown) return;
+						this.#historyWarningShown = true;
+						this.#context?.ui.notify(
+							`Chappie shared history: ${error.message}. Native work can continue.`,
+							"warning",
+						);
+					},
+				})
+			: undefined;
+		this.#connect = options.connect;
+		this.#tls = options.tls;
+		this.#localTools = options.localTools === true;
 	}
 
 	get localTools(): boolean {
@@ -223,6 +247,12 @@ export class LocalSession {
 	installOmp(pi: OmpExtensionAPI): void {
 		pi.on("session_start", (_event, context) => {
 			this.#refreshOmpContext(context);
+		});
+		pi.on("session_before_switch", (_event, context) => {
+			this.#sharedHistory?.capture(context);
+		});
+		pi.on("session_before_branch", (_event, context) => {
+			this.#sharedHistory?.capture(context);
 		});
 		pi.on("session_switch", (_event, context) => {
 			this.#refreshOmpContext(context);
@@ -312,9 +342,10 @@ export class LocalSession {
 			if (event.willContinue === true) return;
 			return this.#settled(shared);
 		});
-		pi.on("session_shutdown", () => {
+		pi.on("session_shutdown", async () => {
 			this.#stopOmpSessionObservers();
 			this.close();
+			await this.#sharedHistory?.flush();
 		});
 	}
 
@@ -326,6 +357,7 @@ export class LocalSession {
 	}
 
 	#refreshOmpContext(context: OmpExtensionContext): ChappieContext {
+		this.#sharedHistory?.observe(context);
 		this.#latestOmpContext = context;
 		this.#observeOmpSession(context);
 		const shared = adaptOmpContext(context);
@@ -479,7 +511,7 @@ export class LocalSession {
 		if (expectedSessionId !== undefined && expectedSessionId !== sessionId)
 			throw new Error("Chappie generation has a mismatched session identity");
 		if (output.closed) return;
-		const id = randomUUID();
+		const id = uuidV7();
 		const generation: GenerationRequest = {
 			output,
 			request,
@@ -632,7 +664,7 @@ export class LocalSession {
 				sessionId,
 				range,
 				chatId: self,
-				requestId: randomUUID(),
+				requestId: uuidV7(),
 			},
 			signal,
 		);
@@ -737,6 +769,7 @@ export class LocalSession {
 
 	close(permanent = true): void {
 		const sessionId = this.#sessionId;
+		if (permanent) this.#sharedHistory?.finish();
 		if (permanent) this.#latestOmpContext = undefined;
 		if (this.#active && !this.#active.completed) this.#context?.abort();
 		if (sessionId) releaseSessionResources(sessionId);
@@ -759,6 +792,7 @@ export class LocalSession {
 		this.#cancelRequests(new Error("Chappie session ended"));
 		this.#rejectSyncs(new Error("Chappie session ended"));
 		this.#rejectStores(new Error("Chappie session ended"));
+		this.#clearDeliveryTimers();
 		for (const id of this.#histories.keys()) this.#finishHistory(id);
 	}
 
@@ -777,7 +811,7 @@ export class LocalSession {
 		if (this.#sessionId !== nextId) this.#resetInputs(context);
 		if (!this.#connection) {
 			this.#connection = new IpcClient(
-				this.#agentDir,
+				this.#storageDir,
 				this.#connect,
 				{
 					onOpen: async () => {
@@ -791,6 +825,7 @@ export class LocalSession {
 						for (const id of this.#histories.keys()) this.#finishHistory(id);
 						this.#rejectSyncs(error);
 						this.#rejectStores(error);
+						this.#clearDeliveryTimers();
 						if (this.#output && !this.#output.closed) this.#output.fail(error);
 						else this.#notify(error.message, "error");
 						this.#failGenerations(error);
@@ -917,6 +952,8 @@ export class LocalSession {
 				this.#syncs.get(message.id)?.resolve();
 				break;
 			case "stored":
+				this.#deliveries.delete(message.id);
+				this.#clearDeliveryTimer(message.id);
 				this.#stores.get(message.id)?.resolve();
 				break;
 			case "notice":
@@ -1300,6 +1337,7 @@ export class LocalSession {
 	}
 
 	#historyChanged(): void {
+		if (this.#context) this.#sharedHistory?.observe(this.#context);
 		for (const { request } of this.#histories.values()) {
 			void this.#readHistory(request).catch(() => {});
 		}
@@ -1373,7 +1411,7 @@ export class LocalSession {
 		}
 
 		this.#queue.shift();
-		const invocationId = randomUUID();
+		const invocationId = uuidV7();
 		output.message.chappie = {
 			...source(request.chatId, request.requestId),
 			invocationId,
@@ -1492,17 +1530,20 @@ export class LocalSession {
 		}
 	}
 
-	#retainResult(active: ActiveRequest): void {
+	#retainResult(active: ActiveRequest, awaitingStorage = false): void {
 		const delivery: DeliveryRecord = {
-			id: active.id,
+			id:
+				active.completed &&
+				active.request.type === "call" &&
+				!active.request.direct
+					? `operation:${active.request.executionId}`
+					: active.id,
 			complete: active.completed,
 			...source(active.request.chatId, active.request.requestId),
 			...(active.request.operationKey
 				? {
 						operationKey: active.request.operationKey,
-						...(active.request.executionId
-							? { executionId: active.request.executionId }
-							: {}),
+						executionId: active.request.executionId,
 					}
 				: {}),
 			sessionId: active.session.id,
@@ -1514,7 +1555,9 @@ export class LocalSession {
 				: {}),
 		};
 		this.#deliveries.set(delivery.id, delivery);
-		void this.#flushDeliveries().catch(() => {});
+		this.#clearDeliveryTimer(delivery.id);
+		if (awaitingStorage) this.#scheduleDeliveryRetry(delivery);
+		else void this.#flushDeliveries().catch(() => {});
 	}
 
 	async #completeActive(): Promise<void> {
@@ -1531,6 +1574,12 @@ export class LocalSession {
 			active.cancelled ??= "Connection lost before result delivery";
 			this.#retainResult(active);
 		} else {
+			if (active.request.type === "call" && !active.request.direct) {
+				// A successful socket write is not durable broker storage. Keep the
+				// native output until stored, without queueing a normal fast result twice
+				// or holding the next native turn while the broker persists this one.
+				this.#retainResult(active, true);
+			}
 			try {
 				if (active.error !== undefined) {
 					await connection.send({
@@ -1623,8 +1672,10 @@ export class LocalSession {
 	async #flushDeliveries(): Promise<void> {
 		const flushed = this.#flushing.then(async () => {
 			const connection = this.#connection;
+			const generation = this.#connectionGeneration;
 			if (!connection?.connected) return;
 			for (const delivery of this.#deliveries.values()) {
+				if (this.#deliveryTimers.has(delivery.id)) continue;
 				const completion = Promise.withResolvers<void>();
 				void completion.promise.catch(() => {});
 				this.#stores.set(delivery.id, completion);
@@ -1633,13 +1684,12 @@ export class LocalSession {
 						completion.reject(
 							new Error("Result storage acknowledgement timed out"),
 						),
-					5000,
+					STORAGE_ACK_TIMEOUT_MS,
 				);
 				timer.unref();
 				try {
 					await connection.send({ type: "delivery", delivery });
 					await completion.promise;
-					this.#deliveries.delete(delivery.id);
 					this.#notify(
 						`Result saved for ChatGPT ${delivery.chatId.slice(-4)}`,
 						"info",
@@ -1648,14 +1698,46 @@ export class LocalSession {
 							...source(delivery.chatId, delivery.requestId),
 						},
 					);
+				} catch (error) {
+					if (
+						this.#connection === connection &&
+						this.#connectionGeneration === generation &&
+						connection.connected &&
+						this.#deliveries.get(delivery.id) === delivery
+					)
+						this.#scheduleDeliveryRetry(delivery);
+					throw error;
 				} finally {
 					clearTimeout(timer);
-					this.#stores.delete(delivery.id);
+					if (this.#stores.get(delivery.id) === completion)
+						this.#stores.delete(delivery.id);
 				}
 			}
 		});
 		this.#flushing = flushed.catch(() => {});
 		return flushed;
+	}
+
+	#scheduleDeliveryRetry(delivery: DeliveryRecord): void {
+		this.#clearDeliveryTimer(delivery.id);
+		const timer = setTimeout(() => {
+			if (this.#deliveryTimers.get(delivery.id) !== timer) return;
+			this.#deliveryTimers.delete(delivery.id);
+			if (this.#deliveries.get(delivery.id) === delivery)
+				void this.#flushDeliveries().catch(() => {});
+		}, STORAGE_ACK_TIMEOUT_MS);
+		timer.unref();
+		this.#deliveryTimers.set(delivery.id, timer);
+	}
+
+	#clearDeliveryTimer(id: string): void {
+		clearTimeout(this.#deliveryTimers.get(id));
+		this.#deliveryTimers.delete(id);
+	}
+
+	#clearDeliveryTimers(): void {
+		for (const timer of this.#deliveryTimers.values()) clearTimeout(timer);
+		this.#deliveryTimers.clear();
 	}
 
 	async #reply(
