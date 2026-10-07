@@ -185,7 +185,9 @@ async function nearMetadataCapacity(
 	return { operations, pending, pendingReference, unread, next, error };
 }
 
-test("byte pressure retires acknowledged secondary references before cold receipts", async (t) => {
+test("byte pressure retires acknowledged secondary references before cold receipts", {
+	timeout: 30_000,
+}, async (t) => {
 	const f = await fixture(t);
 	const seeded = await nearMetadataCapacity(f, true);
 	const state = new State(f.root);
@@ -205,7 +207,9 @@ test("byte pressure retires acknowledged secondary references before cold receip
 	assert.equal(state.operation("owner", "operation-20000").status, "completed");
 });
 
-test("byte pressure archives safe terminal receipts and survives an archive write failure", async (t) => {
+test("byte pressure archives safe terminal receipts and survives an archive write failure", {
+	timeout: 30_000,
+}, async (t) => {
 	const f = await fixture(t);
 	const seeded = await nearMetadataCapacity(f, false);
 	const state = new State(f.root);

@@ -1,6 +1,6 @@
 {
 	"name": "@hypn4/chappie",
-	"version": "0.6.0-rc.20",
+	"version": "0.6.0-rc.21",
 	"description": "ChatGPT MCP 2.0 bridge for native Oh My Pi sessions",
 	"devDependencies": {
 		"@biomejs/biome": "2.5.15",

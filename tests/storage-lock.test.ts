@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import {
+import fs, {
 	mkdir,
 	mkdtemp,
 	readdir,
@@ -263,3 +263,66 @@ test("an empty interrupted release is recoverable", async (t) => {
 	await lock.release();
 	assert.deepEqual(await readdir(f.root), []);
 });
+
+test("a released writer can hand off after consecutive EPERM and EACCES rename races", async (t) => {
+	const f = await fixture(t);
+	const statePath = join(f.root, "state.json");
+	await writeFile(statePath, "unchanged");
+	const previous = await StorageLock.acquire(f.root);
+	const originalOwner = await ownerMetadata(f.root);
+	const renameOnDisk = fs.rename;
+	const preparedPaths: string[] = [];
+	t.mock.method(fs, "rename", async (...args: Parameters<typeof rename>) => {
+		const [source, destination] = args;
+		if (destination !== join(f.root, "writer.lock"))
+			return renameOnDisk(source, destination);
+		preparedPaths.push(String(source));
+		if (preparedPaths.length === 1) {
+			await previous.release();
+			throw Object.assign(new Error("writer released after rename collision"), {
+				code: "EPERM",
+			});
+		}
+		if (preparedPaths.length === 2)
+			throw Object.assign(new Error("concurrent writer handoff"), {
+				code: "EACCES",
+			});
+		return renameOnDisk(source, destination);
+	});
+	const current = await StorageLock.acquire(f.root);
+	assert.equal(preparedPaths.length, 3);
+	assert.equal(new Set(preparedPaths).size, 1);
+	const currentOwner = await ownerMetadata(f.root);
+	assert.equal(currentOwner.value.pid, process.pid);
+	assert.notEqual(currentOwner.value.token, originalOwner.value.token);
+	assert.equal(await readFile(statePath, "utf8"), "unchanged");
+	await current.release();
+	assert.deepEqual(await readdir(f.root), ["state.json"]);
+});
+
+for (const failureCode of ["EPERM", "EACCES"]) {
+	test(`persistent ${failureCode} remains a filesystem error after bounded lock attempts`, async (t) => {
+		const f = await fixture(t);
+		const statePath = join(f.root, "state.json");
+		await writeFile(statePath, "unchanged");
+		const denied = Object.assign(new Error("rename permission denied"), {
+			code: failureCode,
+		});
+		const renameOnDisk = fs.rename;
+		let attempts = 0;
+		t.mock.method(fs, "rename", async (...args: Parameters<typeof rename>) => {
+			const [source, destination] = args;
+			if (destination !== join(f.root, "writer.lock"))
+				return renameOnDisk(source, destination);
+			attempts++;
+			throw denied;
+		});
+		await assert.rejects(
+			StorageLock.acquire(f.root),
+			(error) => error === denied,
+		);
+		assert.equal(attempts, 8);
+		assert.equal(await readFile(statePath, "utf8"), "unchanged");
+		assert.deepEqual(await readdir(f.root), ["state.json"]);
+	});
+}

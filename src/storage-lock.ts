@@ -1,9 +1,8 @@
-import {
+import fs, {
 	lstat,
 	mkdir,
 	open,
 	readdir,
-	rename,
 	rm,
 	rmdir,
 	unlink,
@@ -150,7 +149,7 @@ export class StorageLock {
 				try {
 					// A nonempty directory cannot replace another nonempty directory.
 					// Publishing completed metadata avoids an ownerless acquisition window.
-					await rename(prepared, path);
+					await fs.rename(prepared, path);
 					published = true;
 					return new StorageLock(path, owner);
 				} catch (error) {
@@ -161,9 +160,12 @@ export class StorageLock {
 						throw error;
 					const existing = await readOwner(path);
 					if (!existing) {
+						// Windows can report a collision as a permission error after release.
+						// Retry within the acquisition budget, then preserve the raw error.
 						if (
 							existing === undefined &&
-							["EPERM", "EACCES"].includes(failure ?? "")
+							["EPERM", "EACCES"].includes(failure ?? "") &&
+							attempt === 7
 						)
 							throw error;
 						await removeEmpty(path);
