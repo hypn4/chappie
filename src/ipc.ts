@@ -180,6 +180,7 @@ export type SessionMessage =
 export type BrokerMessage =
 	| { type: "synced"; id: number; sessionId: string }
 	| { type: "stored"; id: string }
+	| { type: "store_failed"; id: string; error: string }
 	| { type: "notice"; sessionId: string; message: string; activity?: Activity }
 	| {
 			type: "history";

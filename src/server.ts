@@ -99,6 +99,7 @@ export function createServer(
 
 	function handle<Args, Result>(
 		callback: (args: Args, context: RequestContext) => Promise<Result>,
+		queryCache = false,
 	) {
 		const execute = async (args: Args, context: RequestContext) => {
 			const chatId = requireChatId(context);
@@ -141,9 +142,16 @@ export function createServer(
 			});
 			if (Buffer.byteLength(JSON.stringify(result)) <= MAX_RESULT_BYTES - 1024)
 				return complete(result, true);
+			// A query may also carry acknowledged input or pending native output.
+			// Those wrapper copies retain the durable protection of their contents.
+			const cacheOnly =
+				queryCache &&
+				responseCommits.durable.length === 0 &&
+				responseCommits.inline.length === 0;
 			const resultId = await broker.saveResponse(
 				chatId,
 				JSON.stringify(result),
+				{ queryCache: cacheOnly },
 			);
 			context.mcpReq.signal.throwIfAborted();
 			const reference = formatResult(
@@ -152,7 +160,10 @@ export function createServer(
 					format: "json",
 					next: { resultId, offset: 0 },
 					message:
-						"Full response retained and protected until read. Read sequential get_operation pages without repeating the original operation.",
+						"Full response retained. Read sequential get_operation pages without repeating the original operation." +
+						(cacheOnly
+							? " This query copy may retire under storage pressure and expires after at most 24 hours; source history/catalogs remain available."
+							: " Unread native output remains protected."),
 				}),
 				chatId,
 			);
@@ -260,7 +271,7 @@ export function createServer(
 					? () => broker.acknowledgeInputs(initialized.session.id, inputs)
 					: undefined,
 			);
-		}),
+		}, true),
 	);
 
 	server.registerTool(
@@ -516,7 +527,7 @@ export function createServer(
 					? () => broker.acknowledgeInputs(inspected.session.id, inputs)
 					: undefined,
 			);
-		}),
+		}, true),
 	);
 
 	server.registerTool(
@@ -844,7 +855,7 @@ export function createServer(
 				},
 				requireChatId(context),
 			);
-		}),
+		}, true),
 	);
 
 	server.registerTool(

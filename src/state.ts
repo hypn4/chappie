@@ -33,9 +33,14 @@ import {
 	resourceDescriptors,
 	resourceSessionId,
 } from "./resources.ts";
-import { ResponseStore } from "./responses.ts";
+import { ResponseStore, StorageCapacityError } from "./responses.ts";
 import { toolResult } from "./tools.ts";
 import { continuationFor } from "./work.ts";
+
+type OperationResponse = { executionId: string } & (
+	| { resultId: string }
+	| { pending: true }
+);
 
 const BINDING_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const BINDING_TOUCH_MS = 24 * 60 * 60 * 1000;
@@ -553,7 +558,7 @@ export class State {
 		status: OperationReceipt["status"],
 		resources: ResourceDescriptor[] = [],
 		error?: string,
-		response?: { executionId: string; resultId: string },
+		response?: OperationResponse,
 	): Promise<void> {
 		return this.#mutate(() =>
 			this.#finishOperation(key, status, resources, error, response),
@@ -565,7 +570,7 @@ export class State {
 		status: OperationReceipt["status"],
 		resources: ResourceDescriptor[] = [],
 		error?: string,
-		response?: { executionId: string; resultId: string },
+		response?: OperationResponse,
 	): Promise<void> {
 		await this.#maintenance;
 		if (!key) return;
@@ -577,10 +582,12 @@ export class State {
 				throw new StaleOperationDeliveryError(
 					"Response belongs to a replaced acceptance",
 				);
-			if (!/^[a-f0-9]{64}$/.test(response.resultId))
-				throw new Error("Invalid result identifier");
-			if (receipt.resultId && receipt.resultId !== response.resultId)
-				throw new Error("Operation response snapshot is immutable");
+			if ("resultId" in response) {
+				if (!/^[a-f0-9]{64}$/.test(response.resultId))
+					throw new Error("Invalid result identifier");
+				if (receipt.resultId && receipt.resultId !== response.resultId)
+					throw new Error("Operation response snapshot is immutable");
+			}
 		}
 		if (!receipt) return;
 		this.#operations.set(key, receipt);
@@ -604,9 +611,17 @@ export class State {
 		if (original.length > 16384)
 			throw new Error("Too many operation resource references");
 		if (response) {
-			if (receipt.resultId !== response.resultId || !receipt.resultAcknowledged)
+			if ("resultId" in response) {
+				if (
+					receipt.resultId !== response.resultId ||
+					!receipt.resultAcknowledged
+				)
+					receipt.resultUnread = true;
+				receipt.resultId = response.resultId;
+			} else {
+				// Storage failure cannot expire the acceptance while OMP holds output.
 				receipt.resultUnread = true;
-			receipt.resultId = response.resultId;
+			}
 		}
 		if (original.length && !receipt.resources?.length)
 			receipt.resources = [
@@ -962,14 +977,22 @@ export class State {
 			if (!(delivery.complete && receipt && !receipt.resultId)) return;
 			this.#deliveredIds.delete(delivery.id);
 		}
-		if (!this.#deliveries.has(delivery.id) && this.#deliveries.size >= 2048)
-			throw new Error(
-				"Pending delivery limit reached; retrieve pending results to continue",
-			);
 		if (receipt) {
 			receipt.operationId ??= recoveryOperationId(receipt);
 			this.#operations.set(receipt.key, receipt);
+			if (delivery.complete && !receipt.resultId && !receipt.resultUnread)
+				await this.#finishOperation(
+					receipt.key,
+					receipt.status,
+					[],
+					delivery.error,
+					{ executionId: receipt.executionId, pending: true },
+				);
 		}
+		if (!this.#deliveries.has(delivery.id) && this.#deliveries.size >= 2048)
+			throw new StorageCapacityError(
+				"Pending delivery limit reached; retrieve pending results to continue",
+			);
 		const reference = await this.#storeDelivery(delivery, true);
 		if (receipt?.operationId && delivery.complete) {
 			// Completed, acknowledged secondary metadata can retire. The acceptance
@@ -987,7 +1010,9 @@ export class State {
 				!this.#operationResults.has(receipt.key) &&
 				this.#operationResults.size >= 2048
 			)
-				throw new Error("Retained operation result limit reached");
+				throw new StorageCapacityError(
+					"Retained operation result limit reached",
+				);
 			this.#operationResults.set(receipt.key, reference);
 		}
 		this.#deliveries.set(delivery.id, reference);
@@ -1291,7 +1316,7 @@ export class State {
 		}
 		const reclaimed = this.#snapshot();
 		if (Buffer.byteLength(reclaimed) > MAX_STATE_BYTES)
-			throw new Error(
+			throw new StorageCapacityError(
 				"Chappie metadata exceeds the 128 MiB limit; protected work remains intact and this change was not persisted",
 			);
 		return reclaimed;

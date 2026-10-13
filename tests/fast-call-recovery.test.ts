@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
+import { JsonLinePeer } from "../src/ipc.ts";
+import { ResponseStore } from "../src/responses.ts";
+import { until } from "./helpers/async.ts";
 import { mcpClient, record, resultOf } from "./helpers/mcp-client.ts";
 import { sessionFixture } from "./helpers/session-fixture.ts";
 
@@ -153,6 +156,111 @@ test("snapshot storage failure leaves a completed receipt to reconcile instead o
 	assert.ok(Array.isArray(listing.operations));
 	assert.equal(record(listing.operations[0]).status, "completed");
 	assert.equal(record(listing.operations[0]).resultId, undefined);
+});
+
+test("native output awaiting storage keeps its completed receipt beyond 24 hours", async (t) => {
+	const f = await sessionFixture(t);
+	let now = Date.now();
+	t.mock.method(Date, "now", () => now);
+	await writeFile(join(f.root, "chappie.results"), "blocked storage");
+	const queued = await f.queue("pending-storage-expiry");
+	await f.complete(await f.dispatch());
+	assert.ok("error" in (await queued.pending));
+	const original = f.broker.recentOperations("test-chat", "A").operations[0];
+	assert.ok(original);
+	now += 48 * 60 * 60 * 1000;
+	const retained = f.broker.recentOperations("test-chat", "A").operations;
+	assert.equal(retained.length, 1);
+	assert.equal(retained[0]?.operationId, original.operationId);
+	assert.equal(retained[0]?.status, "completed");
+	await rm(join(f.root, "chappie.results"));
+	await f.reconnect();
+	await until(() => f.broker.deliveries("test-chat").length === 1);
+	const restored = f.broker.operation("test-chat", original.operationId);
+	assert.equal(restored.operation.status, "completed");
+	assert.ok(restored.operation.resultId);
+	assert.match(
+		await f.broker.readResponse("test-chat", restored.operation.resultId),
+		/completed/,
+	);
+	const replay = await f.broker.call(
+		"test-chat",
+		"A",
+		calls,
+		"pending-storage-expiry",
+		f.controller.signal,
+	);
+	assert.equal(replay.replay?.status, "completed");
+	assert.equal(replay.operation?.operationId, original.operationId);
+});
+
+test("detached storage-pending output remains discoverable after TTL and broker restart", {
+	timeout: 8500,
+}, async (t) => {
+	const f = await sessionFixture(t);
+	let now = Date.now();
+	t.mock.method(Date, "now", () => now);
+	let unavailable = true;
+	const save = ResponseStore.prototype.save;
+	t.mock.method(
+		ResponseStore.prototype,
+		"save",
+		function (this: ResponseStore, ...args: Parameters<ResponseStore["save"]>) {
+			if (unavailable)
+				return Promise.reject(
+					Object.assign(new Error("fixture disk full"), { code: "ENOSPC" }),
+				);
+			return save.call(this, ...args);
+		},
+	);
+	const rejected = Promise.withResolvers<void>();
+	const send = JsonLinePeer.prototype.send;
+	t.mock.method(
+		JsonLinePeer.prototype,
+		"send",
+		function (this: JsonLinePeer<unknown, unknown>, message: unknown) {
+			if (
+				message &&
+				typeof message === "object" &&
+				"type" in message &&
+				message.type === "store_failed"
+			)
+				rejected.resolve();
+			return send.call(this, message);
+		},
+	);
+	const started = await f.broker.startCall(
+		"test-chat",
+		"A",
+		calls,
+		"detached-storage-expiry",
+		"detached-request",
+		f.controller.signal,
+	);
+	await f.complete(await f.dispatch());
+	await until(
+		() =>
+			f.broker.operation("test-chat", started.operation.operationId).operation
+				.status !== "running",
+	);
+	now += 48 * 60 * 60 * 1000;
+	await f.reconnect();
+	await rejected.promise;
+	const retained = f.broker.recentOperations("test-chat", "A").operations;
+	assert.equal(retained.length, 1);
+	assert.equal(retained[0]?.operationId, started.operation.operationId);
+	unavailable = false;
+	await until(() => f.broker.deliveries("test-chat").length === 1, 6000);
+	const restored = f.broker.operation(
+		"test-chat",
+		started.operation.operationId,
+	);
+	assert.equal(restored.operation.status, "completed");
+	assert.ok(restored.operation.resultId);
+	assert.match(
+		await f.broker.readResponse("test-chat", restored.operation.resultId),
+		/completed/,
+	);
 });
 
 test("a failed stdio write can be recovered without replay and unrelated requests do not consume the snapshot", async (t) => {

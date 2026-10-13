@@ -36,7 +36,7 @@ export interface OperationReceipt {
 	resultId?: string | undefined;
 	/** Durable acknowledgement of this acceptance's completed result reference. */
 	resultAcknowledged?: boolean | undefined;
-	/** Explicit unread snapshot protection; cleared only by completed body transmission. */
+	/** Unread native output protection, including unsaved bodies; cleared only after body transmission. */
 	resultUnread?: boolean | undefined;
 }
 

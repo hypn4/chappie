@@ -10,15 +10,21 @@ import {
 	writeFile,
 } from "node:fs/promises";
 import { join } from "node:path";
+import { z } from "zod";
 import { withFileMutationQueue } from "./file-mutation-queue.ts";
 import { uuidV7 } from "./ids.ts";
 
 // Application byte budget, not a promise about a particular ChatGPT token limit.
 export const MAX_RESULT_BYTES = 32 * 1024;
 export const RESULT_RETENTION_MS = 24 * 60 * 60 * 1000;
+export const QUERY_CACHE_PIN = "query-cache";
 const MAX_SNAPSHOT_BYTES = 128 * 1024 * 1024;
 const MAX_METADATA_BYTES = 256 * 1024;
 const MAX_PINS = 4096;
+
+export class StorageCapacityError extends Error {
+	override name = "StorageCapacityError";
+}
 
 export interface ResponseLimits {
 	maxBytes: number;
@@ -51,6 +57,7 @@ interface SnapshotIndex {
 	stamp: string;
 	metadata: SnapshotMetadata;
 	metadataStamp?: string;
+	legacyQueryCache: boolean;
 }
 
 interface SnapshotMetadata {
@@ -74,6 +81,41 @@ function validateId(id: string): void {
 function validatePin(pin: string): void {
 	if (typeof pin !== "string" || !pin || pin.length > 4096)
 		throw new Error("Invalid response snapshot pin");
+}
+
+const legacyQuerySnapshotSchema = z.strictObject({
+	content: z
+		.array(z.object({ type: z.literal("text"), text: z.string() }))
+		.min(1),
+	structuredContent: z.strictObject({ text: z.string() }),
+});
+const legacyQueryHeaderSchema = z.union([
+	z.strictObject({
+		sessionId: z.string(),
+		cwd: z.string(),
+		history: z.record(z.string(), z.unknown()),
+	}),
+	z.object({
+		session: z.object({ id: z.string() }),
+		tools: z.array(z.unknown()),
+	}),
+]);
+
+/** Only the old server envelopes for reproducible queries, never native bodies. */
+function isLegacyQueryCache(text: string): boolean {
+	try {
+		const response = legacyQuerySnapshotSchema.safeParse(JSON.parse(text));
+		if (!response.success) return false;
+		const first = response.data.content[0];
+		if (!first) return false;
+		const header = legacyQueryHeaderSchema.safeParse(JSON.parse(first.text));
+		return (
+			header.success &&
+			("history" in header.data || response.data.content.length === 1)
+		);
+	} catch {
+		return false;
+	}
 }
 
 /** Immutable bodies with separate delivery confirmation and pending references. */
@@ -153,10 +195,16 @@ export class ResponseStore {
 	markRead(chatId: string, id: string): Promise<void> {
 		return withFileMutationQueue(this.#directory, async () => {
 			const entry = await this.#ownedEntry(chatId, id);
-			if (!entry || entry.metadata.readAt !== undefined) return;
+			if (
+				!entry ||
+				(entry.metadata.readAt !== undefined &&
+					!entry.metadata.pins.includes(QUERY_CACHE_PIN))
+			)
+				return;
 			await this.#writeMetadata(id, entry, {
 				...entry.metadata,
-				readAt: Date.now(),
+				readAt: entry.metadata.readAt ?? Date.now(),
+				pins: entry.metadata.pins.filter((pin) => pin !== QUERY_CACHE_PIN),
 			});
 		});
 	}
@@ -241,9 +289,11 @@ export class ResponseStore {
 				...(complete
 					? {
 							readAt: entry.metadata.readAt ?? Date.now(),
-							pins: options.preserveUnreadPin
-								? entry.metadata.pins
-								: entry.metadata.pins.filter((pin) => pin !== "unread"),
+							pins: entry.metadata.pins.filter(
+								(pin) =>
+									pin !== QUERY_CACHE_PIN &&
+									(options.preserveUnreadPin || pin !== "unread"),
+							),
 						}
 					: {}),
 			};
@@ -251,6 +301,7 @@ export class ResponseStore {
 				through !== previous ||
 				(complete &&
 					(entry.metadata.readAt === undefined ||
+						entry.metadata.pins.includes(QUERY_CACHE_PIN) ||
 						(!options.preserveUnreadPin &&
 							entry.metadata.pins.includes("unread"))))
 			)
@@ -271,9 +322,21 @@ export class ResponseStore {
 		});
 	}
 
+	#queryCache(entry: SnapshotIndex): boolean {
+		return (
+			(entry.legacyQueryCache ||
+				entry.metadata.pins.includes(QUERY_CACHE_PIN)) &&
+			entry.metadata.pins.every(
+				(pin) =>
+					pin === QUERY_CACHE_PIN ||
+					(pin === "unread" && entry.legacyQueryCache),
+			)
+		);
+	}
+
 	#expired(entry: SnapshotIndex, now = Date.now()): boolean {
 		return (
-			entry.metadata.pins.length === 0 &&
+			(entry.metadata.pins.length === 0 || this.#queryCache(entry)) &&
 			entry.createdAt <= now - RESULT_RETENTION_MS
 		);
 	}
@@ -338,6 +401,7 @@ export class ResponseStore {
 				length: record.text.length,
 				stamp: currentStamp,
 				metadata: { pins: [] },
+				legacyQueryCache: isLegacyQueryCache(record.text),
 			};
 			this.#index.set(id, entry);
 		}
@@ -414,7 +478,9 @@ export class ResponseStore {
 			metadata.pins.length > MAX_PINS ||
 			Buffer.byteLength(contents) > MAX_METADATA_BYTES
 		)
-			throw new Error("Response snapshot metadata exceeds its storage limit");
+			throw new StorageCapacityError(
+				"Response snapshot metadata exceeds its storage limit",
+			);
 		const file = join(this.#directory, `${id}.meta.json`);
 		await this.#atomicWrite(file, contents);
 		if (entry) {
@@ -477,8 +543,9 @@ export class ResponseStore {
 		const candidates = [...this.#index]
 			.filter(
 				([, entry]) =>
-					entry.metadata.pins.length === 0 &&
-					entry.metadata.readAt !== undefined,
+					this.#queryCache(entry) ||
+					(entry.metadata.pins.length === 0 &&
+						entry.metadata.readAt !== undefined),
 			)
 			.sort(
 				([leftId, left], [rightId, right]) =>
@@ -510,7 +577,7 @@ export class ResponseStore {
 				: undefined;
 		if (scope) {
 			// Planning is read-only: an insufficient candidate set must delete nothing.
-			throw new Error(
+			throw new StorageCapacityError(
 				`Response snapshot ${scope} capacity reached (storage limit); existing result IDs remain readable. Native work may already have executed; do not replay it. Pending data was not acknowledged.`,
 			);
 		}
@@ -536,7 +603,7 @@ export class ResponseStore {
 		} satisfies Snapshot);
 		const bytes = Buffer.byteLength(contents);
 		if (bytes > this.#limits.maxSnapshotBytes)
-			throw new Error(
+			throw new StorageCapacityError(
 				"Response snapshot exceeds its byte limit; native work may already have executed; pending data was not acknowledged",
 			);
 		await mkdir(this.#directory, { recursive: true, mode: 0o700 });
@@ -568,6 +635,7 @@ export class ResponseStore {
 			length: text.length,
 			stamp: stamp(await lstat(destination, { bigint: true })),
 			metadata,
+			legacyQueryCache: options.pin === "unread" && isLegacyQueryCache(text),
 		});
 		// Admission is already checked for the complete plan. Commit the replacement
 		// before deleting confirmed bodies so a failed new write preserves the cache.

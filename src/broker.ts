@@ -48,7 +48,11 @@ import {
 	resourceDescriptors,
 	resourceSessionId,
 } from "./resources.ts";
-import { ResponseStore } from "./responses.ts";
+import {
+	QUERY_CACHE_PIN,
+	ResponseStore,
+	StorageCapacityError,
+} from "./responses.ts";
 import {
 	type BindingMutation,
 	StaleOperationDeliveryError,
@@ -296,9 +300,15 @@ export class Broker {
 			}));
 	}
 
-	async saveResponse(chatId: string, text: string): Promise<string> {
+	async saveResponse(
+		chatId: string,
+		text: string,
+		options: { queryCache?: boolean } = {},
+	): Promise<string> {
 		try {
-			const id = await this.#responses.save(chatId, text, { pin: "unread" });
+			const id = await this.#responses.save(chatId, text, {
+				pin: options.queryCache ? QUERY_CACHE_PIN : "unread",
+			});
 			this.diagnostics.record("snapshot.saved", {
 				chat: chatId,
 				bytes: Buffer.byteLength(text),
@@ -722,6 +732,8 @@ export class Broker {
 									identity?.key,
 									"completed",
 									resources,
+									undefined,
+									{ executionId, pending: true },
 								);
 							throw new Error(
 								`Native batch completed, but its recovery snapshot could not be saved. Recovery operation: ${recovery.operationId}. Inspect get_operation and OMP history; do not repeat execution.`,
@@ -1360,9 +1372,25 @@ export class Broker {
 				try {
 					await this.#state.addDelivery(message.delivery);
 				} catch (error) {
-					// Ownership was checked above. Release a stale packet so the
-					// connected OMP does not endlessly reconnect and resend it.
-					if (!(error instanceof StaleOperationDeliveryError)) throw error;
+					// A retired acceptance can release its stale packet. Valid output
+					// that cannot be persisted must stay in OMP, not tear down IPC.
+					if (!(error instanceof StaleOperationDeliveryError)) {
+						if (
+							!(error instanceof StorageCapacityError) &&
+							!(
+								error instanceof Error &&
+								"code" in error &&
+								typeof error.code === "string"
+							)
+						)
+							throw error;
+						await peer.send({
+							type: "store_failed",
+							id: message.delivery.id,
+							error: error.message.slice(0, 4096),
+						});
+						break;
+					}
 				}
 				await peer.send({ type: "stored", id: message.delivery.id });
 				break;

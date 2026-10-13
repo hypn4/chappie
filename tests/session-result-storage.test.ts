@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { IpcClient, JsonLinePeer, type SessionMessage } from "../src/ipc.ts";
+import { ResponseStore } from "../src/responses.ts";
 import { until, within } from "./helpers/async.ts";
 import { sessionFixture } from "./helpers/session-fixture.ts";
 
@@ -249,3 +250,142 @@ test("an error-only result keeps partial native output for delivery recovery", a
 	]);
 	await until(() => f.broker.deliveries("test-chat").length === 1);
 });
+
+for (const failure of ["capacity", "filesystem"] as const) {
+	test(`deferred ${failure} failure keeps IPC usable and recovers the same execution`, {
+		timeout: 8500,
+	}, async (t) => {
+		const f = await sessionFixture(t);
+		const limited = new ResponseStore(f.root, {
+			maxSnapshots: 2,
+			maxConversationSnapshots: 2,
+		});
+		let consumed: string | undefined;
+		let protectedId: string | undefined;
+		if (failure === "capacity") {
+			consumed = await limited.save("earlier-chat", "earlier result", {
+				pin: "unread",
+			});
+			protectedId = await limited.save("earlier-chat", "still unread", {
+				pin: "unread",
+			});
+		}
+		let unavailable = true;
+		const save = ResponseStore.prototype.save;
+		t.mock.method(
+			ResponseStore.prototype,
+			"save",
+			function (
+				this: ResponseStore,
+				chatId: string,
+				text: string,
+				options?: Parameters<ResponseStore["save"]>[2],
+			) {
+				if (failure === "filesystem" && unavailable)
+					return Promise.reject(
+						Object.assign(new Error("fixture disk full"), { code: "ENOSPC" }),
+					);
+				return save.call(
+					failure === "capacity" ? limited : this,
+					chatId,
+					text,
+					options,
+				);
+			},
+		);
+		let resultSends = 0;
+		let flushing = false;
+		let retained: Extract<SessionMessage, { type: "delivery" }> | undefined;
+		const disposition = Promise.withResolvers<string>();
+		const sendSession = IpcClient.prototype.send;
+		t.mock.method(
+			IpcClient.prototype,
+			"send",
+			function (this: IpcClient, message: SessionMessage) {
+				if (message.type === "result" && "toolResults" in message)
+					resultSends++;
+				if (message.type === "delivery") {
+					flushing = true;
+					retained = message;
+				}
+				return sendSession.call(this, message);
+			},
+		);
+		const sendPeer = JsonLinePeer.prototype.send;
+		t.mock.method(
+			JsonLinePeer.prototype,
+			"send",
+			function (this: JsonLinePeer<unknown, unknown>, message: unknown) {
+				if (
+					message &&
+					typeof message === "object" &&
+					"type" in message &&
+					message.type === "store_failed"
+				)
+					disposition.resolve("deferred");
+				return sendPeer.call(this, message);
+			},
+		);
+		const closePeer = JsonLinePeer.prototype.close;
+		t.mock.method(
+			JsonLinePeer.prototype,
+			"close",
+			function (this: JsonLinePeer<unknown, unknown>) {
+				if (flushing) disposition.resolve("disconnected");
+				return closePeer.call(this);
+			},
+		);
+		const { pending } = await f.queue("storage-pressure");
+		await f.complete(await f.dispatch());
+		assert.ok("error" in (await pending));
+		await f.reconnect();
+		assert.equal(
+			await within(disposition.promise, 1500, "No storage disposition"),
+			"deferred",
+		);
+		const inspected = await f.broker.tools(
+			"test-chat",
+			"A",
+			["read"],
+			"healthy-after-storage-failure",
+			f.controller.signal,
+		);
+		assert.equal(inspected.session.id, "A");
+		assert.deepEqual(
+			inspected.tools.map((tool) => tool.name),
+			["read"],
+		);
+		assert.deepEqual(f.broker.deliveries("test-chat"), []);
+		assert.ok(retained);
+		const executionId = retained.delivery.executionId;
+		if (consumed) {
+			assert.equal(
+				await limited.read("earlier-chat", consumed),
+				"earlier result",
+			);
+			await limited.markRead("earlier-chat", consumed);
+			await limited.unpin("earlier-chat", consumed, "unread");
+		}
+		unavailable = false;
+		await until(() => f.broker.deliveries("test-chat").length === 1, 6000);
+		const saved = f.broker.deliveries("test-chat")[0];
+		assert.ok(saved);
+		assert.equal(saved.executionId, executionId);
+		assert.equal(saved.requestId, "storage-pressure");
+		assert.match(
+			await f.broker.readResponse("test-chat", saved.resultId),
+			/completed/,
+		);
+		assert.deepEqual(f.broker.deliveries("another-chat"), []);
+		if (protectedId)
+			assert.equal(
+				await limited.read("earlier-chat", protectedId),
+				"still unread",
+			);
+		assert.equal(
+			resultSends,
+			1,
+			"storage retries must not execute the native batch again",
+		);
+	});
+}

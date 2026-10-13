@@ -11,7 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type TestContext, test } from "node:test";
-import { ResponseStore } from "../src/responses.ts";
+import { QUERY_CACHE_PIN, ResponseStore } from "../src/responses.ts";
 
 async function fixture(
 	t: TestContext,
@@ -659,4 +659,169 @@ test("invalid pending ownership cannot discard other stale delivery pins", async
 	);
 	now += 24 * 60 * 60 * 1000;
 	assert.equal(await store.read("owner", id), "protected");
+});
+
+test("expired legacy query copies free capacity without expiring native or pending output", async (t) => {
+	const limits = { maxSnapshots: 6, maxConversationSnapshots: 6 };
+	const { root, store, directory } = await fixture(t, limits);
+	let now = Date.now();
+	t.mock.method(Date, "now", () => now);
+	const query = (header: unknown) => {
+		const text = JSON.stringify(header);
+		return JSON.stringify({
+			content: [{ type: "text", text }],
+			structuredContent: { text },
+		});
+	};
+	const bodies = [
+		query({ sessionId: "A", cwd: "/fixture", history: { count: 1 } }),
+		query({ session: { id: "A" }, tools: [{ name: "read" }] }),
+		query({
+			selection: "explicit",
+			session: { id: "A" },
+			tools: [],
+			skills: [],
+		}),
+	] as const;
+	const ids = [];
+	for (const body of bodies)
+		ids.push(await store.save("owner", body, { pin: "unread" }));
+	const nativeText = JSON.stringify({
+		...JSON.parse(bodies[0]),
+		isError: false,
+	});
+	const native = await store.save("owner", nativeText, { pin: "unread" });
+	const unknown = await store.save("owner", "unclassified output", {
+		pin: "unread",
+	});
+	const pending = await store.save(
+		"owner",
+		query({ sessionId: "B", cwd: "/fixture", history: { count: 2 } }),
+		{ pin: "unread" },
+	);
+	await store.pin("owner", pending, "delivery:pending");
+	now += 24 * 60 * 60 * 1000 - 1;
+	const reopened = new ResponseStore(root, limits);
+	for (const [index, id] of ids.entries())
+		assert.equal(await reopened.read("owner", id), bodies[index]);
+	now++;
+	const admitted = await reopened.save("other", "after expiry");
+	for (const id of ids)
+		await assert.rejects(reopened.read("owner", id), /not found|expired/);
+	assert.equal(await reopened.read("owner", native), nativeText);
+	assert.equal(await reopened.read("owner", unknown), "unclassified output");
+	assert.equal(
+		JSON.parse(
+			JSON.parse(await reopened.read("owner", pending)).content[0].text,
+		).sessionId,
+		"B",
+	);
+	assert.equal(await reopened.read("other", admitted), "after expiry");
+	assert.equal(
+		(await readdir(directory)).filter((name) =>
+			/^[a-f0-9]{64}\.json$/.test(name),
+		).length,
+		4,
+	);
+});
+
+test("legacy catalogs containing acknowledged input are not treated as disposable query copies", async (t) => {
+	const { root, store } = await fixture(t);
+	let now = Date.now();
+	t.mock.method(Date, "now", () => now);
+	const content = [
+		{ type: "text", text: JSON.stringify({ session: { id: "A" }, tools: [] }) },
+		{
+			type: "text",
+			text: JSON.stringify({ ompInput: "input-1", sessionId: "A" }),
+		},
+		{ type: "text", text: "original user input" },
+	];
+	const text = JSON.stringify({
+		content,
+		structuredContent: { text: content.map((block) => block.text).join("\n") },
+	});
+	const id = await store.save("owner", text, { pin: "unread" });
+	now += 24 * 60 * 60 * 1000;
+	assert.equal(await new ResponseStore(root).read("owner", id), text);
+});
+
+for (const budget of [
+	{ maxSnapshots: 2, maxConversationSnapshots: 2 },
+	{ maxBytes: 640, maxConversationBytes: 320 },
+]) {
+	test(`query cache pressure reclaims unread copies before TTL (${Object.keys(budget)[0]})`, async (t) => {
+		const { root, store } = await fixture(t, budget);
+		let now = Date.now();
+		t.mock.method(Date, "now", () => now);
+		const oldest = await store.save("owner", "a".repeat(90), {
+			pin: QUERY_CACHE_PIN,
+		});
+		now++;
+		const newer = await store.save("owner", "b".repeat(90), {
+			pin: QUERY_CACHE_PIN,
+		});
+		await store.recordRead("owner", oldest, 0, 1, 90);
+		const native = await new ResponseStore(root, budget).save(
+			"owner",
+			"native output".repeat(8),
+			{ pin: "unread" },
+		);
+		await assert.rejects(store.read("owner", oldest), /not found|expired/);
+		assert.equal(await store.read("owner", newer), "b".repeat(90));
+		assert.equal(await store.read("owner", native), "native output".repeat(8));
+	});
+}
+
+test("legacy query copies retire under pressure while native and delivery pins stay intact", async (t) => {
+	const { root, store } = await fixture(t, {
+		maxSnapshots: 3,
+		maxConversationSnapshots: 3,
+	});
+	const query = JSON.stringify({
+		content: [
+			{
+				type: "text",
+				text: JSON.stringify({
+					sessionId: "A",
+					cwd: "/fixture",
+					history: { count: 1 },
+				}),
+			},
+		],
+		structuredContent: { text: "legacy history" },
+	});
+	const cache = await store.save("owner", query, { pin: "unread" });
+	const native = await store.save("owner", "native result", { pin: "unread" });
+	const pending = await store.save("owner", "pending delivery", {
+		pin: "delivery:pending",
+	});
+	const next = await new ResponseStore(root, {
+		maxSnapshots: 3,
+		maxConversationSnapshots: 3,
+	}).save("owner", "replacement result", { pin: "unread" });
+	await assert.rejects(store.read("owner", cache), /not found|expired/);
+	assert.equal(await store.read("owner", native), "native result");
+	assert.equal(await store.read("owner", pending), "pending delivery");
+	assert.equal(await store.read("owner", next), "replacement result");
+	await assert.rejects(
+		store.save("other", "no disposable cache"),
+		/broker.*capacity/i,
+	);
+});
+
+test("failed replacement leaves unread query cache intact under pressure", async (t) => {
+	const { store, directory } = await fixture(t, {
+		maxSnapshots: 1,
+		maxConversationSnapshots: 1,
+	});
+	const { store: identityStore } = await fixture(t);
+	const nextId = await identityStore.save("owner", "replacement");
+	const current = await store.save("owner", "query cache", {
+		pin: QUERY_CACHE_PIN,
+	});
+	await mkdir(join(directory, `${nextId}.meta.json`));
+	await assert.rejects(store.save("owner", "replacement", { pin: "unread" }));
+	assert.equal(await store.read("owner", current), "query cache");
+	await assert.rejects(store.read("owner", nextId), /not found|expired/);
 });

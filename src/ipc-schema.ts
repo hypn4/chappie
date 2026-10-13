@@ -235,6 +235,11 @@ const brokerMessage = z.union([
 	z.strictObject({ type: z.literal("synced"), id, sessionId: name }),
 	z.strictObject({ type: z.literal("stored"), id: name }),
 	z.strictObject({
+		type: z.literal("store_failed"),
+		id: name,
+		error: z.string().max(4096),
+	}),
+	z.strictObject({
 		type: z.literal("notice"),
 		sessionId: name,
 		message: text,

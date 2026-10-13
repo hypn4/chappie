@@ -134,7 +134,7 @@ interface SyncRequest {
 }
 
 interface StoreRequest {
-	resolve(): void;
+	resolve(stored: boolean): void;
 	reject(error: Error): void;
 }
 
@@ -954,7 +954,10 @@ export class LocalSession {
 			case "stored":
 				this.#deliveries.delete(message.id);
 				this.#clearDeliveryTimer(message.id);
-				this.#stores.get(message.id)?.resolve();
+				this.#stores.get(message.id)?.resolve(true);
+				break;
+			case "store_failed":
+				this.#stores.get(message.id)?.resolve(false);
 				break;
 			case "notice":
 				if (
@@ -1676,7 +1679,7 @@ export class LocalSession {
 			if (!connection?.connected) return;
 			for (const delivery of this.#deliveries.values()) {
 				if (this.#deliveryTimers.has(delivery.id)) continue;
-				const completion = Promise.withResolvers<void>();
+				const completion = Promise.withResolvers<boolean>();
 				void completion.promise.catch(() => {});
 				this.#stores.set(delivery.id, completion);
 				const timer = setTimeout(
@@ -1689,7 +1692,10 @@ export class LocalSession {
 				timer.unref();
 				try {
 					await connection.send({ type: "delivery", delivery });
-					await completion.promise;
+					if (!(await completion.promise)) {
+						this.#scheduleDeliveryRetry(delivery);
+						continue;
+					}
 					this.#notify(
 						`Result saved for ChatGPT ${delivery.chatId.slice(-4)}`,
 						"info",
@@ -1702,10 +1708,12 @@ export class LocalSession {
 					if (
 						this.#connection === connection &&
 						this.#connectionGeneration === generation &&
-						connection.connected &&
-						this.#deliveries.get(delivery.id) === delivery
-					)
-						this.#scheduleDeliveryRetry(delivery);
+						connection.connected
+					) {
+						if (this.#deliveries.get(delivery.id) === delivery)
+							this.#scheduleDeliveryRetry(delivery);
+						continue;
+					}
 					throw error;
 				} finally {
 					clearTimeout(timer);

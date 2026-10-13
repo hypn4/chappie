@@ -197,6 +197,95 @@ test("a whole oversized history entry remains losslessly readable without false 
 	assert.equal(JSON.parse(full.content[1].text).data.message, body);
 });
 
+test("unconsumed query continuations expire after 24 hours without renewing on partial reads", async (t) => {
+	const f = await fixture(t);
+	let now = Date.now();
+	t.mock.method(Date, "now", () => now);
+	const session = {
+		id: "A",
+		cwd: f.root,
+		device: "test",
+		host: "omp",
+		status: "idle" as const,
+	};
+	const tools = [{ name: "read", description: "catalog".repeat(10000) }];
+	t.mock.method(f.broker, "initialize", async () => ({
+		selection: "explicit" as const,
+		session,
+		tools,
+		skills: [],
+		inputs: [],
+	}));
+	t.mock.method(f.broker, "tools", async () => ({
+		session,
+		tools,
+		inputs: [],
+	}));
+	t.mock.method(f.broker, "history", async () => ({
+		sessionId: "A",
+		cwd: f.root,
+		history: {
+			content: [{ type: "text" as const, text: "history".repeat(10000) }],
+			count: 1,
+			hasMore: false,
+			entryIds: ["original-entry"],
+		},
+	}));
+	const ids = [];
+	for (const name of ["init", "tools", "history"])
+		ids.push(resultReference(await f.request(name)).resultId);
+	now += 24 * 60 * 60 * 1000 - 1;
+	for (const resultId of ids) {
+		const firstPage = textData(
+			await f.request("get_operation", { resultId, offset: 0 }),
+		);
+		assert.equal(firstPage.hasMore, true);
+		assert.equal(firstPage.offset, 0);
+	}
+	now++;
+	for (const resultId of ids)
+		assertRpcError(
+			await f.request("get_operation", { resultId, offset: 0 }),
+			/not found|expired/,
+		);
+	const refreshed = resultReference(await f.request("history")).resultId;
+	assert.equal(
+		textData(await f.request("get_operation", { resultId: refreshed })).hasMore,
+		true,
+	);
+});
+
+test("catalog continuations carrying native input remain protected past query cache expiry", async (t) => {
+	const f = await fixture(t);
+	let now = Date.now();
+	t.mock.method(Date, "now", () => now);
+	t.mock.method(f.broker, "tools", async () => ({
+		session: {
+			id: "A",
+			cwd: f.root,
+			device: "test",
+			host: "omp",
+			status: "idle" as const,
+		},
+		tools: [{ name: "read", description: "catalog".repeat(10000) }],
+		inputs: [
+			{
+				id: "input-1",
+				sessionId: "A",
+				message: {
+					role: "user" as const,
+					content: "original user input",
+					timestamp: 1,
+				},
+			},
+		],
+	}));
+	t.mock.method(f.broker, "acknowledgeInputs", async () => {});
+	const resultId = resultReference(await f.request("tools")).resultId;
+	now += 24 * 60 * 60 * 1000;
+	assert.match(await recoverText(f, resultId), /original user input/);
+});
+
 function result(m: JSONRPCMessage) {
 	assert.ok("result" in m);
 	return m.result as {
