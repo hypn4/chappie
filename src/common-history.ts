@@ -1,11 +1,10 @@
-import {
+import fs, {
 	lstat,
 	mkdir,
 	open,
 	readdir,
 	readFile,
 	realpath,
-	rename,
 	unlink,
 } from "node:fs/promises";
 import { hostname } from "node:os";
@@ -206,7 +205,17 @@ async function atomicWrite(path: string, text: string): Promise<void> {
 		} finally {
 			await file.close();
 		}
-		await rename(temporary, path);
+		for (let attempt = 0; ; attempt++) {
+			try {
+				await fs.rename(temporary, path);
+				break;
+			} catch (error) {
+				const code = (error as NodeJS.ErrnoException | undefined)?.code;
+				if (attempt === 7 || (code !== "EPERM" && code !== "EACCES"))
+					throw error;
+				await delay(25);
+			}
+		}
 	} finally {
 		await unlink(temporary).catch((error: unknown) => {
 			if (!missing(error)) throw error;

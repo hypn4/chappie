@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
-import {
+import fs, {
 	mkdir,
 	mkdtemp,
 	readdir,
@@ -541,6 +541,111 @@ test("unknown schema versions are reported without replacing a project catalog o
 	await publish(f.store, { ...value, updatedAt: 3000 });
 	assert.equal(await readFile(historyPath, "utf8"), future);
 });
+
+test("catalog replacement preserves project identity after transient permission collisions", async (t) => {
+	const f = await fixture(t);
+	const catalogPath = join(f.homeDir, "project-catalog.json");
+	const before = await readFile(catalogPath, "utf8");
+	const renameOnDisk = fs.rename;
+	const collisions = ["EPERM", "EACCES"];
+	let index = 0;
+	t.mock.method(fs, "rename", async (...args: Parameters<typeof fs.rename>) => {
+		if (args[1] === catalogPath && index < collisions.length) {
+			assert.equal(await readFile(catalogPath, "utf8"), before);
+			throw Object.assign(new Error("Transient catalog sharing collision"), {
+				code: collisions[index++],
+			});
+		}
+		return renameOnDisk(...args);
+	});
+	const project = await f.store.resolveProject({
+		cwd: f.cwd,
+		name: "Renamed project",
+	});
+	assert.ok(project);
+	assert.equal(project.projectId, f.projectId);
+	const saved = JSON.parse(await readFile(catalogPath, "utf8"));
+	assert.equal(saved.projects[0].projectId, f.projectId);
+	assert.equal(saved.projects[0].name, "Renamed project");
+	assert.deepEqual(f.errors, []);
+	assert.deepEqual((await readdir(f.homeDir)).sort(), ["project-catalog.json"]);
+});
+
+test("history replacement keeps prior public text until transient rename collisions clear", async (t) => {
+	const f = await fixture(t);
+	const previous = input(f.projectId, f.cwd);
+	await publish(f.store, previous);
+	const historyPath = path(f.homeDir, previous);
+	const before = await readFile(historyPath, "utf8");
+	const renameOnDisk = fs.rename;
+	let collisions = 2;
+	t.mock.method(fs, "rename", async (...args: Parameters<typeof fs.rename>) => {
+		if (args[1] === historyPath && collisions-- > 0) {
+			assert.equal(await readFile(historyPath, "utf8"), before);
+			throw Object.assign(new Error("Transient history sharing collision"), {
+				code: "EPERM",
+			});
+		}
+		return renameOnDisk(...args);
+	});
+	await publish(f.store, {
+		...previous,
+		updatedAt: 3000,
+		entries: [
+			{
+				sourceEntryId: "entry-1",
+				timestamp: 2000,
+				kind: "message",
+				role: "user",
+				text: "Updated public text",
+			},
+		],
+	});
+	const saved = JSON.parse(await readFile(historyPath, "utf8"));
+	assert.equal(saved.updatedAt, 3000);
+	assert.equal(saved.entries[0].text, "Updated public text");
+	assert.deepEqual(f.errors, []);
+	assert.deepEqual(
+		await readdir(join(f.homeDir, "projects", f.projectId, "sessions")),
+		[`${previous.sessionId}.json`],
+	);
+});
+
+for (const [failureCode, attempts] of [
+	["EPERM", 8],
+	["EACCES", 8],
+	["EIO", 1],
+] as const) {
+	test(`persistent ${failureCode} catalog replacement preserves original identity and reports its error`, async (t) => {
+		const f = await fixture(t);
+		const catalogPath = join(f.homeDir, "project-catalog.json");
+		const before = await readFile(catalogPath, "utf8");
+		const denied = Object.assign(new Error("Catalog replacement denied"), {
+			code: failureCode,
+		});
+		const renameOnDisk = fs.rename;
+		let calls = 0;
+		t.mock.method(
+			fs,
+			"rename",
+			async (...args: Parameters<typeof fs.rename>) => {
+				if (args[1] !== catalogPath) return renameOnDisk(...args);
+				calls++;
+				throw denied;
+			},
+		);
+		assert.equal(
+			await f.store.resolveProject({ cwd: f.cwd, name: "Not committed" }),
+			undefined,
+		);
+		assert.equal(calls, attempts);
+		assert.deepEqual(f.errors, [denied]);
+		assert.equal(await readFile(catalogPath, "utf8"), before);
+		assert.deepEqual((await readdir(f.homeDir)).sort(), [
+			"project-catalog.json",
+		]);
+	});
+}
 
 test("independent neutral writers share a project identity and retain distinct session snapshots", async (t) => {
 	const f = await fixture(t);

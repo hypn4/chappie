@@ -185,8 +185,9 @@ async function nearMetadataCapacity(
 	return { operations, pending, pendingReference, unread, next, error };
 }
 
+// Multiple 128 MiB round-trips need an I/O hang guard, not a latency limit.
 test("byte pressure retires acknowledged secondary references before cold receipts", {
-	timeout: 30_000,
+	timeout: 120_000,
 }, async (t) => {
 	const f = await fixture(t);
 	const seeded = await nearMetadataCapacity(f, true);
@@ -208,7 +209,7 @@ test("byte pressure retires acknowledged secondary references before cold receip
 });
 
 test("byte pressure archives safe terminal receipts and survives an archive write failure", {
-	timeout: 30_000,
+	timeout: 120_000,
 }, async (t) => {
 	const f = await fixture(t);
 	const seeded = await nearMetadataCapacity(f, false);
