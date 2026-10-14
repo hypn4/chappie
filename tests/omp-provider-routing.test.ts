@@ -26,7 +26,11 @@ const model = {
 function owner(
 	id: string,
 	start?: (output: ProviderOutput) => Promise<void>,
-	generate?: (output: ProviderOutput, kind: string) => Promise<void>,
+	generate?: (
+		output: ProviderOutput,
+		kind: string,
+		sessionId: string,
+	) => Promise<void>,
 ) {
 	let currentId = id;
 	let provider: string | undefined = "chappie";
@@ -53,14 +57,14 @@ function owner(
 	const starts: string[] = [];
 	const observedProviders: Array<string | undefined> = [];
 	const config = createOmpChappieProvider(
-		async (output) => {
-			starts.push(currentId);
+		async (output, sessionId) => {
+			starts.push(sessionId);
 			if (start) return start(output);
 			output.text(currentId);
 			output.done();
 		},
-		async (output, request) => {
-			if (generate) return generate(output, request.kind);
+		async (output, request, sessionId) => {
+			if (generate) return generate(output, request.kind, sessionId);
 			throw new Error("unexpected generation");
 		},
 		api,
@@ -459,4 +463,126 @@ test("recognized compaction requests use a separate generation route", async () 
 	);
 	assert.equal(reply.stopReason, "stop");
 	assert.deepEqual(generations, ["compaction"]);
+});
+
+test("provider identity rotation keeps native execution on the persistent owner", async () => {
+	const a = owner("A");
+	const b = owner("B");
+	for (const providerSessionId of [
+		"A",
+		"fresh-A",
+		"clear-A",
+		"fresh-again-A",
+	]) {
+		const options = { ...a.options(), sessionId: providerSessionId };
+		const reply = await result(b.config, options, {
+			messages: [createOmpPrimaryContextMessage("A")],
+		});
+		assert.equal(
+			reply.stopReason,
+			"stop",
+			reply.errorMessage ?? "native rotation",
+		);
+		assert.equal(options.sessionId, providerSessionId);
+	}
+	assert.deepEqual(a.starts, ["A", "A", "A", "A"]);
+	assert.deepEqual(b.starts, []);
+});
+
+test("provider identity rotation keeps compaction on the owning session hook", async () => {
+	const generations: Array<[string, string]> = [];
+	const a = owner("A", undefined, async (output, kind, sessionId) => {
+		generations.push([kind, sessionId]);
+		output.text("summary");
+		output.done();
+	});
+	const b = owner("B");
+	const reply = await result(
+		b.config,
+		{
+			...a.options(),
+			sessionId: "fresh-A",
+			codexCompaction: {} as NonNullable<
+				SimpleStreamOptions["codexCompaction"]
+			>,
+		},
+		{ messages: [{ role: "user", content: "compact", timestamp: 1 }] },
+	);
+	assert.equal(
+		reply.stopReason,
+		"stop",
+		reply.errorMessage ?? "compaction rotation",
+	);
+	assert.deepEqual(generations, [["compaction", "A"]]);
+	assert.deepEqual(a.starts, []);
+	assert.deepEqual(b.starts, []);
+});
+
+test("rotated provider requests reject missing, foreign and conflicting provenance", async () => {
+	const a = owner("A");
+	for (const messages of [
+		[],
+		[createOmpPrimaryContextMessage("B")],
+		[createOmpPrimaryContextMessage("A"), createOmpPrimaryContextMessage("B")],
+		JSON.parse(JSON.stringify([createOmpPrimaryContextMessage("A")])),
+	]) {
+		const reply = await result(
+			a.config,
+			{ ...a.options(), sessionId: "fresh-A" },
+			{ messages },
+		);
+		assert.equal(reply.stopReason, "error");
+	}
+	assert.deepEqual(a.starts, []);
+	assert.deepEqual(a.observedProviders, []);
+});
+
+test("rotated requests cannot outlive their owner while request hooks await", async () => {
+	for (const invalidate of [
+		"shutdown",
+		"model",
+		"session",
+		"cancel",
+	] as const) {
+		for (const compaction of [false, true]) {
+			const starts: string[] = [];
+			const a = owner(
+				"A",
+				async (output) => {
+					starts.push("primary");
+					output.done();
+				},
+				async (output) => {
+					starts.push("compaction");
+					output.done();
+				},
+			);
+			const controller = new AbortController();
+			const options: SimpleStreamOptions = {
+				...a.options(),
+				sessionId: "fresh-A",
+				signal: controller.signal,
+				...(compaction
+					? {
+							codexCompaction: {} as NonNullable<
+								SimpleStreamOptions["codexCompaction"]
+							>,
+						}
+					: {}),
+				onPayload: async (payload) => {
+					const routed = await a.onPayload(payload);
+					if (invalidate === "shutdown") await a.emit("session_shutdown", {});
+					else if (invalidate === "model") a.setProvider("other");
+					else if (invalidate === "session") a.switchTo("B");
+					else controller.abort();
+					return routed;
+				},
+			};
+			const reply = await result(a.config, options, {
+				messages: [createOmpPrimaryContextMessage("A")],
+			});
+			assert.ok(reply.stopReason === "error" || reply.stopReason === "aborted");
+			assert.deepEqual(starts, []);
+		}
+	}
 });

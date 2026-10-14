@@ -68,20 +68,35 @@ export function createOmpPrimaryContextMessage(
 	};
 }
 
-// Primary authorization is exact-session scoped. Empty context alone is not
-// sufficient because OMP auxiliary helpers may reuse the main request hook.
+// Resolve the persistent owner from local-only provenance, not from the
+// provider transport/cache ID, which OMP rotates on /clear and /fresh.
+// Conflicting markers never grant ownership to either session.
+export function getOmpPrimarySessionId(context: unknown): string | undefined {
+	if (typeof context !== "object" || context === null) return undefined;
+	const messages = (context as OmpContext).messages;
+	if (!Array.isArray(messages)) return undefined;
+	let sessionId: string | undefined;
+	for (const message of messages) {
+		if (typeof message !== "object" || message === null) continue;
+		const value = (message as Partial<OmpPrimaryContextMessage>)[
+			primaryContextTag
+		];
+		if (value === undefined) continue;
+		if (
+			typeof value !== "string" ||
+			!value ||
+			(sessionId !== undefined && value !== sessionId)
+		)
+			return undefined;
+		sessionId = value;
+	}
+	return sessionId;
+}
+
+// Empty context alone is insufficient: auxiliary helpers may reuse the hook.
 export function hasOmpPrimaryContext(
 	context: unknown,
 	sessionId: string,
 ): boolean {
-	if (typeof context !== "object" || context === null) return false;
-	const messages = (context as OmpContext).messages;
-	if (!Array.isArray(messages)) return false;
-	return messages.some(
-		(message) =>
-			typeof message === "object" &&
-			message !== null &&
-			(message as Partial<OmpPrimaryContextMessage>)[primaryContextTag] ===
-				sessionId,
-	);
+	return getOmpPrimarySessionId(context) === sessionId;
 }

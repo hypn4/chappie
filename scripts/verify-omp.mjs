@@ -11,6 +11,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createInterface } from "node:readline";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { Broker } from "../src/broker.ts";
@@ -328,6 +329,39 @@ const omp = createOmpProcessHarness({
 	env,
 	baseArgs: commonArgs,
 });
+
+// Drive only the isolated OMP process; match complete RPC responses by ID.
+async function rpc(command) {
+	omp.assertHealthy();
+	const id = `identity-${crypto.randomUUID()}`;
+	const lines = createInterface({ input: omp.child.stdout });
+	try {
+		const response = new Promise((resolve, reject) => {
+			const abort = () => reject(signal.reason);
+			signal.addEventListener("abort", abort, { once: true });
+			lines.once("close", () => {
+				signal.removeEventListener("abort", abort);
+				reject(new Error(`OMP closed before RPC ${id} completed`));
+			});
+			lines.on("line", (line) => {
+				let frame;
+				try {
+					frame = JSON.parse(line);
+				} catch {
+					return;
+				}
+				if (frame.type !== "response" || frame.id !== id) return;
+				if (frame.success) resolve(frame.data);
+				else reject(new Error(frame.error ?? `OMP RPC ${command.type} failed`));
+			});
+		});
+		signal.throwIfAborted();
+		omp.child.stdin.write(`${JSON.stringify({ ...command, id })}\n`);
+		return await response;
+	} finally {
+		lines.close();
+	}
+}
 try {
 	await broker.start();
 	omp.launch(["--no-session"]);
@@ -746,6 +780,44 @@ try {
 		false,
 		"first Chappie request after OMP session resume must complete normally",
 	);
+	// /fresh rotates the real OMP provider ID without changing the persistent
+	// session. Exercise the first native wake and a subsequent turn each time.
+	for (let rotation = 0; rotation < 2; rotation++) {
+		await broker.chat(
+			"resume-integration-chat",
+			restored.id,
+			"Settle the isolated identity probe.",
+			`identity-settle-${rotation}`,
+			signal,
+		);
+		let before = await rpc({ type: "get_state" });
+		while (before.isStreaming) {
+			await delay(20, undefined, { signal });
+			before = await rpc({ type: "get_state" });
+		}
+		await rpc({ type: "prompt", message: "/fresh" });
+		let after = await rpc({ type: "get_state" });
+		while (after.sessionId === before.sessionId) {
+			await delay(20, undefined, { signal });
+			after = await rpc({ type: "get_state" });
+		}
+		assert.notEqual(after.sessionId, restored.id);
+		assert.deepEqual(
+			broker.listSessions().map((entry) => entry.id),
+			[restored.id],
+		);
+		for (let turn = 0; turn < 2; turn++) {
+			const resumed = await completedCall(
+				"resume-integration-chat",
+				restored.id,
+				[{ name: "read", arguments: { path: "fixture.txt" } }],
+				`after-provider-rotation-${rotation}-${turn}`,
+				signal,
+			);
+			assert.equal(resumed.output.isError, false);
+			assert.equal(resumed.sessionId, restored.id);
+		}
+	}
 	if (soakIterations) {
 		Bun.gc(true);
 		const beforeMemory = process.memoryUsage();
@@ -876,7 +948,7 @@ try {
 		"Chappie must not write storage into the native agent directory",
 	);
 	console.log(
-		"OMP integration passed: native tool discovery and batch execution, provider ownership after replacement/disposal, auxiliary rejection, detached operation completion, bounded synchronous call recovery through a gated native read, broker reconnect first-turn routing, saved-session resume first-turn routing, local collaboration registration, nonterminating progress and two-step TODO continuation, exact read, native edit, resource bytes, replay and original-URI recovery.",
+		"OMP integration passed: native tool discovery and batch execution, provider ownership after replacement/disposal, auxiliary rejection, detached operation completion, bounded synchronous call recovery through a gated native read, broker reconnect first-turn routing, saved-session resume first-turn routing, repeated /fresh provider identity rotation with first and subsequent native calls on the persistent owner, local collaboration registration, nonterminating progress and two-step TODO continuation, exact read, native edit, resource bytes, replay and original-URI recovery.",
 	);
 	console.log(
 		"No subagents, external model inference or live broker changes were used. ChatGPT approval UI and final response rendering are not covered.",

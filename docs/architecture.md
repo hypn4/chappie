@@ -34,7 +34,7 @@ Do not restore direct read/bash/edit/write wrappers, Base64 aliases, a native sc
 
 ### Exact-session provenance, not last-registered ownership
 
-OMP API registration is process-wide. The provider dispatcher must remain stateless and follow each caller's request hook and exact session ID. In-process primary provenance survives context copies but is excluded from provider serialization. Recognized compaction/branch-summary generations have their own route; unrelated auxiliary prompts cannot borrow a primary output.
+OMP API registration is process-wide. The provider dispatcher must remain stateless and follow each caller's request hook and persistent OMP session ID. This owner ID is distinct from `options.sessionId`, the provider transport/cache ID rotated by `/clear` and `/fresh`. Primary provenance carries the persistent owner, survives context copies, and is excluded from provider serialization; missing, foreign or conflicting provenance is rejected. Recognized compaction without primary provenance binds to its caller's session hook. Both routes capture the persistent owner and recheck it after awaited hooks before native execution or generation. No global provider-ID alias map or auxiliary inference fallback is used. Branch summaries retain their separate session-owned generation route.
 
 Transient resume context must not discard a legitimate request hook, but an explicit provider/session switch must invalidate stale work. Native completion is delivered at `turn_end`, independently of a later model request or TODO continuation. Idle remote work uses an invisible control message removed from model context. Starting another `chappie/chatgpt` agent does not create a ChatGPT conversation.
 

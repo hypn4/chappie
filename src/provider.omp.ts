@@ -4,7 +4,7 @@ import type {
 	ProviderConfig as OmpProviderConfig,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import type { ModelRequest } from "./ipc.ts";
-import { hasOmpPrimaryContext } from "./omp-primary-context.ts";
+import { getOmpPrimarySessionId } from "./omp-primary-context.ts";
 import { createChappieStream, type ProviderOutput } from "./provider-core.ts";
 
 const CHAPPIE_API = "chappie";
@@ -13,8 +13,8 @@ const CHAPPIE_LOCAL_BASE_URL = "http://127.0.0.1";
 
 // OMP can load multiple copies of an extension in one process. Symbols share
 // this local-only contract without storing sessions in a global registry.
-const requestTag = Symbol.for("@hypn4/chappie/omp-request/v1");
-const routeTag = Symbol.for("@hypn4/chappie/omp-route/v1");
+const requestTag = Symbol.for("@hypn4/chappie/omp-request/v2");
+const routeTag = Symbol.for("@hypn4/chappie/omp-route/v2");
 type Start = (output: ProviderOutput, sessionId: string) => Promise<void>;
 type Generate = (
 	output: ProviderOutput,
@@ -24,10 +24,13 @@ type Generate = (
 type ObserveProviderRequest = (context: OmpExtensionContext) => void;
 interface OmpRequest {
 	[requestTag]: true;
-	sessionId: string;
+	providerSessionId: string;
+	// Absent only for recognized compaction, which uses its caller's hook.
+	sessionId?: string;
 	generation?: ModelRequest;
 }
 interface RoutedRequest extends OmpRequest {
+	sessionId: string;
 	[routeTag]: (output: ProviderOutput, sessionId: string) => Promise<void>;
 }
 
@@ -37,14 +40,17 @@ function isRequest(value: unknown): value is OmpRequest {
 		value !== null &&
 		requestTag in value &&
 		value[requestTag] === true &&
-		"sessionId" in value &&
-		typeof value.sessionId === "string"
+		"providerSessionId" in value &&
+		typeof value.providerSessionId === "string" &&
+		(!("sessionId" in value) || typeof value.sessionId === "string")
 	);
 }
 
 function isRouted(value: unknown): value is RoutedRequest {
 	return (
 		isRequest(value) &&
+		typeof value.sessionId === "string" &&
+		value.sessionId.length > 0 &&
 		routeTag in value &&
 		typeof value[routeTag] === "function"
 	);
@@ -56,8 +62,8 @@ type OmpStreamSimple = NonNullable<OmpProviderConfig["streamSimple"]>;
 // custom API registration is process-wide, but onPayload belongs to the caller.
 const streamSimple: OmpStreamSimple = (model, context, options) => {
 	const stream = createChappieStream(async (output) => {
-		const sessionId = options?.sessionId;
-		if (!sessionId || !options?.onPayload) {
+		const providerSessionId = options?.sessionId;
+		if (!providerSessionId || !options?.onPayload) {
 			throw new Error(
 				"Chappie requires an OMP session request hook; auxiliary model requests are not supported.",
 			);
@@ -65,24 +71,30 @@ const streamSimple: OmpStreamSimple = (model, context, options) => {
 		const generation: ModelRequest | undefined = options.codexCompaction
 			? { kind: "compaction", input: context }
 			: undefined;
-		if (!generation && !hasOmpPrimaryContext(context, sessionId)) {
+		const sessionId = getOmpPrimarySessionId(context);
+		if (!generation && !sessionId) {
 			throw new Error(
 				"Chappie cannot answer auxiliary model prompts; use the ChatGPT-controlled session instead.",
 			);
 		}
 		const payload: OmpRequest = {
 			[requestTag]: true,
-			sessionId,
+			providerSessionId,
+			...(sessionId ? { sessionId } : {}),
 			...(generation ? { generation } : {}),
 		};
 		const routed = await options.onPayload(payload, model, options.signal);
 		if (output.closed) return;
-		if (!isRouted(routed) || routed.sessionId !== sessionId) {
+		if (
+			!isRouted(routed) ||
+			routed.providerSessionId !== providerSessionId ||
+			(sessionId !== undefined && routed.sessionId !== sessionId)
+		) {
 			throw new Error(
-				`Chappie has no owning OMP session for request ${sessionId}; auxiliary model requests are not supported.`,
+				`Chappie has no owning OMP session for provider request ${providerSessionId}; auxiliary model requests are not supported.`,
 			);
 		}
-		await routed[routeTag](output, sessionId);
+		await routed[routeTag](output, routed.sessionId);
 	});
 	return stream(model, context, options);
 };
@@ -108,17 +120,21 @@ export function createOmpChappieProvider(
 	api.on("before_provider_request", (event, context) => {
 		const request = event.payload;
 		if (!isRequest(request)) return;
+		const ownerSessionId = context.sessionManager.getSessionId();
+		if (request.sessionId !== undefined && request.sessionId !== ownerSessionId)
+			return;
 		observeProviderRequest?.(context);
 		const ownsRequest = () =>
 			!disposed &&
 			context.model?.provider === CHAPPIE_API &&
-			context.sessionManager.getSessionId() === request.sessionId;
+			context.sessionManager.getSessionId() === ownerSessionId;
 		if (!ownsRequest()) return;
 		const routed: RoutedRequest = {
 			...request,
+			sessionId: ownerSessionId,
 			[routeTag]: async (output, sessionId) => {
 				// Hooks may await while the owner changes model/session or shuts down.
-				if (!ownsRequest() || sessionId !== request.sessionId)
+				if (!ownsRequest() || sessionId !== ownerSessionId)
 					throw new Error("Chappie's owning OMP session is no longer active");
 				if (request.generation)
 					await generate(output, request.generation, sessionId);
