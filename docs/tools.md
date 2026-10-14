@@ -401,13 +401,18 @@ session identity and stable operation receipts instead.
 `transfer.paths` always names paths or image references on the OMP side. Relative paths resolve from the selected OMP session's working directory; absolute paths and `~/` are accepted.
 
 A completed replay confirms native execution, not attachment receipt. Its
-`delivery.resources` preserves the original resource descriptors. If the host
-has not read an exported resource yet, Chappie may expose the same original
-resource link again on replay without rerunning the export. `sourceReadAt`, when
-present, records a successful broker-side source read; after that point Chappie
-stops automatic replay attachment. `hostReceipt` remains `unconfirmed` because
-a source read does not prove ChatGPT saved or displayed the file. Older receipts
-may lack references; inspect history instead of recreating work.
+`delivery.resources` preserves the original resource descriptors as metadata,
+but completed retries do not emit another `resource_link`, even before the first
+source read. Offering the same attachment during approval resumption can trigger
+another materialization request; execution deduplication alone does not prevent
+that cycle. Saved operation output also uses `resourceReference` metadata rather
+than active attachment links. Original bytes and URIs remain available through
+the existing resource reader and explicit missing-file recovery below.
+`sourceReadAt` records a broker-side read, not host delivery. `hostReceipt` remains
+`unconfirmed`; neither a receipt-only response nor a source read proves ChatGPT
+saved or displayed the file. If the original response was lost, do not assume
+the file arrived or automatically resend it. Older receipts may lack references;
+inspect history instead of recreating work.
 
 For an explicitly requested missing-file recovery, pass the original resource URI
 to `transfer.paths`, with a stable `operationId` for that separate delivery request.

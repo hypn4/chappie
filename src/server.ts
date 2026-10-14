@@ -780,7 +780,7 @@ export function createServer(
 		{
 			title: "Transfer files",
 			description:
-				"Import host-injected ChatGPT files, copy between OMP sessions, or export local files and images.",
+				"Import host-injected ChatGPT files, copy between OMP sessions, or export local files and images. Completed retries return receipt metadata, not another attachment offer. Recover missing files only when explicitly requested, using their original resource URI under a separate stable operationId.",
 			outputSchema,
 			inputSchema: transferSchema.extend({
 				operationId: operationIdSchema,
@@ -1021,7 +1021,18 @@ function snapshotContent(
 		!Array.isArray(value.content)
 	)
 		throw new Error("Invalid public operation response");
-	const content = value.content as ReturnType<typeof toolResult>["content"];
+	// A saved response is recovery/history, not a new attachment delivery.
+	// Preserve the resource URI so explicit recovery never regenerates the file.
+	const content = (
+		value.content as ReturnType<typeof toolResult>["content"]
+	).map((block) => {
+		if (block.type !== "resource_link") return block;
+		const { type: _type, ...resource } = block;
+		return {
+			type: "text" as const,
+			text: JSON.stringify({ resourceReference: resource }),
+		};
+	});
 	const first = content[0];
 	if (first?.type === "text") {
 		try {

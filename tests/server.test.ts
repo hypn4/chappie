@@ -259,7 +259,7 @@ test("completed chat replay still delivers and acknowledges other pending result
 	assert.equal(f.acknowledgements, 1);
 });
 
-test("completed transfer replay re-exposes unread resources to the same ChatGPT session", async (t) => {
+test("completed transfer replay retains unread references without another attachment", async (t) => {
 	const replayResource = {
 		uri: "chappie://session/A/file/replay/file.txt",
 		name: "file.txt",
@@ -290,8 +290,12 @@ test("completed transfer replay re-exposes unread resources to the same ChatGPT 
 	const links = (result.content as Array<Record<string, unknown>>).filter(
 		(block) => block.type === "resource_link",
 	);
-	assert.equal(links.length, 1);
-	assert.match(String(links[0]?.uri), /chatId=server-test/);
+	assert.equal(links.length, 0);
+	const header = (result.content as { type: string; text?: string }[])[0];
+	assert.ok(header?.type === "text" && header.text);
+	const receipt = JSON.parse(header.text).replay;
+	assert.deepEqual(receipt.delivery.resources, [replayResource]);
+	assert.equal(receipt.delivery.hostReceipt, "unconfirmed");
 });
 
 test("new sessions expose their host and agent directory", async (t) => {

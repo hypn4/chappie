@@ -18,6 +18,7 @@ import { Broker } from "../src/broker.ts";
 import { CommonHistoryStore } from "../src/common-history.ts";
 import { toolResultsContent } from "../src/delivery.ts";
 import { resolveChappieStorage } from "../src/storage.ts";
+import { toolResult } from "../src/tools.ts";
 import { createOmpProcessHarness } from "./omp-process-harness.mjs";
 
 // These are synthetic tool requests, not a second model/agent doing inference.
@@ -548,6 +549,37 @@ try {
 		(block) => block.type === "resource_link",
 	);
 	assert.equal(links.length, 1);
+	// Approval can resume the completed transfer before resources/read happens.
+	// It must retain the original reference without making another file offer.
+	const approvalResume = await completedCall(
+		"integration-chat",
+		session.id,
+		calls,
+		"export-before-first-resource-read",
+		signal,
+		true,
+	);
+	assert.equal(approvalResume.replay?.status, "completed");
+	assert.equal(approvalResume.toolResults.length, 0);
+	assert.equal(
+		approvalResume.replay?.delivery?.resources[0]?.uri,
+		links[0].uri,
+	);
+	assert.equal(
+		approvalResume.replay?.delivery?.resources[0]?.sourceReadAt,
+		undefined,
+	);
+	assert.equal(
+		toolResult(
+			[],
+			session.id,
+			work,
+			[],
+			undefined,
+			approvalResume.replay,
+		).content.filter((block) => block.type === "resource_link").length,
+		0,
+	);
 	const bytes = await broker.readResource(
 		`${links[0].uri}?chatId=integration-chat`,
 		signal,
