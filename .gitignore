@@ -4,3 +4,9 @@ dist/
 *.tgz
 .pi/tasks/
 .quality/
+/.omp/
+
+# Share the Beads command reference, never its private state.
+!/.beads/
+/.beads/*
+!/.beads/PRIME.md
