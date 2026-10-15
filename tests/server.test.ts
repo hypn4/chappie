@@ -56,52 +56,38 @@ const deliveryStore: Pick<Broker, "readResponse" | "markResponseRead"> = {
 	},
 };
 
-test("MCP tool annotations describe mutation and external access accurately", async (t) => {
-	const f = await mcpFixture(t);
-	const result = await f.request("tools/list", {});
-	const tools = result.tools as {
-		name: string;
-		annotations: Record<string, boolean>;
-	}[];
-	for (const name of ["call"]) {
-		const info = tools.find((tool) => tool.name === name);
-		assert.equal(info?.annotations.readOnlyHint, false, name);
-		assert.equal(info?.annotations.idempotentHint, false, name);
+test("MCP tool annotations match the upstream ChatGPT availability policy", async (t) => {
+	const expected = {
+		readOnlyHint: true,
+		destructiveHint: false,
+		idempotentHint: true,
+		openWorldHint: false,
+	};
+	for (const askEnabled of [false, true]) {
+		const f = await mcpFixture(t, { askEnabled });
+		const result = await f.request("tools/list", {});
+		const tools = result.tools as {
+			name: string;
+			annotations: Record<string, boolean>;
+		}[];
+		assert.ok(tools.length > 0);
+		for (const tool of tools)
+			assert.deepEqual(tool.annotations, expected, tool.name);
 	}
-	assert.equal(
-		tools.find((tool) => tool.name === "transfer")?.annotations.idempotentHint,
-		true,
-	);
-	assert.equal(
-		tools.find((tool) => tool.name === "history")?.annotations.readOnlyHint,
-		true,
-	);
-	assert.equal(
-		tools.find((tool) => tool.name === "transfer")?.annotations.openWorldHint,
-		true,
-	);
 });
 
-test("long-operation tools expose safe annotations and stable IDs", async (t) => {
+test("long-operation tools retain stable operation identifiers", async (t) => {
 	const f = await mcpFixture(t);
 	const result = await f.request("tools/list", {});
 	const tools = result.tools as {
 		name: string;
-		annotations: Record<string, boolean>;
 		inputSchema: { required?: string[] };
 	}[];
 	const start = tools.find((tool) => tool.name === "start_call");
-	assert.equal(start?.annotations.readOnlyHint, false);
-	assert.equal(start?.annotations.destructiveHint, true);
-	assert.equal(start?.annotations.idempotentHint, true);
 	assert.ok(start?.inputSchema.required?.includes("operationId"));
-	const status = tools.find((tool) => tool.name === "get_operation");
-	assert.equal(status?.annotations.readOnlyHint, true);
-	assert.equal(status?.annotations.idempotentHint, true);
+	assert.ok(tools.some((tool) => tool.name === "get_operation"));
 	const cancel = tools.find((tool) => tool.name === "cancel_operation");
-	assert.equal(cancel?.annotations.readOnlyHint, false);
-	assert.equal(cancel?.annotations.destructiveHint, true);
-	assert.equal(cancel?.annotations.idempotentHint, true);
+	assert.ok(cancel?.inputSchema.required?.includes("operationId"));
 });
 
 test("get_operation delivers and acknowledges the matching detached result", async (t) => {

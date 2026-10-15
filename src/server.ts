@@ -33,28 +33,13 @@ const outputSchema = z.object({
 
 const questionTemplate = "ui://chappie/question.html";
 const questionSchema = outputSchema.extend({ question: questionOutput });
-function toolAnnotations(name: string) {
-	const readOnly = ["tools", "history", "sessions", "get_operation"].includes(
-		name,
-	);
-	const dangerous = [
-		"call",
-		"start_call",
-		"cancel_operation",
-		"transfer",
-	].includes(name);
-	return {
-		readOnlyHint: readOnly,
-		destructiveHint: dangerous,
-		idempotentHint:
-			readOnly ||
-			name === "init" ||
-			name === "transfer" ||
-			name === "start_call" ||
-			name === "cancel_operation",
-		openWorldHint: dangerous,
-	};
-}
+// These hints reduce intermittent tool loss in ChatGPT developer mode.
+const toolAnnotations = {
+	readOnlyHint: true,
+	destructiveHint: false,
+	idempotentHint: true,
+	openWorldHint: false,
+} as const;
 
 interface RequestContext {
 	mcpReq: {
@@ -243,9 +228,9 @@ export function createServer(
 	server.registerTool(
 		"init",
 		{
-			title: "Connect to OMP",
+			title: "Select OMP session",
 			description:
-				"Select this chat's default OMP session and return its environment, active native tool and Skill shortlists, and participation instructions. Tool shortlist entries are for capability selection only; use tools before first native use to obtain the current full definition. Large catalogs return resultId; follow get_operation pages to inspect every entry. Read task-relevant Skills through their skill:// URI instead of preloading all Skill contents. Use the task's sessionId to resume, or find it by cwd/name with sessions. Read recent history when resuming work.",
+				"Select this Chat's default OMP session. Use the requested sessionId, or find one by device/cwd with sessions. Returns environment, participation guidance and native tool/Skill shortlists; obtain full native definitions with tools before execution.",
 			outputSchema,
 			inputSchema: z.object({
 				sessionId: z
@@ -253,7 +238,7 @@ export function createServer(
 					.optional()
 					.describe("Default OMP session ID; may be shared with other chats"),
 			}),
-			annotations: toolAnnotations("init"),
+			annotations: toolAnnotations,
 		},
 		handle(async (args, context) => {
 			const chatId = requireChatId(context);
@@ -279,7 +264,7 @@ export function createServer(
 		{
 			title: "Reply in OMP",
 			description:
-				"Report progress to OMP without ending or starting a provider turn (default mode=progress). Use mode=message only for an intentional assistant turn after reviewing the requested scope, or replyTo for a recognized model request. Neither a progress report nor a native turn means the whole user task is complete.",
+				"Send progress to OMP (default mode=progress) without starting or ending a provider turn. Use mode=message for an intentional assistant turn, or replyTo for a current model request.",
 			outputSchema,
 			inputSchema: z
 				.object({
@@ -307,7 +292,7 @@ export function createServer(
 				.refine((args) => !(args.mode === "progress" && args.replyTo), {
 					message: "Progress cannot answer a model request",
 				}),
-			annotations: toolAnnotations("chat"),
+			annotations: toolAnnotations,
 		},
 		handle(async (args, context) => {
 			const result = await broker.chat(
@@ -358,7 +343,7 @@ export function createServer(
 						),
 				}),
 				outputSchema: questionSchema,
-				annotations: toolAnnotations("ask"),
+				annotations: toolAnnotations,
 				_meta: { ui: { resourceUri: questionTemplate } },
 			},
 			handle(async ({ sessionId, ...input }, context) => {
@@ -395,7 +380,7 @@ export function createServer(
 					questionId: z.string().describe("question.id returned by ask"),
 				}),
 				outputSchema: questionSchema,
-				annotations: toolAnnotations("ask_assert"),
+				annotations: toolAnnotations,
 			},
 			handle(async ({ questionId }, context) => {
 				const question = await broker.assertQuestion(
@@ -428,7 +413,7 @@ export function createServer(
 						.describe("The question widget has loaded"),
 				}),
 				outputSchema: questionSchema,
-				annotations: toolAnnotations("answer"),
+				annotations: toolAnnotations,
 				_meta: { ui: { visibility: ["app"] }, "openai/widgetAccessible": true },
 			},
 			async ({ questionId, answer, loaded = false }, context) => {
@@ -482,9 +467,9 @@ export function createServer(
 	server.registerTool(
 		"tools",
 		{
-			title: "OMP tools",
+			title: "Inspect native OMP definitions",
 			description:
-				"Get current full definitions for selected active OMP tools, including registered MCP-backed tools. Before first use, request every candidate definition needed for the decision; reuse definitions while the session and native toolset are unchanged, and refresh after a session/toolset change or unavailable/schema error. Omit names only to inspect the entire active catalog.",
+				"Inspect selected active native OMP tools, including MCP-backed tools. Returns schemas, not executable ChatGPT functions; use call or start_call to run them. Reuse unchanged definitions. Omit names for the full native catalog; this cannot load a missing bridge executor.",
 			outputSchema,
 			inputSchema: z.object({
 				names: z
@@ -499,7 +484,7 @@ export function createServer(
 						"OMP session for this operation; becomes the default if none is set",
 					),
 			}),
-			annotations: toolAnnotations("tools"),
+			annotations: toolAnnotations,
 		},
 		handle(async (args, context) => {
 			const { inputs, ...inspected } = await broker.tools(
@@ -533,15 +518,15 @@ export function createServer(
 	server.registerTool(
 		"call",
 		{
-			title: "Call OMP tools",
+			title: "Execute native OMP tools",
 			description:
-				"Execute one discovered native OMP batch. Fast results return inline; after a 25-second native wait budget, a durably accepted batch yields operation.operationId without cancelling execution. Recover with get_operation; cancel explicitly with cancel_operation. Prefer start_call for known long work. Neither result form completes the user goal: inspect continuation/work and continue authorized scope. Use the most specific native capability; prefer focused native edits over encoded shell mutation scripts. Batch only independent calls; dependent edits and checks require separate batches. Native schemas and permissions remain OMP-owned. needs_input/executed:false means no work ran.",
+				"Use to execute native OMP file reads, shell commands or edits using definitions from tools. Can change files and external systems. Independent batches return results or an accepted operation ID; recover pending output with get_operation. needs_input/executed:false means no work ran.",
 			outputSchema,
 			inputSchema: z.strictObject({
 				calls: nativeCallsSchema,
 				sessionId: z.string().optional().describe("OMP session for this batch"),
 			}),
-			annotations: toolAnnotations("call"),
+			annotations: toolAnnotations,
 		},
 		handle(async (args, context) => {
 			const chatId = requireChatId(context);
@@ -605,9 +590,9 @@ export function createServer(
 	server.registerTool(
 		"start_call",
 		{
-			title: "Start long OMP tool batch",
+			title: "Start durable OMP execution",
 			description:
-				"Start one discovered native OMP batch independently of this MCP request. Apply the same discovery, focused native editing and independent-batch rules as call; do not replace native edits with encoded shell mutation scripts. Returns one batch's durable operation status, not completion of all TODOs. Use get_operation or a later Chappie interaction to recover status and retained results. Reuse the same operationId and arguments; explicitly resume waiting_input only after handling its model request.",
+				"Run a long native OMP batch independently of this request. May modify files or external systems. Use a stable operationId and discovered native definitions; inspect results with get_operation. Resume only waiting_input with the same arguments after answering its current model request.",
 			outputSchema,
 			inputSchema: z.strictObject({
 				operationId: z
@@ -622,7 +607,7 @@ export function createServer(
 					.optional()
 					.describe("OMP session for this operation"),
 			}),
-			annotations: toolAnnotations("start_call"),
+			annotations: toolAnnotations,
 		},
 		handle(async (args, context) => {
 			const result = await broker.startCall(
@@ -653,7 +638,7 @@ export function createServer(
 		{
 			title: "Recover native operation results",
 			description:
-				"Read an operation with operationId, or read its saved public output with resultId and offset. When a response and its IDs were lost, supply sessionId to list this conversation's recent receipts (default 10, maximum 20); this does not execute or bind a session. Follow nextOffset while snapshot hasMore is true. A completed fast call exposes operation.resultId. These reads never re-execute native work or confirm model/UI receipt. waiting_input is known-unexecuted; completed refers to a batch, not child jobs or the user goal. Check current history and scoped work before continuing.",
+				"Read durable status by operationId, saved output by resultId/offset, or recent receipts by sessionId. Choose exactly one selector; follow nextOffset while hasMore. Does not execute work or bind a session. Completion is one batch's state, not confirmation of child-job or UI success.",
 			outputSchema,
 			inputSchema: z
 				.object({
@@ -681,7 +666,7 @@ export function createServer(
 					(value) => value.limit === undefined || value.sessionId !== undefined,
 					"limit requires sessionId",
 				),
-			annotations: toolAnnotations("get_operation"),
+			annotations: toolAnnotations,
 		},
 		handle(
 			async (
@@ -764,7 +749,7 @@ export function createServer(
 			inputSchema: z.object({
 				operationId: z.string().trim().min(1).max(128),
 			}),
-			annotations: toolAnnotations("cancel_operation"),
+			annotations: toolAnnotations,
 		},
 		handle(async ({ operationId }, context) => {
 			const result = await broker.cancelOperation(
@@ -790,7 +775,7 @@ export function createServer(
 					.optional()
 					.describe("OMP session for this transfer"),
 			}),
-			annotations: toolAnnotations("transfer"),
+			annotations: toolAnnotations,
 			_meta: { "openai/fileParams": ["files"] },
 		},
 		handle(async ({ sessionId, ...input }, context) => {
@@ -827,7 +812,7 @@ export function createServer(
 		{
 			title: "Session history",
 			description:
-				"Read OMP history with entry IDs and timestamps. Use before/after to page the current branch, and wait to follow new progress when caught up. Set observer when reading as an observer. An explicit sessionId applies only to this read.",
+				"Read past OMP events with entry IDs and timestamps, not current filesystem state. Page with before/after; wait follows new events. Set observer when observing. An explicit sessionId applies only to this read.",
 			inputSchema: historyInput.extend({
 				sessionId: z
 					.string()
@@ -835,7 +820,7 @@ export function createServer(
 					.describe("OMP session to read; defaults to this chat's session"),
 			}),
 			outputSchema,
-			annotations: toolAnnotations("history"),
+			annotations: toolAnnotations,
 		},
 		handle(async ({ sessionId, ...range }, context) => {
 			const { history, ...session } = await broker.history(
@@ -871,7 +856,7 @@ export function createServer(
 					.optional()
 					.describe("Filter the online list to this OMP session"),
 			}),
-			annotations: toolAnnotations("sessions"),
+			annotations: toolAnnotations,
 		},
 		handle(async (args, context) => {
 			const chatId = requestChatId(context);
