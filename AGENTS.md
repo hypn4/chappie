@@ -1,31 +1,25 @@
 # Chappie contributor entrypoint
 
-Chappie is a Chat-only bridge from ChatGPT to native Oh My Pi (OMP), not an inference service. Work must remain recoverable after a new Chat or compaction. Store decisions and evidence outside the conversation, then verify them against current source before acting.
+Chappie is a Chat-only bridge to native Oh My Pi sessions, not an inference service. Preserve unrelated work and verify current source instead of relying on remembered state.
+
+## Authority
+
+Current user scope and higher-priority safety rules govern the task. Read-only Git inspection is allowed. Commits, push, merge, deployment, live service replacement, global configuration and remote sync require explicit authorization. Beads records work; it does not grant Git authority. Stay inline unless subagents are explicitly authorized.
 
 ## Start or resume
 
-1. Confirm the intended session/cwd and inspect current Git state. Preserve unrelated and prior uncommitted changes.
-2. Read the [quality standard](docs/quality.md) and the task-relevant [quality Skill](.agents/skills/chappie-quality/SKILL.md). With OMP, read `skill://chappie-quality` when registered; otherwise read that repository file. Newly added Skills may require the host's documented resource reload.
-3. Run `bd prime`, then `bd show <issue-id>`; without an ID inspect in-progress work before creating a duplicate. Restore its `CHECKPOINT v1`: goal, constraints, decisions/reasons, verified subject, remaining scope and next action.
-4. Revalidate evidence with `bun run quality:evidence inspect <report.json>`. A previous PASS applies only to its source, tests, lockfile, environment and exact command. A missing log or changed source is not current proof.
-5. Load only relevant OMP Skills and live native/MCP definitions. Follow executor/observer guidance and current user authorization. Read-only Git inspection is allowed; commit, push, merge, deploy, global configuration and remote sync require explicit authorization.
+Confirm session/cwd and Git state. Read the task's Beads issue; without an ID, inspect in-progress work before creating one. Use `bd prime` for the project's compact command reference. Reuse unchanged instructions and valid evidence already read; do not reload every document on every tool call.
 
-## Source map
-
-| Need | Authority |
+| Need | Source |
 |---|---|
-| Review, tests, evidence, checkpoint and completion | [docs/quality.md](docs/quality.md) |
-| Component boundaries and reasons for settled decisions | [docs/architecture.md](docs/architecture.md) |
-| Public/native operations, ownership and recovery | [docs/tools.md](docs/tools.md) |
-| Package identity, locked tools, CI and release procedure | [docs/publishing.md](docs/publishing.md), `package.json`, `.github/workflows/` |
-| Current task state | Beads issue; no parallel TODO/HANDOFF/MEMORY ledger |
+| Task workflow | [.agents/skills/chappie-quality/SKILL.md](.agents/skills/chappie-quality/SKILL.md), also `skill://chappie-quality` |
+| Review, verification and checkpoint | [docs/quality.md](docs/quality.md), relevant sections only |
+| Architecture and settled decisions | [docs/architecture.md](docs/architecture.md) |
+| Bridge tools, ownership and recovery | [docs/tools.md](docs/tools.md) |
+| Release procedure | [docs/publishing.md](docs/publishing.md), `package.json`, workflows |
 
-## Non-negotiable boundaries
+## Boundaries and handoff
 
-Keep OMP as the source of truth for native arguments, permissions and execution. Keep logical operation IDs separate from acceptance execution IDs; uncertain work is not automatically retried. Preserve conversation/session/file ownership, mTLS and staged writes. Do not reintroduce direct native wrappers, retired host/protocol compatibility, Events/Tasks, webhooks, heartbeat processes, schema caches or auxiliary inference routers.
+OMP owns native arguments, permissions and execution. Preserve conversation, session and file ownership, accepted-operation identity, mTLS and staged writes. Bridge tool-surface or compatibility-hint changes need a recorded design decision; do not copy native schemas or treat annotations as authorization. Current execution remains Chat-only; do not add auxiliary inference or automatic replay.
 
-Use existing tests and fixtures rather than a second framework. Report implementation, local verification, review, CI, publication and live validation separately. A batch result or progress acknowledgement is not goal completion; follow the quality standard's Q-CHAT scope and continuation contract. Do not call inline review independent review or claim a host/UI check that was not performed. Follow the quality standard's stop conditions rather than repeatedly reopening work for speculative hardening.
-
-## Before stopping
-
-Update the issue checkpoint with reasons, exact evidence and the next authorized action. Close only satisfied scope. Keep referenced evidence accessible; do not delete another task's logs or generated resources. Repository rules and current user instructions override generic Skill defaults; remain inline unless subagents are explicitly authorized.
+Keep one Beads checkpoint with decisions, evidence and remaining scope. Report code, tests, publication and live behavior separately. Close only completed scope; neither a batch result nor a counter proves user acceptance.

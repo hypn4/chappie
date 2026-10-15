@@ -183,13 +183,23 @@ Execution/progress results include `continuation: { scope, userGoal: "not_evalua
 
 The executing assistant uses `chat` (default `mode: "progress"`) for intermediate updates. Progress is an acknowledged native notice, not a provider stop or a new turn. Use `mode: "message"` only for an intentional assistant message/turn; it does not certify completion of the whole user goal. When initialization directs an assistant to observe, it follows that work through `history` with `observer: true` and `wait: true`, thinks independently, and leaves the completion response to the original execution. Observers must not repeat exports or post a second completion response.
 
+## Host tool availability
+
+Three catalogs have different meanings: the MCP server advertises bridge functions through `tools/list`; the Chat host decides which functions are available to its current model and mode; Chappie's `tools(names)` returns definitions of tools inside the selected OMP session. That third catalog is data. It does not register new ChatGPT functions or load a missing bridge executor.
+
+When functions appear missing, compare the raw server catalog with the host's complete unfiltered discovery, using actual function names rather than search counts or mentions in descriptions. Record the model, Chat surface/mode, plugin version and relevant action controls. Native execution is a separate check, made only when the required executor is available and permitted. Do not infer a connection failure from partial exposure, or the current filesystem state from an old history error.
+
+All bridge functions use the upstream compatibility annotations: `readOnlyHint: true`, `destructiveHint: false`, `idempotentHint: true`, and `openWorldHint: false`. Upstream introduced this shared metadata to reduce intermittent tool loss in ChatGPT developer mode. These values affect host discovery hints; they do not make `call`, `start_call`, `transfer`, or other operations incapable of side effects. Native schemas, permissions, approvals, session ownership and execution remain authoritative.
+
+Keep execution guidance in the first 512 characters of server instructions and keep individual descriptions focused on purpose and inputs. Discovery and loader tests prove what this server advertises, not what every ChatGPT model receives. Compare the raw server catalog with the host's complete function list when investigating missing tools; do not add diagnostic endpoints, schema caches or permission changes for this purpose.
+
 ## OMP Skills and tools
 
 Chappie applies a 32 KiB UTF-8 byte budget to final tool-result JSON, including text mirrored into `structuredContent`. This is an application policy, not a guarantee about any host/model token limit or final rendering.
 
 `init` returns every active tool and Skill in compact form. Tool summaries and Skill descriptions contain at most 512 characters; Skills expose a normalized name and `skill://` URI rather than filesystem paths. Large catalogs are not prefix-truncated: they use the same lossless `resultId` continuation described below. This makes every name discoverable without already knowing it. Read only relevant Skills, then obtain selected live tool definitions through `tools(names)`.
 
-Before first use of a native tool whose full definition is not already available for the current session, request it with `tools({ names: [...] })`; request several candidate definitions together when choosing between tools. Registered OMP MCP tools appear in the same native catalog and are first-class capabilities. Prefer a specialized native/MCP capability over reproducing it with `bash`, `eval`, generic text search, manual HTTP calls, or a generic web path when the specialized integration materially matches the task. Explicit user/project instructions take precedence over Skill/tool guidance.
+Before first native use, obtain missing definitions with `tools({ names: [...] })`; reuse unchanged definitions. Choose a native capability that fits the task, including an active MCP-backed tool when appropriate, and follow its schema and permissions. Tool and Skill guidance does not override the user's scope or project authority.
 
 Skills guide workflows; native definitions govern execution. Reuse a full definition while the target session and native toolset remain unchanged. Refresh after changing sessions/toolsets or after an unavailable/schema error. Definitions are read from the current session on every discovery request; there is no broker-side native schema cache. Never infer arguments from the shortlist, guess old aliases, or switch to a broader tool solely to bypass validation or approval.
 
@@ -349,7 +359,7 @@ OMP now also retains ordinary completed native batches until Chappie explicitly 
 
 Validated native deliveries that hit snapshot/pending/metadata capacity or filesystem write errors receive a negative `store_failed` acknowledgement, not `stored` and not an IPC disconnect. OMP keeps that exact execution's output and uses its existing bounded retry timer; control/discovery requests remain usable. A storage-ACK timeout on a still-live connection is also nonfatal. Fast native completion with an unsaved body retains its completed receipt and unread protection even without a `resultId`, so ordinary 24-hour receipt cleanup cannot discard its replay identity before recovery. An individual response may still report unavailable storage; preserving a connection cannot create space when all remaining data is protected or the disk cannot write. Invalid ownership, malformed protocol and genuine transport failures keep their existing rejection semantics. This protocol change requires the broker and OMP extension from the same repaired build.
 
-The active model remains the current ChatGPT conversation. Starting another `chappie/chatgpt` agent inside OMP does not create another browser conversation; tools that need another model should use a separately configured provider.
+This ChatGPT conversation supplies Chappie's model replies. Starting another `chappie/chatgpt` agent inside OMP does not create a ChatGPT conversation. Keep native work inline; do not switch providers or start auxiliary inference merely to satisfy delegation advice in a tool or Skill. Any separate agent workflow requires its own explicit scope and supported configuration.
 
 ## Webpage questions
 

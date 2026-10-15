@@ -62,6 +62,11 @@ test("discovery delivers the complete authored instruction resource", async (t) 
 	const discovery = resultOf(await f.request("server/discover"));
 	// This checks delivery fidelity, not whether a model follows the prose.
 	assert.equal(discovery.instructions, authored);
+	// Check discoverability of protocol identifiers, not exact prose or model behavior.
+	const introduction = authored.slice(0, 512);
+	for (const name of ["init", "tools", "call", "start_call"]) {
+		assert.match(introduction, new RegExp(`\\b${name}\\b`));
+	}
 });
 
 test("modern start_call returns supported durable operation output, not a fake Task", async (t) => {

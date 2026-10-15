@@ -28,9 +28,9 @@ Do not rearrange runtime files merely to make this table symmetrical. Keep reusa
 
 ### Native discovery, not duplicated execution tools
 
-The public surface is a small bridge. `init` returns compact complete tool/Skill catalogs; `tools(names)` reads live native definitions. OMP owns tool-specific schemas, permissions, anchors and execution. Skills describe workflows; Chappie routes to them without copying their text. `call` and `start_call` share the JSON envelope in `native-calls.ts`.
+The bridge surface is small. `init` returns compact complete tool and Skill catalogs; `tools(names)` reads live native definitions. OMP owns tool-specific schemas, permissions, anchors and execution. Skills describe workflows; Chappie routes to them without copying their text. `call` and `start_call` share the JSON envelope in `native-calls.ts`.
 
-Do not restore direct read/bash/edit/write wrappers, Base64 aliases, a native schema cache or another inference router. Those create a second source of truth. `transfer` remains direct because host-injected files and resource delivery are a distinct boundary.
+This private bridge avoids hand-maintained native wrappers and schema caches so OMP remains authoritative. Bridge annotations follow upstream's shared ChatGPT-availability policy across every registered function; they are compatibility hints, not execution controls. Runtime schemas, permissions, ownership and approvals remain enforced by OMP and Chappie. See [host tool availability](tools.md#host-tool-availability). `transfer` remains direct for host-injected files and resource delivery.
 
 ### Exact-session provenance, not last-registered ownership
 
